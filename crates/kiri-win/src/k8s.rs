@@ -79,12 +79,33 @@ pub fn handle(action: &str, value: &Value) {
         "start" => op("start", |say| start(say)),
         "stop" => op("stop", |say| stop(say)),
         "deletecluster" => op("deletecluster", |say| delete_cluster(say)),
-        // Settings → Kubernetes → Network: saved, and the node recreated with them.
+        // Settings → Kubernetes: saved, and the node recreated with them.
         "set" => {
             let sans: Vec<String> = value["tls_san"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
             let lan = value["lan"] == true;
             let port = value["port"].as_u64().and_then(|p| u16::try_from(p).ok());
-            op("set", move |say| set(lan, sans, port, say));
+            let version = value.get("version").map(|v| {
+                v.as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default"))
+                    .map(str::to_owned)
+            });
+            let k3s_args = value.get("k3s_args").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            });
+            op("set", move |say| set(lan, sans, port, version, k3s_args, say));
+        }
+        "manifests" => {
+            if let Ok(dir) = manifests_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                let mut cmd = crate::win::tool("explorer.exe");
+                let _ = cmd.arg(dir).spawn();
+            }
         }
         "delete" => delete(arg("ns"), arg("pod")),
         "logs" => logs(arg("ns"), arg("pod"), arg("container"), value["previous"] == true),
@@ -110,7 +131,7 @@ fn copy(text: &str) {
 /// and the port asked for. They are applied when the node container is
 /// created, so a change recreates it; the cluster's state is in the volume
 /// and stays.
-#[derive(Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Config {
     #[serde(default)]
     lan: bool,
@@ -120,12 +141,64 @@ struct Config {
     /// the node takes the next free one; `port` in its container says which.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
+    /// Custom k3s image tag (`rancher/k3s:<version>`), or `None` for `IMAGE.1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// Extra arguments appended to `k3s server`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    k3s_args: Vec<String>,
 }
+
+/// Maximum byte length of a single custom `--k3s-arg` value.
+const MAX_K3S_ARG_LEN: usize = 512;
 
 impl Config {
     fn api_port(&self) -> u16 {
         self.port.unwrap_or(API_PORT)
     }
+
+    fn version_tag(&self) -> &str {
+        self.version.as_deref().filter(|v| valid_version(v)).unwrap_or(IMAGE.1)
+    }
+}
+
+fn valid_version(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 128
+        && !tag.eq_ignore_ascii_case("default")
+        && !tag.contains("..")
+        && tag.as_bytes()[0].is_ascii_alphanumeric()
+        && tag.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn valid_k3s_arg(arg: &str) -> bool {
+    !arg.trim().is_empty()
+        && arg.len() <= MAX_K3S_ARG_LEN
+        && !arg.bytes().any(|b| b < 0x20 || b == 0x7f)
+        && !arg.chars().any(char::is_control)
+}
+
+fn server_cmd(cfg: &Config) -> Vec<String> {
+    let mut cmd: Vec<String> = [
+        "server",
+        "--disable",
+        "traefik",
+        "--tls-san",
+        "127.0.0.1",
+        "--tls-san",
+        "localhost",
+        "--write-kubeconfig-mode",
+        "644",
+    ]
+    .map(String::from)
+    .to_vec();
+    for name in cfg.tls_san.iter().filter(|n| valid_san(n)) {
+        cmd.extend(["--tls-san".to_owned(), name.clone()]);
+    }
+    for arg in cfg.k3s_args.iter().filter(|a| valid_k3s_arg(a)) {
+        cmd.push(arg.clone());
+    }
+    cmd
 }
 
 /// %LOCALAPPDATA%\Kiri, where the window keeps its settings.
@@ -137,6 +210,10 @@ fn config_path() -> io::Result<PathBuf> {
     Ok(state_dir()?.join("k8s.json"))
 }
 
+fn manifests_dir() -> io::Result<PathBuf> {
+    Ok(state_dir()?.join("k8s-manifests"))
+}
+
 fn config() -> Config {
     config_path().ok().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
@@ -145,7 +222,11 @@ fn config() -> Config {
 /// drives' folder is in it too, so a node made before it had it is made
 /// again at its next start.
 fn made_with(cfg: &Config) -> String {
-    serde_json::to_string(&(cfg.lan, &cfg.tls_san, cfg.api_port(), drives())).unwrap_or_default()
+    if cfg.version.is_none() && cfg.k3s_args.is_empty() {
+        serde_json::to_string(&(cfg.lan, &cfg.tls_san, cfg.api_port(), drives())).unwrap_or_default()
+    } else {
+        serde_json::to_string(&(cfg.lan, &cfg.tls_san, cfg.api_port(), drives(), cfg.version_tag(), &cfg.k3s_args)).unwrap_or_default()
+    }
 }
 
 /// Where WSL puts this PC's drives (`/mnt`, unless `[automount] root` in
@@ -305,6 +386,10 @@ fn read_lists() -> Value {
     v["op"] = json!(current_op());
     v["context"] = json!(context());
     v["config"] = json!(config());
+    v["default_version"] = json!(IMAGE.1);
+    if let Ok(dir) = manifests_dir() {
+        v["manifests_dir"] = json!(dir);
+    }
     v
 }
 
@@ -443,13 +528,11 @@ fn start(say: &dyn Fn(&str)) -> io::Result<()> {
         if port != want {
             say(&format!("port {want} is in use; the API server takes {port}"));
         }
-        let (repo, tag) = IMAGE;
+        let repo = IMAGE.0;
+        let tag = cfg.version_tag();
         say(&format!("pulling {repo}:{tag}…"));
         pull(repo, tag)?;
-        let mut cmd: Vec<String> = ["server", "--disable", "traefik", "--tls-san", "127.0.0.1", "--tls-san", "localhost", "--write-kubeconfig-mode", "644"].map(String::from).to_vec();
-        for name in cfg.tls_san.iter().filter(|n| valid_san(n)) {
-            cmd.extend(["--tls-san".to_owned(), name.clone()]);
-        }
+        let cmd = server_cmd(&cfg);
         let body = json!({
             "Image": format!("{repo}:{tag}"),
             "Cmd": cmd,
@@ -537,9 +620,16 @@ fn delete_cluster(say: &dyn Fn(&str)) -> io::Result<()> {
 
 /// `kiri k8s set`: saves the settings and, if the cluster exists and they
 /// changed, recreates its node with them.
-fn set(lan: bool, sans: Vec<String>, port: Option<u16>, say: &dyn Fn(&str)) -> io::Result<()> {
+fn set(
+    lan: bool,
+    sans: Vec<String>,
+    port: Option<u16>,
+    version: Option<Option<String>>,
+    k3s_args: Option<Vec<String>>,
+    say: &dyn Fn(&str),
+) -> io::Result<()> {
     let mut cfg = config();
-    let before = (cfg.lan, cfg.tls_san.clone(), cfg.api_port());
+    let before = cfg.clone();
     cfg.lan = lan;
     let list: Vec<String> = sans.iter().map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()).collect();
     if let Some(bad) = list.iter().find(|n| !valid_san(n)) {
@@ -552,10 +642,26 @@ fn set(lan: bool, sans: Vec<String>, port: Option<u16>, say: &dyn Fn(&str)) -> i
         }
         cfg.port = (p != API_PORT).then_some(p);
     }
+    if let Some(ver) = version {
+        match ver {
+            None => cfg.version = None,
+            Some(tag) if valid_version(&tag) => cfg.version = Some(tag),
+            Some(tag) => return Err(io::Error::other(format!("invalid k3s version tag `{tag}`"))),
+        }
+    }
+    if let Some(args) = k3s_args {
+        if args.len() > 64 {
+            return Err(io::Error::other("too many --k3s-arg values (at most 64)"));
+        }
+        if let Some(bad) = args.iter().find(|a| !valid_k3s_arg(a)) {
+            return Err(io::Error::other(format!("invalid --k3s-arg `{bad}`")));
+        }
+        cfg.k3s_args = args;
+    }
     let node = if exists()? { Some(client::get(&format!("/containers/{NAME}/json"))?) } else { None };
     // A port asked for that the node doesn't already hold must be free now.
     let port = cfg.api_port();
-    if port != before.2 && node.as_ref().and_then(bound_port) != Some(port) && !port_free(port, cfg.lan) {
+    if port != before.api_port() && node.as_ref().and_then(bound_port) != Some(port) && !port_free(port, cfg.lan) {
         return Err(io::Error::other(format!("port {port} is in use on this PC; choose another")));
     }
     let path = config_path()?;
@@ -567,7 +673,7 @@ fn set(lan: bool, sans: Vec<String>, port: Option<u16>, say: &dyn Fn(&str)) -> i
         if cfg.tls_san.is_empty() { "none".to_owned() } else { cfg.tls_san.join(", ") }
     ));
     let Some(node) = node else { return Ok(()) };
-    if (cfg.lan, cfg.tls_san.clone(), port) == before {
+    if cfg == before {
         return Ok(());
     }
     if node["State"]["Running"] != true {
@@ -627,6 +733,9 @@ pub(crate) fn sync_soon() {
         let result = (|| -> io::Result<bool> {
             let deadline = Instant::now() + Duration::from_secs(180);
             loop {
+                if crate::serve::is_stopped() {
+                    return Ok(false);
+                }
                 let (status, info) = request("GET", &format!("/containers/{NAME}/json"), None)?;
                 if status == 404 || info["State"]["Running"] != true {
                     return Ok(false);
@@ -795,5 +904,43 @@ mod tests {
         for bad in ["", "a b", "-x.com", "a..b", "x/y", "--flag"] {
             assert!(!super::valid_san(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn custom_k3s_version_and_args_are_validated_and_applied() {
+        assert!(super::valid_version("v1.31.4-k3s1"));
+        assert!(!super::valid_version("default"));
+        assert!(!super::valid_version("rancher/k3s:v1.31.4-k3s1"));
+        assert!(super::valid_k3s_arg("--flannel-backend=none"));
+        assert!(!super::valid_k3s_arg(""));
+        assert!(!super::valid_k3s_arg("--bad\0arg"));
+
+        let cfg = super::Config {
+            lan: false,
+            tls_san: vec!["my-pc.local".into()],
+            port: None,
+            version: Some("v1.31.4-k3s1".into()),
+            k3s_args: vec!["--flannel-backend=none".into(), "--disable-network-policy".into()],
+        };
+        assert_eq!(cfg.version_tag(), "v1.31.4-k3s1");
+        assert_eq!(
+            super::server_cmd(&cfg),
+            vec![
+                "server",
+                "--disable",
+                "traefik",
+                "--tls-san",
+                "127.0.0.1",
+                "--tls-san",
+                "localhost",
+                "--write-kubeconfig-mode",
+                "644",
+                "--tls-san",
+                "my-pc.local",
+                "--flannel-backend=none",
+                "--disable-network-policy",
+            ]
+        );
+        assert_ne!(super::made_with(&cfg), super::made_with(&super::Config::default()));
     }
 }

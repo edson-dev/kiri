@@ -106,10 +106,344 @@ pub fn remount(target: &CStr, flags: libc::c_ulong) -> io::Result<()> {
     check(ret as _, &format!("remount {}", target.to_string_lossy())).map(drop)
 }
 
+pub fn umount(target: &Path) -> io::Result<()> {
+    let t = cstr(target)?;
+    // SAFETY: `t` is a valid NUL-terminated string.
+    check(unsafe { libc::umount2(t.as_ptr(), 0) } as _, "umount").map(drop)
+}
+
 pub fn umount_lazy(target: &Path) -> io::Result<()> {
     let t = cstr(target)?;
     // SAFETY: `t` is a valid NUL-terminated string.
     check(unsafe { libc::umount2(t.as_ptr(), libc::MNT_DETACH) } as _, "umount").map(drop)
+}
+
+/// Linux's `CGROUP_SUPER_MAGIC` (`<linux/magic.h>`).
+const CGROUP_SUPER_MAGIC: i64 = 0x27_e0eb;
+/// Linux's `CGROUP2_SUPER_MAGIC` (`<linux/magic.h>`).
+const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+
+/// OpenZFS's `ZFS_SUPER_MAGIC` (`zpl_super.c`).
+pub const ZFS_SUPER_MAGIC: i64 = 0x2fc1_2fc1;
+
+fn fs_magic(path: &Path) -> Option<i64> {
+    let c = cstr(path).ok()?;
+    // SAFETY: `st` is plain zero-initialized data; `c` is a valid C string.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statfs writes into `st`.
+    (unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0).then_some(st.f_type as i64)
+}
+
+/// Whether `path` sits on a mounted `cgroup2` filesystem.
+pub fn is_cgroup2(path: &Path) -> bool {
+    fs_magic(path) == Some(CGROUP2_SUPER_MAGIC)
+}
+
+/// Whether `path` sits on a mounted cgroup v1 or v2 filesystem.
+pub fn is_cgroup(path: &Path) -> bool {
+    matches!(fs_magic(path), Some(CGROUP_SUPER_MAGIC | CGROUP2_SUPER_MAGIC))
+}
+
+/// Linux `<linux/mount.h>` `mount_attr` for `mount_setattr(2)` (Linux 5.12+).
+#[repr(C)]
+#[derive(Default)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+pub const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+pub const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
+pub const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
+pub const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
+
+/// Recursively sets `attr_set` mount attributes on `target` and every mount
+/// beneath it via `mount_setattr(2)`.
+pub fn mount_setattr_recursive(target: &CStr, attr_set: u64) -> io::Result<()> {
+    let attr = MountAttr { attr_set, ..Default::default() };
+    // SAFETY: `target` is a valid NUL-terminated path and `attr` is a valid
+    // `mount_attr` struct of the passed size.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::AT_RECURSIVE as libc::c_uint,
+            &attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    check(ret as _, &format!("mount_setattr {}", target.to_string_lossy())).map(drop)
+}
+
+/// Whether `statfs(2)` reports `ZFS_SUPER_MAGIC` on `path`.
+pub fn is_statfs_zfs(path: &Path) -> bool {
+    let Ok(c) = cstr(path) else { return false };
+    // SAFETY: `st` is plain zero-initialized data; `c` is a valid C string.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statfs writes into `st`.
+    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == ZFS_SUPER_MAGIC }
+}
+
+/// Why a container storage filesystem is read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlyKind {
+    /// Linux ext4 aborted its journal (`errors=remount-ro`) and added `emergency_ro`.
+    EmergencyRo,
+    /// Mounted read-only (`ro` / `ST_RDONLY`), or overlayfs fell back to read-only.
+    ReadOnly,
+}
+
+impl ReadOnlyKind {
+    pub fn merge(self, other: Self) -> Self {
+        if self == Self::EmergencyRo || other == Self::EmergencyRo {
+            Self::EmergencyRo
+        } else {
+            Self::ReadOnly
+        }
+    }
+}
+
+/// Unescapes `/proc/mounts` and `/proc/self/mountinfo` octal escapes (`\040`, `\011`, `\012`, `\134`).
+pub fn unescape_mount_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b))
+        {
+            let val = ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
+            out.push(val);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn norm_mount_path(p: &str) -> &str {
+    let trimmed = p.trim_end_matches('/');
+    if trimmed.is_empty() { "/" } else { trimmed }
+}
+
+fn mount_covers(mp: &str, target: &str) -> bool {
+    let mp = norm_mount_path(mp);
+    let target = norm_mount_path(target);
+    mp == "/" || target == mp || (target.starts_with(mp) && target.as_bytes().get(mp.len()) == Some(&b'/'))
+}
+
+/// Parses comma-separated mount options (`rw,...,emergency_ro` or `ro,...`)
+/// into `ReadOnlyKind`, ignoring substrings such as `errors=remount-ro`.
+pub fn parse_opts_readonly(opts: &str) -> Option<ReadOnlyKind> {
+    let mut ro = false;
+    for opt in opts.split(',') {
+        match opt.trim() {
+            "emergency_ro" => return Some(ReadOnlyKind::EmergencyRo),
+            "ro" => ro = true,
+            _ => {}
+        }
+    }
+    ro.then_some(ReadOnlyKind::ReadOnly)
+}
+
+/// Inspects `/proc/mounts` text for the active mount covering `target`.
+/// Picks the longest ancestor mountpoint, with later lines winning ties (overmounts).
+pub fn proc_mounts_readonly(proc_mounts: &str, target: &Path) -> Option<ReadOnlyKind> {
+    let target_str = target.to_string_lossy();
+    let mut best: Option<(usize, Option<ReadOnlyKind>)> = None;
+    for line in proc_mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(_spec), Some(mp_raw), Some(_fstype), Some(opts)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let mp = unescape_mount_path(mp_raw);
+        let mp_norm = norm_mount_path(&mp);
+        if mount_covers(mp_norm, &target_str) && best.is_none_or(|(len, _)| mp_norm.len() >= len) {
+            best = Some((mp_norm.len(), parse_opts_readonly(opts)));
+        }
+    }
+    best.and_then(|(_, kind)| kind)
+}
+
+/// Inspects `/proc/self/mountinfo` text for the active mount covering `target`.
+pub fn mountinfo_readonly(mountinfo: &str, target: &Path) -> Option<ReadOnlyKind> {
+    let target_str = target.to_string_lossy();
+    let mut best: Option<(usize, Option<ReadOnlyKind>)> = None;
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else { continue };
+        let mut b = before.split_whitespace();
+        let (Some(_id), Some(_parent), Some(_dev), Some(_root), Some(mp_raw), Some(mopts)) =
+            (b.next(), b.next(), b.next(), b.next(), b.next(), b.next())
+        else {
+            continue;
+        };
+        let mut a = after.split_whitespace();
+        let (Some(_fstype), Some(_src), Some(sopts)) = (a.next(), a.next(), a.next()) else { continue };
+        let mp = unescape_mount_path(mp_raw);
+        let mp_norm = norm_mount_path(&mp);
+        if mount_covers(mp_norm, &target_str) && best.is_none_or(|(len, _)| mp_norm.len() >= len) {
+            let kind = match (parse_opts_readonly(mopts), parse_opts_readonly(sopts)) {
+                (Some(a), Some(b)) => Some(a.merge(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            best = Some((mp_norm.len(), kind));
+        }
+    }
+    best.and_then(|(_, kind)| kind)
+}
+
+/// Inspects `/proc/self/mountinfo` text for the filesystem type of the active
+/// mount covering `target` (longest ancestor mountpoint, with later lines
+/// winning ties for overmounts).
+pub fn mountinfo_fstype<'a>(mountinfo: &'a str, target: &Path) -> Option<&'a str> {
+    let target_str = target.to_string_lossy();
+    let mut best: Option<(usize, &'a str)> = None;
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else { continue };
+        let Some(mp_raw) = before.split_whitespace().nth(4) else { continue };
+        let Some(fstype) = after.split_whitespace().next() else { continue };
+        let mp = unescape_mount_path(mp_raw);
+        let mp_norm = norm_mount_path(&mp);
+        if mount_covers(mp_norm, &target_str) && best.is_none_or(|(len, _)| mp_norm.len() >= len) {
+            best = Some((mp_norm.len(), fstype));
+        }
+    }
+    best.map(|(_, fstype)| fstype)
+}
+
+/// Whether `/proc/self/mountinfo` reports fstype `"zfs"` for the active mount covering `target`.
+pub fn is_zfs_mountinfo(mountinfo: &str, target: &Path) -> bool {
+    mountinfo_fstype(mountinfo, target) == Some("zfs")
+}
+
+/// Whether `path` (or its nearest existing ancestor) sits on a ZFS filesystem,
+/// checked via `statfs(ZFS_SUPER_MAGIC)` with `/proc/self/mountinfo` fallback.
+pub fn is_zfs(path: &Path) -> bool {
+    let Some(existing) = path.ancestors().find(|p| !p.as_os_str().is_empty() && p.exists()) else {
+        return false;
+    };
+    if is_statfs_zfs(existing) {
+        return true;
+    }
+    let Ok(mi) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let canon = existing.canonicalize().ok();
+    is_zfs_mountinfo(&mi, canon.as_deref().unwrap_or(existing))
+}
+
+/// Whether `statvfs(2)` reports `ST_RDONLY` on `path`.
+pub fn is_statvfs_readonly(path: &Path) -> io::Result<bool> {
+    let c = cstr(path)?;
+    // SAFETY: `st` is plain zero-initialized data; `c` is a valid C string.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statvfs writes into `st`.
+    check(unsafe { libc::statvfs(c.as_ptr(), &mut st) } as _, &format!("statvfs {}", path.display()))?;
+    Ok((st.f_flag as u64) & (libc::ST_RDONLY as u64) != 0)
+}
+
+/// Classifies an already-known read-only path (`EmergencyRo` vs `ReadOnly`)
+/// by reading `/proc/self/mountinfo` and `/proc/mounts`.
+pub fn inspect_readonly_kind(existing: &Path) -> ReadOnlyKind {
+    let canon = existing.canonicalize().ok();
+    let targets = [canon.as_deref(), Some(existing)];
+    if let Ok(mi) = std::fs::read_to_string("/proc/self/mountinfo") {
+        for t in targets.into_iter().flatten() {
+            if mountinfo_readonly(&mi, t) == Some(ReadOnlyKind::EmergencyRo) {
+                return ReadOnlyKind::EmergencyRo;
+            }
+        }
+    }
+    if let Ok(pm) = std::fs::read_to_string("/proc/mounts") {
+        for t in targets.into_iter().flatten() {
+            if proc_mounts_readonly(&pm, t) == Some(ReadOnlyKind::EmergencyRo) {
+                return ReadOnlyKind::EmergencyRo;
+            }
+        }
+    }
+    ReadOnlyKind::ReadOnly
+}
+
+/// Fast-path read-only filesystem check on `path` (or its nearest existing
+/// ancestor): 1 `statvfs` syscall when writable; inspects `/proc/self/mountinfo`
+/// and `/proc/mounts` for `emergency_ro` only when `ST_RDONLY` is set.
+pub fn detect_readonly_fs(path: &Path) -> Option<ReadOnlyKind> {
+    let existing = path.ancestors().find(|p| !p.as_os_str().is_empty() && p.exists())?;
+    if is_statvfs_readonly(existing).ok()? {
+        Some(inspect_readonly_kind(existing))
+    } else {
+        None
+    }
+}
+
+/// Pure helper testing whether `osrelease` or WSL interop markers indicate WSL.
+pub fn is_wsl_env(osrelease: &str, interop_exists: bool) -> bool {
+    if interop_exists {
+        return true;
+    }
+    let lower = osrelease.to_ascii_lowercase();
+    lower.contains("microsoft") || lower.contains("wsl")
+}
+
+/// True when running inside WSL 2 (Microsoft or custom WSL kernel / WSLInterop).
+pub fn is_wsl() -> bool {
+    static WSL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WSL.get_or_init(|| {
+        let interop = Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+            || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop-late").exists()
+            || Path::new("/run/WSL").is_dir();
+        let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        is_wsl_env(&osrelease, interop)
+    })
+}
+
+/// Formats an actionable error message for a read-only container storage filesystem.
+pub fn format_readonly_storage_error(kind: ReadOnlyKind, wsl: bool, host_process: bool) -> String {
+    if wsl {
+        let state = match kind {
+            ReadOnlyKind::EmergencyRo => "was remounted read-only by Linux (emergency_ro)",
+            ReadOnlyKind::ReadOnly => "is mounted read-only (emergency_ro)",
+        };
+        format!(
+            "Kiri's WSL2 disk (ext4.vhdx) {state} after an unclean shutdown or filesystem error. \
+             To recover: 1) run `wsl --shutdown` in PowerShell; \
+             2) attach the disk bare with `wsl --mount <path>\\ext4.vhdx --vhd --bare` (default `%LOCALAPPDATA%\\Kiri\\wsl\\kiri\\ext4.vhdx`); \
+             3) from another Linux distro in WSL, find the device with `lsblk` and run `sudo e2fsck -f -y -D /dev/<disk>`, then `wsl --unmount`; \
+             or move/recreate storage in Settings -> Storage."
+        )
+    } else if host_process {
+        match kind {
+            ReadOnlyKind::EmergencyRo => {
+                "Kiri's container storage filesystem (/var/lib/kiri) was remounted read-only by Linux (emergency_ro) after a filesystem error: check `dmesg` and run `fsck` to repair the filesystem, then restart Kiri.".to_owned()
+            }
+            ReadOnlyKind::ReadOnly => {
+                "Kiri's container storage filesystem (/var/lib/kiri) is mounted read-only: check `dmesg` and mount options, or run `fsck` to repair the filesystem, then restart Kiri.".to_owned()
+            }
+        }
+    } else {
+        match kind {
+            ReadOnlyKind::EmergencyRo => {
+                "Kiri's container storage filesystem (/var/lib/kiri) was remounted read-only by Linux (emergency_ro) after a filesystem error: check `dmesg`, restart Kiri, or run `fsck` on the VM data disk.".to_owned()
+            }
+            ReadOnlyKind::ReadOnly => {
+                "Kiri's container storage filesystem (/var/lib/kiri) is mounted read-only: check `dmesg`, restart Kiri, or run `fsck` on the VM data disk.".to_owned()
+            }
+        }
+    }
+}
+
+pub fn readonly_storage_error(kind: ReadOnlyKind) -> io::Error {
+    let msg = format_readonly_storage_error(kind, is_wsl(), super::transport::is_host_process());
+    io::Error::new(io::Error::from_raw_os_error(libc::EROFS).kind(), msg)
 }
 
 pub fn mkdir(p: &CStr, mode: libc::mode_t) {
@@ -181,17 +515,89 @@ pub struct CloneArgs {
 
 pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
+/// A started child: its pid, and whether clone3 placed it in its cgroup.
+pub struct Cloned {
+    pub pid: libc::pid_t,
+    /// False when the child was started with clone(2): the caller must move
+    /// it into `CloneArgs::cgroup` itself before letting it run.
+    pub into_cgroup: bool,
+}
+
+/// Whether clone3 is unavailable rather than refusing this request: an old
+/// kernel answers ENOSYS, and a seccomp filter (Docker's and Android's) may
+/// answer ENOSYS or EPERM. glibc and runc fall back to clone(2) for these.
+fn clone3_unavailable(errno: Option<i32>) -> bool {
+    matches!(errno, Some(code) if code == libc::ENOSYS || code == libc::EPERM)
+}
+
+/// The clone(2) flags for `args`: clone3-only flags above 32 bits
+/// (CLONE_INTO_CGROUP, CLONE_CLEAR_SIGHAND) and fields clone(2) has no place
+/// for (the cgroup, a pidfd, set_tid, tls) are dropped, and clone3's separate
+/// exit signal goes back into the low byte of the flags. CLONE_NEWCGROUP
+/// goes too: clone3 places the child in its cgroup before making it, so the
+/// namespace is rooted there; clone(2) cannot, and a namespace made now
+/// would be rooted at the agent's cgroup. The caller unshares it after
+/// moving the child.
+fn clone_flags(args: &CloneArgs) -> libc::c_ulong {
+    ((args.flags & 0xffff_ffff & !(libc::CLONE_NEWCGROUP as u64)) | (args.exit_signal & 0xff)) as libc::c_ulong
+}
+
 /// Like fork(), but straight into new namespaces and a cgroup. Returns 0 in
 /// the child and the child's pid in the parent.
+///
+/// Uses clone3(2), which puts the child in its cgroup atomically. Where
+/// clone3 is blocked (an old kernel, or a seccomp filter answering ENOSYS or
+/// EPERM, as on Android/Droidspaces, #529), it falls back to clone(2), as
+/// glibc and runc do, and reports `into_cgroup: false`. clone(2) cannot make
+/// the cgroup namespace either, so the caller must move the child into its
+/// cgroup and unshare CLONE_NEWCGROUP before it proceeds.
 ///
 /// # Safety
 /// The caller must be single-threaded, as with fork(): the child gets a copy
 /// of this thread only, so no other thread may hold a lock it needs.
-pub unsafe fn clone3(args: &CloneArgs) -> io::Result<libc::pid_t> {
+static CLONE3_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// True once `clone3(..., CLONE_INTO_CGROUP)` has succeeded in this process,
+/// allowing later spawns/execs to skip creating the fallback `cgroup_ready` pipe.
+pub fn clone3_works() -> bool {
+    CLONE3_STATE.load(std::sync::atomic::Ordering::Relaxed) == 1
+}
+
+pub unsafe fn clone3(args: &CloneArgs) -> io::Result<Cloned> {
     // SAFETY: `args` is a valid clone_args of the size passed; the caller
     // upholds the single-thread requirement.
     let ret = unsafe { libc::syscall(libc::SYS_clone3, args as *const CloneArgs, std::mem::size_of::<CloneArgs>()) };
-    check(ret, "clone3").map(|p| p as libc::pid_t)
+    if ret >= 0 {
+        if ret > 0 {
+            CLONE3_STATE.store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok(Cloned { pid: ret as libc::pid_t, into_cgroup: true });
+    }
+    let e = io::Error::last_os_error();
+    if !clone3_unavailable(e.raw_os_error()) {
+        return Err(io::Error::new(e.kind(), format!("clone3: {e}")));
+    }
+    CLONE3_STATE.store(2, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: as above. clone(2) has no cgroup, pidfd, set_tid, stack or tls
+    // arguments here: the child runs on a copy of this thread's stack, like
+    // fork(). Passing 0 for the four arguments after `flags` is identical on
+    // x86_64 and aarch64 (CONFIG_CLONE_BACKWARDS). The caller upholds
+    // single-threadedness, which that requires.
+    let ret = unsafe {
+        libc::syscall(libc::SYS_clone, clone_flags(args), 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong)
+    };
+    if ret < 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("clone: {e}")));
+    }
+    Ok(Cloned { pid: ret as libc::pid_t, into_cgroup: false })
+}
+
+/// Makes this thread's namespace view like `unshare(2)`: a new cgroup
+/// namespace here is rooted at the caller's cgroup.
+pub fn unshare(flags: libc::c_int) -> io::Result<()> {
+    // SAFETY: plain syscall on the calling thread.
+    check(unsafe { libc::unshare(flags) } as _, "unshare").map(drop)
 }
 
 /// The engine's own message as one line of the container's log: a value
@@ -555,5 +961,143 @@ mod tests {
         let err = io::Error::last_os_error();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(super::exec_failure(file.to_str().unwrap(), &err, super::Found { exists: true, dir: false }, false).0, 126, "{err}");
+    }
+
+    /// Only a clone3 that is blocked (a seccomp filter answering ENOSYS or
+    /// EPERM, as Docker's and Android's do, #529) falls back to clone(2);
+    /// a refusal of the request itself is reported as it is.
+    #[test]
+    fn only_a_blocked_clone3_falls_back() {
+        let f = super::clone3_unavailable;
+        assert!(f(Some(libc::ENOSYS)));
+        assert!(f(Some(libc::EPERM)));
+        for code in [libc::EINVAL, libc::EBUSY, libc::EAGAIN, libc::ENOMEM] {
+            assert!(!f(Some(code)), "errno {code}");
+        }
+        assert!(!f(None));
+    }
+
+    /// clone(2) cannot take CLONE_INTO_CGROUP (or any >32-bit clone3 flag such
+    /// as CLONE_CLEAR_SIGHAND), and a CLONE_NEWCGROUP made before the child is
+    /// in its cgroup would be rooted at the agent's, so all of those are
+    /// dropped; clone3's exit signal goes in the low byte, as clone(2) expects.
+    #[test]
+    fn clone2_flags_drop_what_it_cannot_place() {
+        const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+        let args = super::CloneArgs {
+            flags: (libc::CLONE_NEWPID | libc::CLONE_NEWCGROUP) as u64 | super::CLONE_INTO_CGROUP | CLONE_CLEAR_SIGHAND,
+            exit_signal: libc::SIGCHLD as u64,
+            ..Default::default()
+        };
+        let flags = super::clone_flags(&args) as u64;
+        assert_eq!(flags & libc::CLONE_NEWPID as u64, libc::CLONE_NEWPID as u64);
+        assert_eq!(flags & super::CLONE_INTO_CGROUP, 0);
+        assert_eq!(flags & CLONE_CLEAR_SIGHAND, 0);
+        assert_eq!(flags & libc::CLONE_NEWCGROUP as u64, 0);
+        assert_eq!(flags & 0xff, libc::SIGCHLD as u64);
+    }
+
+    /// The real thing: a seccomp filter answering ENOSYS or EPERM for clone3,
+    /// as Android's and Docker's do (#529), must fall back to clone(2) instead
+    /// of failing the start. The filter is installed in a child process of
+    /// this test binary, so it does not outlive the test.
+    #[test]
+    fn blocked_clone3_falls_back_to_clone() {
+        if let Some(val) = std::env::var_os("KIRI_CLONE3_SEccomp") {
+            let code = if val == "EPERM" { libc::EPERM } else { libc::ENOSYS };
+            install_clone3_denial(code);
+            // SAFETY: this helper process runs no other thread, as clone(2)
+            // without CLONE_VM needs; the child only calls _exit.
+            let cloned = unsafe {
+                super::clone3(&super::CloneArgs { exit_signal: libc::SIGCHLD as u64, ..Default::default() })
+            }
+            .expect("a blocked clone3 must fall back to clone");
+            assert!(!cloned.into_cgroup, "clone(2) cannot place the child in a cgroup");
+            if cloned.pid == 0 {
+                // SAFETY: _exit neither unwinds nor runs destructors.
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            // SAFETY: waiting for the child just cloned.
+            let waited = unsafe { libc::waitpid(cloned.pid, &mut status, 0) };
+            assert_eq!(waited, cloned.pid);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status}");
+            return;
+        }
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, m)| m);
+        let name = format!("{module}::blocked_clone3_falls_back_to_clone");
+        for kind in ["1", "EPERM"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env("KIRI_CLONE3_SEccomp", kind)
+                .output()
+                .expect("spawn this test binary");
+            assert!(
+                out.status.success(),
+                "the clone3-blocked helper ({kind}) failed:\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// Installs a seccomp filter that makes clone3 return `errno`.
+    fn install_clone3_denial(errno: i32) {
+        #[repr(C)]
+        struct Insn {
+            code: u16,
+            jt: u8,
+            jf: u8,
+            k: u32,
+        }
+        #[repr(C)]
+        struct Prog {
+            len: u16,
+            filter: *const Insn,
+        }
+        const LD_W_ABS: u16 = 0x20;
+        const JEQ_K: u16 = 0x15;
+        const RET_K: u16 = 0x06;
+        const RET_ALLOW: u32 = 0x7fff_0000;
+        const RET_ERRNO: u32 = 0x0005_0000;
+        let insns = [
+            Insn { code: LD_W_ABS, jt: 0, jf: 0, k: 0 }, // seccomp_data.nr
+            Insn { code: JEQ_K, jt: 0, jf: 1, k: libc::SYS_clone3 as u32 },
+            Insn { code: RET_K, jt: 0, jf: 0, k: RET_ERRNO | errno as u32 },
+            Insn { code: RET_K, jt: 0, jf: 0, k: RET_ALLOW },
+        ];
+        let prog = Prog { len: insns.len() as u16, filter: insns.as_ptr() };
+        // SAFETY: valid prctl calls; `prog` lives until they return.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0, "no_new_privs: {}", io::Error::last_os_error());
+            let n = libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER as libc::c_ulong, &prog);
+            assert_eq!(n, 0, "seccomp: {}", io::Error::last_os_error());
+        }
+    }
+
+    #[test]
+    fn parses_readonly_mounts_and_formats_wsl_and_linux_diagnostics() {
+        use std::path::Path;
+        let healthy = "/dev/sdd / ext4 rw,relatime,discard,errors=remount-ro,data=ordered 0 0\n";
+        assert_eq!(super::proc_mounts_readonly(healthy, Path::new("/var/lib/kiri")), None);
+
+        let emergency = "/dev/sdd / ext4 rw,relatime,discard,errors=remount-ro,data=ordered,emergency_ro 0 0\ntmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0\n";
+        assert_eq!(super::proc_mounts_readonly(emergency, Path::new("/var/lib/kiri/containers/abc")), Some(super::ReadOnlyKind::EmergencyRo));
+        assert_eq!(super::proc_mounts_readonly(emergency, Path::new("/run/kiri")), None);
+
+        let mountinfo = "25 1 8:48 / / rw,relatime - ext4 /dev/sdd rw,discard,errors=remount-ro,data=ordered,emergency_ro\n";
+        assert_eq!(super::mountinfo_readonly(mountinfo, Path::new("/var/lib/kiri")), Some(super::ReadOnlyKind::EmergencyRo));
+
+        assert!(super::is_wsl_env("6.6.87.2-microsoft-standard-WSL2\n", false));
+        assert!(super::is_wsl_env("6.18.58.1-1\n", true));
+        assert!(!super::is_wsl_env("6.18.58.1-1-generic\n", false));
+
+        let wsl = super::format_readonly_storage_error(super::ReadOnlyKind::EmergencyRo, true, true);
+        assert!(wsl.contains("ext4.vhdx") && wsl.contains("emergency_ro") && wsl.contains("e2fsck -f -y -D"), "{wsl}");
+        let host = super::format_readonly_storage_error(super::ReadOnlyKind::EmergencyRo, false, true);
+        assert!(host.contains("/var/lib/kiri") && host.contains("fsck"), "{host}");
+        let vm = super::format_readonly_storage_error(super::ReadOnlyKind::ReadOnly, false, false);
+        assert!(vm.contains("VM data disk"), "{vm}");
     }
 }

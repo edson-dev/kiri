@@ -160,7 +160,7 @@ body.rail .vm .dot { width: 6px; height: 6px; position: relative; box-shadow: no
 body.rail[data-vm=running] .vm .dot::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--moss); --ring: 2.8; animation: var(--beat); pointer-events: none; }
 .mark .speed { fill: currentColor; opacity: .35; transition: opacity .3s; }
 [data-vm=running] .mark .speed { opacity: .9; }
-[data-vm=booting] .mark .speed { animation: zoom .25s infinite alternate; }
+[data-vm=booting] .mark .speed, [data-vm=restarting] .mark .speed { animation: zoom .25s infinite alternate; }
 
 [data-vm=stopped] .mark .eyes, [data-vm=asleep] .mark .eyes { transform: scaleY(.25); transform-origin: 46px 29px; }
 .navlabel { font-size: var(--fs); font-weight: 600; color: var(--faint); padding: 10px 8px 4px; text-transform: uppercase; letter-spacing: .06em; }
@@ -180,7 +180,7 @@ nav .count { margin-inline-start: auto; font-size: var(--fs); color: var(--faint
 .vm-head { display: flex; align-items: center; gap: 7px; font-weight: 600; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
 [data-vm=running] .dot { background: var(--moss); box-shadow: 0 0 0 3px color-mix(in srgb, var(--moss) 25%, transparent); }
-[data-vm=booting] .dot, [data-vm=waking] .dot, [data-vm=stopping] .dot { background: var(--sun); animation: pulse .8s infinite alternate; }
+[data-vm=booting] .dot, [data-vm=waking] .dot, [data-vm=stopping] .dot, [data-vm=restarting] .dot { background: var(--sun); animation: pulse .8s infinite alternate; }
 [data-vm=asleep] .dot { background: transparent; box-shadow: inset 0 0 0 2px var(--moss); }
 .vm-sub { color: var(--faint); font-size: var(--fs-small); margin-top: -6px; }
 #vm-state { margin-inline-start: auto; font-weight: 500; color: var(--muted); font-size: var(--fs); }
@@ -868,7 +868,7 @@ tr[data-rowopen] .sel, .sel { cursor: text; -webkit-user-select: text; user-sele
 .statusbar .k8s { width: 13px; height: 13px; fill: #326CE5; flex: none; }
 .statusbar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
 .statusbar .dot.running { background: var(--moss); }
-.statusbar .dot.booting, .statusbar .dot.stopping { background: var(--sun); }
+.statusbar .dot.booting, .statusbar .dot.stopping, .statusbar .dot.restarting { background: var(--sun); }
 .statusbar .dot.asleep { background: transparent; box-shadow: inset 0 0 0 1.5px var(--moss); }
 .statusbar .sep { color: var(--faint); }
 /* Kiri Dev, after the version: solid amber with near-black text, the same in either theme. */
@@ -1065,9 +1065,12 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
                font: 500 var(--fs) var(--ui-font); text-align: var(--start); cursor: pointer; }
 .menu button:hover, .menu button:focus-visible { background: var(--raised); outline: none; }
 .menu button.danger { color: var(--red); }
-/* Settings */
-.settings { display: grid; grid-template-columns: 180px 1fr; gap: 28px; align-items: start; max-width: 860px; }
-.settings .tabs { display: grid; gap: 2px; }
+/* Settings: the left tab rail stays static while the pane body scrolls. */
+.content:has(> .settings) { display: flex; flex-direction: column; overflow: hidden; padding-block: 0; padding-inline-end: 0; }
+.settings { flex: 1; min-height: 0; display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 28px; align-items: stretch; }
+.settings .tabs { display: grid; gap: 2px; align-content: start; padding-block: 4px 20px; overflow-y: auto; }
+.settings-body { min-width: 0; height: 100%; overflow-y: auto; overflow-x: hidden; padding-block: 4px calc(20px + var(--hold, 0px)); padding-inline-end: 24px; }
+.settings-body > :is(.pane, .panes) { max-width: 652px; }
 .settings .tabs button { display: flex; align-items: center; gap: 9px; height: 31px; padding: 0 10px; border: 0; border-radius: 7px; background: transparent;
                          color: var(--muted); font: 500 var(--fs) var(--ui-font); text-align: var(--start); cursor: pointer; }
 .settings .tabs button:hover { background: var(--row-hover); color: var(--text); }
@@ -1091,7 +1094,7 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .linkbtn { background: none; border: 0; padding: 0; color: var(--blue-light); font: inherit; cursor: pointer; }
 .pref { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 20px; align-items: center; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
 .pref .t { font-weight: 600; }
-.pref .d { color: var(--muted); font-size: var(--fs); grid-column: 1; }
+.pref .d { color: var(--muted); font-size: var(--fs); grid-column: 1; min-width: 0; }
 .pref select { grid-row: 1 / span 2; grid-column: 2; height: 32px; width: 240px; padding: 0 10px; border-radius: 7px; border: 1px solid var(--line);
                background: var(--panel); color: var(--text); font: var(--fs) var(--ui-font); }
 /* Every other <select>: a button and its list (ssOpen); the select stays, hidden. */
@@ -1165,6 +1168,32 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .rports input:disabled { color: var(--faint); }
 .rports .btn { height: 32px; }
 .pref + .rp-notes { margin-top: -6px; }
+.pref .sockhint { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; max-width: 100%; min-width: 0; margin-top: 4px; color: var(--text); }
+.pref .sockhint code { min-width: 0; max-width: calc(100% - 22px); box-sizing: border-box; overflow-wrap: anywhere; word-break: break-all; padding: 1px 6px; border-radius: 5px; background: var(--panel); border: 1px solid var(--line); font: var(--fs-mono) var(--mono-font); user-select: text; -webkit-user-select: text; }
+.pref .sockhint .copy { flex: none; margin-inline-start: 0; }
+/* Settings → Storage */
+.st-t { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.st-badge { font-size: var(--fs-small); font-weight: 500; padding: 1px 7px; border-radius: 99px; background: color-mix(in srgb, var(--blue) 16%, transparent); color: var(--text); }
+.st-path { overflow-wrap: anywhere; word-break: break-word; color: var(--text); }
+.st-meta { display: block; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.pref .st-acts { grid-row: 1 / span 2; grid-column: 2; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.st-box { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: var(--panel); display: grid; gap: 8px; min-width: 0; }
+.st-box.warn { border-color: color-mix(in srgb, var(--sun) 45%, var(--line)); background: color-mix(in srgb, var(--sun) 8%, var(--panel)); }
+.st-box.err { border-color: color-mix(in srgb, var(--red) 45%, var(--line)); background: color-mix(in srgb, var(--red) 8%, var(--panel)); }
+.st-box .st-hd { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.st-box.warn .st-hd svg { color: var(--sun-text); flex: none; }
+.st-box.err .st-hd svg { color: var(--red-text); flex: none; }
+.st-box p { color: var(--muted); font-size: var(--fs); overflow-wrap: anywhere; }
+.st-box .st-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.st-bar { width: 100%; height: 6px; border-radius: 9px; background: var(--raised); overflow: hidden; }
+.st-bar span { display: block; height: 100%; background: var(--blue); }
+.st-opts { display: grid; gap: 8px; margin-top: 4px; }
+.st-opt { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; align-items: start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); cursor: pointer; }
+.st-opt:has(input:checked) { border-color: var(--blue); background: color-mix(in srgb, var(--blue) 8%, var(--bg)); }
+.st-opt input { margin-top: 3px; accent-color: var(--blue); }
+.st-opt b { font-weight: 600; color: var(--text); }
+.st-opt small { grid-column: 2; color: var(--muted); font-size: var(--fs-small); }
+@media (max-width: 520px) { .pref.st-pref { grid-template-columns: minmax(0, 1fr); } .pref.st-pref .st-acts { grid-row: auto; grid-column: 1; justify-content: flex-start; margin-top: 8px; } }
 /* Chinese and Japanese break between any two characters: a short choice (关闭, 开启)
    stays on one line, as an English word does; Korean's too. Only in a CJK window,
    so English lays out as it did. */
@@ -1183,6 +1212,7 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 .about dt { color: var(--muted); }
 .about dd { font-variant-numeric: tabular-nums; }
 .about a { color: var(--blue-light); cursor: pointer; text-decoration: none; }
+.about .soc-i { width: 13px; height: 13px; vertical-align: -2px; margin-inline-end: 4px; opacity: .88; }
 /* The setup checklist: Linux opens on it until Kiri can run containers; the Mac shows it over a working window
    when a first-launch step failed (onboarding()). */
 #onb { position: fixed; inset: 0; z-index: 30; background: var(--bg); overflow: auto; display: grid; place-items: start center; }
@@ -1208,7 +1238,7 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 #onb .st.no, #onb .st.restart { background: rgba(255, 194, 61, .15); color: var(--sun-text); }
 #onb .st.bad { background: rgba(220, 53, 69, .16); color: var(--red-text); }
 #onb .st.off { background: var(--raised); color: var(--faint); }
-#onb .st.wait { border: 2px solid var(--line); border-top-color: var(--blue); animation: onbspin .8s linear infinite; }
+#onb .st.wait { border: 2px solid color-mix(in srgb, var(--sun) 20%, var(--line)); border-top-color: var(--sun); border-right-color: color-mix(in srgb, var(--sun) 65%, transparent); animation: onbspin .8s linear infinite; }
 @keyframes onbspin { to { transform: rotate(360deg); } }
 #onb .btn svg.i { width: 13px; height: 13px; }
 #onb .onb-ft { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
@@ -1223,6 +1253,26 @@ tr.row:hover td.actions .acts-row { background: linear-gradient(var(--fwd), tran
 #onb .onb-rs p { color: var(--muted); font-size: var(--fs-small); margin: 2px 0 8px; }
 #onb .onb-rs .a { display: flex; gap: 6px; }
 .scrim { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); display: grid; place-items: center; z-index: 8; }
+/* Universal Restarting overlay & shared restarting spinner (.rspin). */
+.rspin { --sz: 40px; position: relative; width: var(--sz); height: var(--sz); display: inline-grid; place-items: center; flex: none; }
+.rspin::before { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 2.5px solid color-mix(in srgb, var(--sun) 20%, var(--line)); border-top-color: var(--sun); border-right-color: color-mix(in srgb, var(--sun) 65%, transparent); animation: spin .85s cubic-bezier(.42, .15, .58, .85) infinite; }
+.rspin.sm { --sz: 16px; }
+.rspin.sm::before { border-width: 2px; }
+.rspin.md { --sz: 28px; }
+.rspin.md::before { border-width: 2.2px; }
+.rspin .kdot { width: 16px; height: 17px; animation: bob 1.5s ease-in-out infinite; }
+.rspin.md .kdot { width: 12px; height: 13px; }
+.rspin.plain .kdot { display: none; }
+.rscrim { position: fixed; inset: 0; z-index: 25; background: rgba(8, 12, 16, .58); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px); display: grid; place-items: center; animation: sh-fade .16s ease-out; }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .rscrim { background: rgba(15, 20, 25, .36); } }
+:root[data-theme="light"] .rscrim { background: rgba(15, 20, 25, .36); }
+.rdlg { width: min(360px, calc(100% - 32px)); background: var(--panel); border: 1px solid color-mix(in srgb, var(--sun) 32%, var(--line)); border-radius: 14px; padding: 24px 22px 20px; display: grid; justify-items: center; text-align: center; gap: 8px; box-shadow: 0 24px 60px rgba(0, 0, 0, .48); animation: sh-rise .2s ease-out; }
+.rdlg h3 { font-size: var(--fs-head); font-weight: 700; letter-spacing: -.01em; margin-top: 4px; }
+.rdlg .rwhat { color: var(--muted); font-size: var(--fs); max-width: 300px; line-height: 1.45; overflow-wrap: anywhere; }
+.rdlg .rstep { margin-top: 4px; display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px; border-radius: 999px; background: var(--raised); border: 1px solid var(--line); font-size: var(--fs-small); color: var(--muted); font-variant-numeric: tabular-nums; max-width: 100%; }
+.rdlg .rstep i { width: 6px; height: 6px; border-radius: 50%; background: var(--sun); flex: none; animation: pulse .75s infinite alternate; }
+.rdlg .rbar { width: 100%; height: 4px; border-radius: 99px; background: var(--raised); overflow: hidden; margin-top: 6px; }
+.rdlg .rbar span { display: block; height: 100%; background: var(--sun); border-radius: 99px; transition: width .35s ease; }
 /* The language step's dialog takes its height from this box, not the window's:
    Text size zooms the page, and 100vh would be the unzoomed window. */
 .scrim.langstep { z-index: 40; grid-template: minmax(0, 1fr) / minmax(0, 1fr); }
@@ -2345,6 +2395,15 @@ main { position: relative; }
 .htctx .mi { display: flex; align-items: center; gap: 8px; width: 100%; height: 28px; padding: 0 8px; border: 0; border-radius: 6px; background: none; cursor: pointer; color: var(--text); font: var(--fs) var(--ui-font); text-align: var(--start); }
 .htctx .mi:hover { background: var(--blue); color: #fff; }
 .htctx .mi:disabled { color: var(--faint); background: none; cursor: default; }
+.appctx { position: fixed; z-index: 120; min-width: 160px; padding: 5px; background: var(--raised); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 14px 40px rgb(0 0 0 / .45); }
+.appctx[hidden] { display: none; }
+.appctx .mi { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; height: 28px; padding-block: 0; padding-inline: 8px; border: 0; border-radius: 6px; background: none; cursor: pointer; color: var(--text); font: var(--fs) var(--ui-font); text-align: var(--start); }
+.appctx .mi:hover { background: var(--blue); color: #fff; }
+.appctx .mi:hover .k { color: rgb(255 255 255 / .8); }
+.appctx .mi:disabled { color: var(--faint); background: none; cursor: default; }
+.appctx .mi:disabled .k { color: var(--faint); }
+.appctx .mi .k { color: var(--faint); font-size: var(--fs-xs); }
+.appctx hr { border: 0; border-top: 1px solid var(--line); margin: 4px 2px; }
 .httab .x:hover { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
 .hthead .grow { flex: 1; min-width: 10px; align-self: stretch; }
 .hthead .sep { width: 1px; height: 16px; background: var(--line); margin: 0 4px; }
@@ -2575,6 +2634,7 @@ tr.usb-more > td { padding: 0; background: var(--panel); }
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <div id="updcard" aria-live="polite"></div>
 <div id="ctxcard" class="updcard" aria-live="polite" hidden></div>
+<div class="rscrim" id="rscrim" role="alertdialog" aria-modal="true" aria-live="assertive" aria-busy="true" hidden></div>
 
 <script>/*ICONS*/</script>
 <!-- The built-in terminal's emulator: xterm.js and its add-ons (xterm/, spliced in by assemble.rs). -->
@@ -2749,8 +2809,10 @@ const AR_FONTS = '"SF Arabic", "Geeza Pro", "Segoe UI", "Noto Sans Arabic", "Not
    each script, Windows' (Ebrima and Nyala for Ethiopic, Nirmala UI for India's,
    Leelawadee UI for Thai and Lao), then Linux's Noto. */
 const SCRIPT_FONTS = {
+  hy: '"Noto Sans Armenian", "Mshtakan", "Sylfaen", ',
   am: '"Kefa", "Ebrima", "Nyala", "Noto Sans Ethiopic", ',
   hi: '"Kohinoor Devanagari", "Devanagari Sangam MN", "Nirmala UI", "Noto Sans Devanagari", ',
+  ne: '"Noto Sans Devanagari", "Kohinoor Devanagari", "Devanagari Sangam MN", "Nirmala UI", ',
   bn: '"Kohinoor Bangla", "Bangla Sangam MN", "Nirmala UI", "Noto Sans Bengali", ',
   ta: '"Tamil Sangam MN", "InaiMathi", "Nirmala UI", "Noto Sans Tamil", ',
   te: '"Kohinoor Telugu", "Telugu Sangam MN", "Nirmala UI", "Noto Sans Telugu", ',
@@ -2778,17 +2840,17 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0,
+const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], volSizes: {}, volSizesLoading: false, volSizesAt: 0, volSizesKey: "", volSizesInFlight: 0, networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, storage: null, stErr: "", stReclaiming: false, stReclaimed: null, stPruning: false, stPruned: null, bset: null, bsetDraft: null, vmnet: null, shellPath: null, shellPathBusy: false, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" }, dockersock: null, sockTaking: false, ctxSwitching: false,
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
-  upd: null, engineStale: null, staleHidden: false,
+  upd: null, engineStale: null, staleHidden: false, restarting: null,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
   bl: { items: null, error: "", sel: null, d: null, steps: "all", internal: false, open: new Set(), confirm: null, tab: "steps", layers: null, plat: null } };
 function resetPicks() { ui.imp.picked = { images: new Set(), volumes: new Set(), containers: new Set() }; ui.imp.steps = {}; ui.imp.summary = ""; }
 // Asleep is ready: the VM sleeps after a minute with nothing running and the next
 // request wakes it in milliseconds, so it reads as Ready with Stop, never as stopped
 // with Start. Start is for an engine someone stopped (Stop, `kiri stop`).
-const vmLabels = { stopped: "Off", booting: "Starting…", running: "Running", stopping: "Stopping…" };
-/* i18n */ void [tr("Off"), tr("Starting…"), tr("Running"), tr("Stopping…")];
+const vmLabels = { stopped: "Off", booting: "Starting…", running: "Running", stopping: "Stopping…", restarting: "Restarting…" };
+/* i18n */ void [tr("Off"), tr("Starting…"), tr("Running"), tr("Stopping…"), tr("Restarting…")];
 /* i18n */ void [tr("Mac"), tr("PC"), tr("computer"), tr("Linux VM"), tr("Engine")];
 
 function size(b) {
@@ -2831,11 +2893,13 @@ function exitWord(code) {
   if (code === 139) return tr("Crashed (139)");
   return tr("Failed ({code})", { code });
 }
+// Ended by the VM stopping, or by a stop or kill (an app often exits 143 on SIGTERM); 137 still reads Killed.
+const stoppedNotFailed = (c) => c.KiriVmStopped || (c.KiriStoppedByUser && exitCode(c) !== 137);
 function statusText(c) {
   if (c.State === "exited" && c.KiriOOMKilled) return tr("Out of memory");
   if (c.State === "running" && c.KiriStartedAt) return tr("Up {time}", { time: since(c.KiriStartedAt) });
   if (c.State === "paused" && c.KiriStartedAt) return tr("Up {time} (Paused)", { time: since(c.KiriStartedAt) });
-  if (c.State === "exited") return c.KiriVmStopped ? tr("Stopped") : exitWord(exitCode(c));
+  if (c.State === "exited") return stoppedNotFailed(c) ? tr("Stopped") : exitWord(exitCode(c));
   return shortStatus(c.Status);
 }
 /* The hover text: when it stopped, and Docker's own words for a failure. */
@@ -2851,7 +2915,7 @@ function statusTitle(c) {
 function exitClass(c) {
   if (c.State !== "exited") return "";
   if (c.KiriOOMKilled) return " failed";
-  if (c.KiriVmStopped) return "";
+  if (stoppedNotFailed(c)) return "";
   const code = exitCode(c);
   return code === 0 ? "" : code === 137 ? " killed" : " failed";
 }
@@ -2965,7 +3029,7 @@ function themeBtn() {
   b.firstElementChild.innerHTML = `<path d="${PH[dark ? "sun" : "moon"]}"/>`;
 }
 const fontLists = { families: [], mono: [] };
-const optsMemo = {}, settingsShown = { html: "", el: null };
+const optsMemo = {}, settingsShown = { html: "", el: null, tab: "" };
 let about = null;
 const SIZES = [0.9, 1, 1.1, 1.25];
 /* Logs are small unless you choose otherwise: they're long and wide. */
@@ -2989,12 +3053,129 @@ function applyPrefs() {
   r.setProperty("--blue-light", `color-mix(in srgb, ${accent} 60%, white)`);
   window.htApply?.();
 }
-/* A right-click gets no browser menu (Reload, Back, Inspect): this is an app,
-   not a web page. Text fields and selected text keep theirs, for Copy and Paste. */
+/* Right-click never opens the WebView's browser menu (Safari's Search with
+   Google, Look Up, Translate, Copy Link with Highlight, Share…): Kiri draws
+   its own app menu with only editing actions (Copy on selected text, Cut /
+   Copy / Paste / Select All in text fields, Copy / Paste in the terminal). */
+const appCtxEl = document.createElement("div");
+appCtxEl.id = "app-ctx";
+appCtxEl.className = "appctx";
+appCtxEl.setAttribute("role", "menu");
+appCtxEl.hidden = true;
+document.body.append(appCtxEl);
+let ctxTarget = null, ctxPasteField = null;
+function hideAppCtx() { appCtxEl.hidden = true; ctxTarget = null; }
+function isTextField(el) {
+  if (!el) return false;
+  if (el.tagName === "TEXTAREA") return true;
+  if (el.tagName === "INPUT") {
+    const t = (el.type || "text").toLowerCase();
+    return ["text", "search", "url", "tel", "password", "email", "number"].includes(t);
+  }
+  return false;
+}
+function fieldRange(el) {
+  try {
+    if (typeof el.selectionStart === "number" && typeof el.selectionEnd === "number") return [el.selectionStart, el.selectionEnd, true];
+  } catch {}
+  const len = (el.value || "").length;
+  return [0, len, false];
+}
+function replaceFieldText(el, text, start, end, hasRange) {
+  el.focus();
+  if (hasRange) {
+    try { el.setRangeText(text, start, end, "end"); }
+    catch { el.value = (el.value || "").slice(0, start) + text + (el.value || "").slice(end); }
+  } else {
+    el.value = text;
+  }
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+function ctxItem(act, label, key, disabled) {
+  return `<button type="button" class="mi" role="menuitem" data-ctx="${act}"${disabled ? " disabled" : ""}><span>${label}</span>${key ? `<span class="k">${esc(key)}</span>` : ""}</button>`;
+}
+function openAppCtx(ev, html) {
+  setHTML(appCtxEl, html);
+  appCtxEl.hidden = false;
+  const zoom = Number(prefs.scale) || 1, vw = (innerWidth || 800) / zoom, vh = (innerHeight || 600) / zoom;
+  const rect = appCtxEl.getBoundingClientRect(), mw = (rect.width || 168) / zoom, mh = (rect.height || 38) / zoom;
+  const x = Math.max(6, Math.min((ev.clientX || 0) / zoom, vw - mw - 6));
+  const y = Math.max(6, Math.min((ev.clientY || 0) / zoom, vh - mh - 6));
+  appCtxEl.style.left = `${x}px`;
+  appCtxEl.style.top = `${y}px`;
+}
 document.addEventListener("contextmenu", (ev) => {
-  const editable = ev.target.closest?.("input, textarea, [contenteditable]");
-  if (!editable && !String(getSelection()).trim()) ev.preventDefault();
+  ev.preventDefault();
+  const htMenuEl = document.querySelector(".htctx");
+  if (htMenuEl) htMenuEl.hidden = true;
+  const modKey = WIN || LINUX ? "Ctrl+" : "⌘";
+  const field = ev.target.closest?.("input, textarea");
+  if (isTextField(field) && !field.disabled) {
+    if (document.activeElement !== field) field.focus();
+    const [start, end, hasRange] = fieldRange(field);
+    const isPwd = (field.type || "").toLowerCase() === "password";
+    const writable = !field.readOnly;
+    const selected = !isPwd && hasRange && end > start ? (field.value || "").slice(start, end) : (!isPwd && !hasRange ? (field.value || "") : "");
+    const hasText = (field.value || "").length > 0;
+    ctxTarget = { kind: "field", el: field, start, end, hasRange, text: selected, writable };
+    const items = writable
+      ? [
+          ctxItem("cut", tr("Cut"), `${modKey}X`, !selected),
+          ctxItem("copy", tr("Copy"), `${modKey}C`, !selected),
+          ctxItem("paste", tr("Paste"), `${modKey}V`, false),
+          "<hr>",
+          ctxItem("selectall", tr("Select All"), `${modKey}A`, !hasText),
+        ]
+      : [
+          ctxItem("copy", tr("Copy"), `${modKey}C`, !selected),
+          ctxItem("selectall", tr("Select All"), `${modKey}A`, !hasText),
+        ];
+    openAppCtx(ev, items.join(""));
+    return;
+  }
+  const paneEl = ev.target.closest?.(".htpane");
+  if (paneEl && ev.target.closest?.(".htx, .xterm") && typeof htPane === "function") {
+    const p = htPane(paneEl.dataset.id);
+    if (!p) { hideAppCtx(); return; }
+    const selected = p.term?.getSelection() || "";
+    ctxTarget = { kind: "term", pane: p, text: selected };
+    const tk = WIN || LINUX ? "Ctrl+Shift+" : "⌘";
+    openAppCtx(ev, [
+      ctxItem("copy", tr("Copy"), `${tk}C`, !selected),
+      ctxItem("paste", tr("Paste"), `${tk}V`, Boolean(p.exited)),
+    ].join(""));
+    return;
+  }
+  const selected = String(getSelection());
+  if (!selected.trim()) { hideAppCtx(); return; }
+  ctxTarget = { kind: "selection", text: selected };
+  openAppCtx(ev, ctxItem("copy", tr("Copy"), `${modKey}C`, false));
 });
+appCtxEl.addEventListener("mousedown", (ev) => ev.preventDefault());
+appCtxEl.addEventListener("click", (ev) => {
+  const btn = ev.target.closest?.("[data-ctx]");
+  if (!btn || btn.disabled) return;
+  const act = btn.dataset.ctx, t = ctxTarget;
+  hideAppCtx();
+  if (!t) return;
+  if (act === "copy") {
+    if (t.kind === "term") htCopy(t.pane);
+    else if (t.text) send("term", { name: "copy", value: t.text });
+  } else if (act === "cut" && t.kind === "field" && t.writable && t.text) {
+    send("term", { name: "copy", value: t.text });
+    replaceFieldText(t.el, "", t.start, t.end, t.hasRange);
+  } else if (act === "paste") {
+    if (t.kind === "term") send("term", { name: "paste", id: t.pane.id });
+    else if (t.kind === "field" && t.writable) { ctxPasteField = t.el; send("term", { name: "paste", id: "__field" }); }
+  } else if (act === "selectall" && t.kind === "field") {
+    t.el.focus();
+    try { t.el.select(); } catch {}
+  }
+});
+document.addEventListener("mousedown", (ev) => { if (!ev.target.closest?.("#app-ctx")) hideAppCtx(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !appCtxEl.hidden) hideAppCtx(); });
+document.addEventListener("scroll", hideAppCtx, true);
+addEventListener("blur", hideAppCtx);
 /* Copy with the keyboard: selected text (a log, a row's value) goes to the
    clipboard the way the terminal's does. On the Mac, Edit → Copy does it.
    Text fields and the terminal keep their own handling. */
@@ -3171,12 +3352,20 @@ function ssScan() {
   for (const s of ssSels) if (s.ssb) ssSync(s); else if (!s.classList.contains("lsrc")) ssWrap(s);
   ss.open?.check();
 }
+function ssMut(records) {
+  for (const b of ss.btns) if (!b.isConnected || b.nextSibling !== b.ssOf) return ssScan();
+  for (const s of ssSels) if (!s.ssb && !s.classList.contains("lsrc")) return ssScan();
+  for (const r of records) {
+    const t = r.target;
+    if (t.nodeType === 1 && (t.tagName === "SELECT" || t.closest?.("select, label"))) return ssScan();
+  }
+}
 // A value set from code shows on the button too.
 for (const p of ["value", "selectedIndex"]) {
   const d = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, p);
   Object.defineProperty(HTMLSelectElement.prototype, p, { ...d, set(v) { d.set.call(this, v); if (this.ssb) ssSync(this); } });
 }
-new MutationObserver(ssScan).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "selected", "aria-label"] });
+new MutationObserver(ssMut).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "selected", "aria-label"] });
 ssScan();
 function ssOpen(b) {
   if (ss.open) { const was = ss.open.b; ss.open.close(true); if (was === b) return; }
@@ -3352,8 +3541,12 @@ window.kiriWords = (p) => {
 /* A container's page: Overview, Logs, Terminal, Files. The log console and
    the terminal are kept as live elements, so a list refresh never wipes
    them or what is being typed. */
-const logEl = Object.assign(document.createElement("div"), { className: "console numbered", tabIndex: 0 });
-logEl.setAttribute("role", "log");
+function makeLogConsole() {
+  const el = Object.assign(document.createElement("div"), { className: "console numbered", tabIndex: 0, _shown: 0 });
+  el.setAttribute("role", "log");
+  return el;
+}
+const logEl = makeLogConsole();
 const termEl = document.createElement("div");
 termEl.className = "term";
 termEl.innerHTML = `<div class="console" id="term-out" tabindex="0"></div>
@@ -3386,7 +3579,7 @@ function openDetail(id) {
   const name = c.Names[0].replace(/^\//, "");
   ui.detail = { id, name, tab: "overview", info: null, logsOn: false, follow: true, logFilter: "", logLevel: "",
                 term: { history: [], at: -1, user: "", host: "", cwd: "", probed: false }, files: { path: "/", entries: null, selected: null, preview: null } };
-  logEl.textContent = "";
+  logEl.textContent = ""; logEl._shown = 0;
   termEl.querySelector("#term-out").textContent = "";
   ui.partial = { false: "", true: "" }; ui.logN = 0;
   ui.detail.stats = [];
@@ -3482,7 +3675,7 @@ function closeDetail() {
 function setTab(tab) {
   const d = ui.detail;
   d.tab = tab;
-  if (tab === "logs" && !d.logsOn) { d.logsOn = true; logEl.textContent = ""; ui.partial = { false: "", true: "" }; ui.logN = 0; send("logs", { id: d.id }); }
+  if (tab === "logs" && !d.logsOn) { d.logsOn = true; logEl.textContent = ""; logEl._shown = 0; ui.partial = { false: "", true: "" }; ui.logN = 0; send("logs", { id: d.id }); }
   if (tab === "files" && !d.files.entries) browse("/");
   if (tab === "overview") send("inspect", { id: d.id });
   watchStats();
@@ -3507,21 +3700,30 @@ function levelOf(line) {
   return "";
 }
 const shown = (div, f, lvl) => (!f || div.textContent.toLowerCase().includes(f)) && (!lvl || div.dataset.lvl === lvl);
-function logCount() {
-  const el = $("log-count");
-  if (!el) return;
-  const all = logEl.childElementCount, d = ui.detail;
-  const showing = d.logFilter || d.logLevel ? [...logEl.children].filter((x) => !x.classList.contains("hide")).length : all;
-  el.textContent = d.logFilter || d.logLevel ? tr("{showing} of {all} lines", { showing: showing.toLocaleString(), all: all.toLocaleString() }) : tr("{all} lines", { all: all.toLocaleString() });
+const LOG_LEVEL_OPTS = () => [["", tr("All levels")], ["error", tr("Error")], ["warn", tr("Warn")], ["info", tr("Info")], ["debug", tr("Debug")]];
+function logToolbarHtml({ prefix, filter, level, follow, left = "", right = "", reloadAttr = "", clearAttr }) {
+  return `<div class="logbar">${left}<input class="field" id="${prefix}-filter" placeholder="${tr("Find in logs")}" spellcheck="false" value="${esc(filter)}">
+    <select id="${prefix}-level" aria-label="${tr("Level")}">${LOG_LEVEL_OPTS().map(([v, l]) => `<option value="${v}"${level === v ? " selected" : ""}>${l}</option>`).join("")}</select>
+    <span class="logcount" id="${prefix}-count"></span>
+    <span class="spacer" style="flex:1"></span>
+    ${right}<label class="toggle"><input type="checkbox" id="${prefix}-follow"${follow ? " checked" : ""}> ${tr("Follow")}</label>${reloadAttr ? btn(tr("Reload"), reloadAttr) : ""}${btn(tr("Clear"), clearAttr)}</div>`;
 }
-
-function addLogs(parts) {
-  const atEnd = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
-  const filter = ui.detail.logFilter.toLowerCase(), level = ui.detail.logLevel;
+function updateLogCount(el, countId, d) {
+  const cnt = $(countId);
+  if (!cnt || !d) return;
+  const all = el.childElementCount;
+  const showing = d.logFilter || d.logLevel ? (el._shown ?? all) : all;
+  cnt.textContent = d.logFilter || d.logLevel ? tr("{showing} of {all} lines", { showing: showing.toLocaleString(), all: all.toLocaleString() }) : tr("{all} lines", { all: all.toLocaleString() });
+}
+function appendLogParts(el, countId, d, partial, nextN, parts) {
+  const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  const filter = d.logFilter.toLowerCase(), level = d.logLevel;
   const frag = document.createDocumentFragment();
+  let addedShown = 0;
   for (const p of parts) {
-    const lines = (ui.partial[p.e] + p.t.replace(ansi, "").replace(/\r\n/g, "\n")).split("\n");
-    ui.partial[p.e] = lines.pop();
+    const key = Boolean(p.e);
+    const lines = ((partial[key] || "") + p.t.replace(ansi, "").replace(/\r\n/g, "\n")).split("\n");
+    partial[key] = lines.pop();
     for (const line of lines) {
       const div = document.createElement("div");
       const lvl = levelOf(line);
@@ -3529,22 +3731,50 @@ function addLogs(parts) {
       if (lvl && lvl !== "info") div.className = `lvl-${lvl}`;
       else if (p.e) div.className = "err";
       div.textContent = line || " ";
-      div.dataset.n = ++ui.logN;
-      if (!shown(div, filter, level)) div.classList.add("hide");
+      div.dataset.n = nextN();
+      if (shown(div, filter, level)) addedShown++;
+      else div.classList.add("hide");
       frag.append(div);
     }
   }
-  logEl.append(frag);
-  while (logEl.childElementCount > LOG_MAX) logEl.firstElementChild.remove();
-  if (ui.detail.follow && atEnd || ui.detail.follow && parts.length > 50) logEl.scrollTop = logEl.scrollHeight;
-  logCount();
+  el._shown = (el._shown ?? el.childElementCount) + addedShown;
+  el.append(frag);
+  while (el.childElementCount > LOG_MAX) {
+    if (!el.firstElementChild.classList.contains("hide")) el._shown--;
+    el.firstElementChild.remove();
+  }
+  if (d.follow && atEnd || d.follow && parts.length > 50) el.scrollTop = el.scrollHeight;
+  updateLogCount(el, countId, d);
 }
-
-function filterLogs() {
-  const d = ui.detail, f = d.logFilter.toLowerCase();
-  for (const div of logEl.children) div.classList.toggle("hide", !shown(div, f, d.logLevel));
-  logCount();
+function applyLogFilter(el, countId, d) {
+  const f = d.logFilter.toLowerCase();
+  let visCount = 0;
+  for (const div of el.children) {
+    const vis = shown(div, f, d.logLevel);
+    div.classList.toggle("hide", !vis);
+    if (vis) visCount++;
+  }
+  el._shown = visCount;
+  updateLogCount(el, countId, d);
 }
+function appendLogEnd(el, text) {
+  const div = document.createElement("div");
+  div.className = "quiet";
+  div.textContent = text;
+  el._shown = (el._shown ?? el.childElementCount) + 1;
+  el.append(div);
+}
+function clearLogConsole(el, countId, d, partial, resetN) {
+  el.textContent = "";
+  el._shown = 0;
+  partial.false = "";
+  partial.true = "";
+  resetN();
+  updateLogCount(el, countId, d);
+}
+function logCount() { updateLogCount(logEl, "log-count", ui.detail); }
+function addLogs(parts) { appendLogParts(logEl, "log-count", ui.detail, ui.partial, () => ++ui.logN, parts); }
+function filterLogs() { applyLogFilter(logEl, "log-count", ui.detail); }
 
 /* The prompt, as a shell shows it: user@host:dir# (or $ for other users).
    Until the container has answered, it comes from the inspect data. */
@@ -3694,12 +3924,7 @@ function renderDetail() {
   else if (d.tab === "logs" && keepLogs) logCount();
   else if (d.tab === "logs") {
     body.dataset.logs = c.Id;
-    const levels = [["", tr("All levels")], ["error", tr("Error")], ["warn", tr("Warn")], ["info", tr("Info")], ["debug", tr("Debug")]];
-    body.innerHTML = `<div class="logbar"><input class="field" id="log-filter" placeholder="${tr("Find in logs")}" spellcheck="false" value="${esc(d.logFilter)}">
-      <select id="log-level" aria-label="${tr("Level")}">${levels.map(([v, l]) => `<option value="${v}"${d.logLevel === v ? " selected" : ""}>${l}</option>`).join("")}</select>
-      <span class="logcount" id="log-count"></span>
-      <span class="spacer" style="flex:1"></span>
-      <label class="toggle"><input type="checkbox" id="log-follow"${d.follow ? " checked" : ""}> ${tr("Follow")}</label>${btn(tr("Clear"), "data-logclear")}</div>`;
+    body.innerHTML = logToolbarHtml({ prefix: "log", filter: d.logFilter, level: d.logLevel, follow: d.follow, clearAttr: "data-logclear" });
     body.append(logEl);
     logCount();
     $("log-filter").addEventListener("input", (ev) => { d.logFilter = ev.target.value; filterLogs(); });
@@ -3775,9 +4000,10 @@ function filesView(d) {
 /* A container's local address: the name it chose with the dev.kiri.domain
    label, else its Compose service.project, else its own name. */
 function localUrl(c, name) {
+  const scheme = ui.https ? "https" : "http", r = ui.rports?.[scheme];
+  if (r && (r.running === false || r.serving === false)) return "";
   const chosen = (c.Labels?.["dev.kiri.domain"] || "").split(",")[0].trim().replace(/\.kiri\.local(host)?$/, "");
   const project = c.Labels?.["com.docker.compose.project"];
-  const scheme = ui.https ? "https" : "http", r = ui.rports?.[scheme];
   const port = r && r.port !== r.default ? `:${r.port}` : "";
   return `${scheme}://${chosen || (project ? `${c.Labels["com.docker.compose.service"]}.${project}` : name)}.${ui.suffix}${port}`;
 }
@@ -3791,6 +4017,40 @@ const KIRI_MARK = `<svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><g t
 const KDOT = `<svg class="kdot" viewBox="0 0 30 32" aria-hidden="true"><g transform="skewX(-10) translate(5 0)"><rect x="2" y="1" width="26" height="30" rx="8" fill="#E0B420"/>
   <path d="M2 9a8 8 0 0 1 8-8h10a8 8 0 0 1 8 8v-.5H2z" fill="#F2CF5B"/>
   <ellipse cx="12" cy="15" rx="2.6" ry="3" fill="#0F1419"/><ellipse cx="20" cy="15" rx="2.6" ry="3" fill="#0F1419"/></g></svg>`;
+const rspin = (cls = "") => `<span class="rspin${cls ? ` ${cls}` : ""}" aria-hidden="true">${cls.includes("plain") ? "" : KDOT}</span>`;
+function drawRestartOverlay() {
+  const el = $("rscrim"), r = ui.restarting;
+  if (!el) return;
+  if (!r) { el.hidden = true; el.innerHTML = ""; return; }
+  el.hidden = false;
+  setHTML(el, `<div class="rdlg">${rspin()}<h3>${tr("Restarting…")}</h3>${r.what ? `<p class="rwhat">${r.what}</p>` : ""}${r.step ? `<span class="rstep"><i></i><span>${esc(r.step)}</span></span>` : ""}${r.pct != null ? `<div class="rbar"><span style="width:${r.pct}%"></span></div>` : ""}</div>`);
+}
+function startRestartOverlay(kind, what, step, pct = null) {
+  ui.restarting = { kind, what: what || "", step: step || tr("Restarting…"), pct };
+  drawRestartOverlay();
+  paintEngine();
+  renderStatus();
+  if (ui.view === "settings" && prefs.tab === "resources") render();
+}
+function setRestartStep(step, pct = ui.restarting?.pct ?? null) {
+  if (!ui.restarting) return;
+  ui.restarting.step = step;
+  ui.restarting.pct = pct;
+  drawRestartOverlay();
+}
+function stopRestartOverlay() {
+  if (!ui.restarting) return;
+  ui.restarting = null;
+  drawRestartOverlay();
+  paintEngine();
+  renderStatus();
+  if (ui.view === "settings") render();
+}
+function restartVm() {
+  const note = esc(ui.res?.restart_note || tr("Restarting stops the running containers; start them again afterwards."));
+  startRestartOverlay("vm", note, tr("Stopping containers…"));
+  send("restartvm");
+}
 const localChip = (url) => `<button class="local" data-open="${esc(url)}" title="${tr("Open {url}", { url: esc(url) })}"><span>${esc(url.replace(/^https?:\/\//, ""))}</span></button>`;
 
 /* First open: two small pictures of the same app, by port and by name. */
@@ -3837,6 +4097,7 @@ const ONB_MAC = [
   tr("The engine runs from the app for now"), tr("Show log"), tr("Continue anyway"), tr("One step didn't work. Everything else is ready."), tr("Some steps didn't work. Everything else is ready.")];
 const onbIcon = (name) => `<svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH[name]}"/></svg>`;
 function onboarding(e) {
+  if (ui.restarting?.kind === "onb") stopRestartOverlay();
   ui.onb = { ...e, busy: null };
   let el = $("onb");
   if (!el) {
@@ -3888,17 +4149,19 @@ function onbClick(ev) {
     o.error = "";
     send("onbskip", { name: b.dataset.onbskip, value: !b.dataset.undo });
   } else if (b.dataset.onbfix) {
+    if (b.dataset.onbfix === "running" && o.checks?.running === "bad") startRestartOverlay("onb", "", tr("Restarting engine…"));
     o.busy = b.dataset.onbfix;
     o.error = "";
     drawOnb();
     send("onbfix", { name: b.dataset.onbfix });
   } else if (b.dataset.onb === "open") {
+    if (ui.restarting?.kind === "onb") stopRestartOverlay();
     $("onb")?.remove();
     ui.onb = null;
     send("onbopen");
   } else if (b.dataset.onb === "log") send("diagfolder");
   else if (b.dataset.onb === "logout") send("onblogout");
-  else if (b.dataset.onb === "restart") send("onbrestart");
+  else if (b.dataset.onb === "restart") { startRestartOverlay("onb", "", tr("Restarting…")); send("onbrestart"); }
 }
 
 /* The first start: which language, before anything else: langStep
@@ -4064,6 +4327,7 @@ const CTX_NAMES = { orbstack: "OrbStack", "desktop-linux": "Docker Desktop", def
 const CTX_SNOOZE = 7 * 864e5;
 const ctx = { card: null };
 const ctxOther = () => !!ui.status && ui.status.context !== ui.status.ours;
+const ctxPinned = () => ui.status?.pinned || "";
 const ctxLabel = (c) => (CTX_NAMES[c] ? tr(CTX_NAMES[c]) : c);
 const ctxWarn = (cls = "") => `<svg class="${cls}" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg>`;
 // "1.2GB", "187MB", "5.6kB" (docker's image sizes) in bytes.
@@ -4072,16 +4336,25 @@ const ctxBytes = (v) => { const m = /^([\d.]+)\s*([kMGT]?)B$/i.exec(String(v || 
 function ctxStatusItem() {
   if (!ui.status) return "";
   if (!ctxOther()) return `<span class="sep">·</span><span class="item ctx-ok" title="${tr("The docker command uses {app}", { app: esc(ui.status.app || "Kiri") })}"><i></i>docker → ${esc(ui.status.app || "Kiri")}</span>`;
+  const pinned = ctxPinned();
+  if (pinned) return `<span class="sep">·</span><button class="item ctx-warn" data-ctxswitch title="${tr("{env} is set, so docker uses another engine instead of {app}", { env: esc(pinned), app: esc(ui.status.app || "Kiri") })}">${ctxWarn()}docker → ${esc(pinned)}</button>`;
   return `<span class="sep">·</span><button class="item ctx-warn" data-ctxswitch title="${tr("The docker command uses {engine}. Switch it to {app}", { engine: esc(ctxLabel(ui.status.context)), app: esc(ui.status.app || "Kiri") })}">${ctxWarn()}docker → ${esc(rtl() ? island(ctxLabel(ui.status.context)) : ctxLabel(ui.status.context))}</button>`;
 }
 
 function renderCtxStrip() {
   const el = $("impstrip");
   if (!ctxOther() || !["containers", "images"].includes(ui.view) || Date.now() < (prefs.ctxSnooze || 0) || ctx.card) return false;
-  el.innerHTML = `${ctxWarn("is-warn")}
-    <span class="is-text">${tr("<b>docker still uses {engine}</b>, so what you run in the terminal won't show up here. Your images can come along.", { engine: esc(ctxLabel(ui.status.context)) })}</span>
-    <button class="btn sm primary" data-ctxswitch>${tr("Switch to {app}", { app: esc(ui.status.app || "Kiri") })}</button>
-    <button class="is-x" data-ctxsnooze title="${tr("Not now: ask again in a week")}" aria-label="${tr("Not now")}">×</button>`;
+  const pinned = ctxPinned();
+  if (pinned) {
+    el.innerHTML = `${ctxWarn("is-warn")}
+      <span class="is-text">${tr("{env} is set, so {docker} uses another engine instead of {app}. Unset it in your shell to use {app}.", { env: `<code>${esc(pinned)}</code>`, docker: "<code>docker</code>", app: esc(ui.status.app || "Kiri") })}</span>
+      <button class="is-x" data-ctxsnooze title="${tr("Not now: ask again in a week")}" aria-label="${tr("Not now")}">×</button>`;
+  } else {
+    el.innerHTML = `${ctxWarn("is-warn")}
+      <span class="is-text">${tr("<b>docker still uses {engine}</b>, so what you run in the terminal won't show up here. Your images can come along.", { engine: esc(ctxLabel(ui.status.context)) })}</span>
+      <button class="btn sm primary" data-ctxswitch>${tr("Switch to {app}", { app: esc(ui.status.app || "Kiri") })}</button>
+      <button class="is-x" data-ctxsnooze title="${tr("Not now: ask again in a week")}" aria-label="${tr("Not now")}">×</button>`;
+  }
   el.classList.add("ctx");
   el.hidden = false;
   return true;
@@ -4096,7 +4369,21 @@ function ctxImages(from) {
 function ctxDialog() {
   if (!ctxOther()) return;
   $("ctx-dlg")?.remove();
-  const from = ui.status.context, label = ctxLabel(from), app = ui.status.app || "Kiri";
+  const pinned = ctxPinned(), app = ui.status.app || "Kiri";
+  if (pinned) {
+    const cmd = WIN ? `Remove-Item Env:${esc(pinned)}` : `unset ${esc(pinned)}`;
+    const scrim = document.createElement("div");
+    scrim.className = "scrim"; scrim.id = "ctx-dlg";
+    scrim.innerHTML = `<div class="dialog ctx-dlg" role="dialog" aria-modal="true" aria-labelledby="ctx-h">
+      <h3 id="ctx-h">${tr("{env} is set", { env: esc(pinned) })}</h3>
+      <p class="muted" style="font-size:var(--fs);margin:8px 0 14px">${tr("{env} overrides docker's context in this session, so switching context won't move {docker} to {app}. Clear it with {cmd} or remove it from your profile.", { env: `<span class="mono">${esc(pinned)}</span>`, docker: "<code>docker</code>", app: esc(app), cmd: `<code>${cmd}</code>` })}</p>
+      <div class="ctx-foot"><span></span><span><button class="btn primary" data-close>${tr("OK")}</button></span></div></div>`;
+    document.body.append(scrim);
+    scrim.addEventListener("click", (ev) => { if (ev.target === scrim || ev.target.closest("[data-close]")) scrim.remove(); });
+    scrim.querySelector("[data-close]").focus();
+    return;
+  }
+  const from = ui.status.context, label = ctxLabel(from);
   const src = ui.imp.sources?.find((s) => s.id === from), imgs = ctxImages(from), inv = ui.imp.inv;
   if (src?.running && !imgs) send("inventory", { name: from });
   const bytes = (imgs || []).reduce((a, v) => a + ctxBytes(v.size), 0);
@@ -4345,6 +4632,22 @@ function builderPref() {
     <button class="btn sm" data-buildprune${ui.bwPruning ? " disabled" : ""}>${ui.bwPruning ? tr("Clearing…") : tr("Clear build cache")}</button></div>`;
 }
 
+/* Settings → Builds: cache limit and idle sleep (/kiri/builder). */
+function builderSettingsPrefs() {
+  const s = ui.bset;
+  if (!s || s.error) return "";
+  const cacheVal = Math.min(128, Math.max(2, Number(ui.bsetDraft?.cache_gb ?? s.cache_gb ?? s.default_cache_gb ?? 20)));
+  const idleVal = Number(ui.bsetDraft?.idle_secs ?? s.idle_secs ?? 300);
+  const idleOpts = [[300, tr("5 min")], [600, tr("10 min")], [1800, tr("30 min")], [0, tr("Never")]];
+  return `<div class="pref"><span class="t">${tr("Build cache limit")}</span>
+      <span class="d">${tr("Oldest cached layers are pruned automatically once BuildKit's cache passes this size.")}</span>
+      <div class="range"><input type="range" id="bld-cache" min="2" max="128" step="2" value="${cacheVal}" aria-label="${tr("Build cache limit")}" style="--fill:${rangeFill(cacheVal, 2, 128)}"><span class="num" id="bld-cache-v">${diskGb(cacheVal)}</span></div></div>
+    <div class="pref"><span class="t">${tr("Stop builder when idle")}</span>
+      <span class="d">${tr("Stops BuildKit between builds so it uses no memory while idle; the next build wakes it in under a second.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Stop builder when idle")}">${idleOpts.map(([v, l]) => `<button data-bldidle="${v}" aria-pressed="${idleVal === v}">${l}</button>`).join("")}</div></div>
+    ${s.overridden ? `<p class="muted">${tr("KIRI_BUILD_CACHE_GB or KIRI_BUILDER_IDLE_SECS is set for the daemon, and it takes precedence over these.")}</p>` : ""}`;
+}
+
 /* Settings → Builds: Docker's builder or Kiri's for plain `docker build`, at once. */
 function buildsPane() {
   const b = ui.bw;
@@ -4363,27 +4666,92 @@ function buildsPane() {
       <div class="seg" role="group" aria-label="${tr("Build with")}"><button data-bw="docker" aria-pressed="${!kiri}">Docker</button><button data-bw="kiri" aria-pressed="${kiri}">Kiri</button></div></div>
     ${note}
     ${builderPref()}
+    ${builderSettingsPrefs()}
     <p class="muted">${tr("{cmd} always builds on Kiri. A switch applies at once, in terminals already open too. Switching back to Docker puts docker's build settings back as they were before Kiri changed them.", { cmd: cmd("kiri build") })}</p>
   </div>`;
 }
 
-/* Settings → Network: the proxy for pulls and, if wanted, for containers. */
+/* Settings → Network: Docker's default socket + CLI binding, and the proxy. */
+function dockerSockRows() {
+  const app = ui.status?.app || "Kiri";
+  const mono = (t) => `<span class="mono">${esc(String(t))}</span>`;
+  const s = ui.dockersock;
+  let sockRow = "";
+  if (s) {
+    let desc = "", pact = "";
+    if (s.owner === "kiri") {
+      desc = tr("{path} leads to {app}. Tools like Testcontainers, IDE plugins and SDKs use it directly.", { path: mono(s.path), app: esc(app) });
+      pact = `<span class="pact kstate"><i class="on"></i>${esc(app)}</span>`;
+    } else if (s.owner === "other") {
+      const who = s.engine ? (s.target?.includes("/") ? `${esc(s.engine)} (${mono(s.target)})` : esc(s.engine)) : s.target ? mono(s.target) : tr("another engine");
+      desc = `${tr("{path} belongs to {engine} and stays so.", { path: mono(s.path), engine: who })}<br><span class="sockhint">${tr("Tools that ignore docker contexts can use {hint}", { hint: `<code>${esc(s.hint)}</code>` })}${copyBtn(s.hint, tr("command"))}</span>`;
+      pact = `<span class="pact kstate"><i></i>${s.engine ? esc(s.engine) : tr("In use")}</span>`;
+    } else {
+      desc = s.take
+        ? tr("{path} is free. Link it to {app} so tools that ignore docker contexts find {app} there.", { path: mono(s.path), app: esc(app) })
+        : WIN
+          ? tr("{path} is free. {app} serves it whenever it runs and no other Docker engine does.", { path: mono(s.path), app: esc(app) })
+          : LINUX
+            ? tr("{path} is free. {service} links it when Kiri starts while no other Docker engine has it.", { path: mono(s.path), service: mono("kiri.service") })
+            : tr("{path} is free. {app} leaves it for the installed Kiri.", { path: mono(s.path), app: esc(app) });
+      pact = s.take
+        ? `<span class="pact"><button class="btn primary" data-takesock${ui.sockTaking ? " disabled" : ""}>${ui.sockTaking ? tr("Linking…") : tr("Use {app}", { app: esc(app) })}</button></span>`
+        : `<span class="pact kstate"><i></i>${tr("Free")}</span>`;
+    }
+    sockRow = `<div class="pref"><span class="t">${tr("Docker socket")}</span><span class="d">${desc}</span>${pact}</div>`;
+  }
+  let cliRow = "";
+  if (ui.status) {
+    const pinned = ctxPinned();
+    let desc = "", pact = "";
+    if (!ctxOther()) {
+      desc = tr("The {docker} command uses {app}.", { docker: mono("docker"), app: esc(app) });
+      pact = `<span class="pact kstate"><i class="on"></i>${esc(app)}</span>`;
+    } else if (pinned) {
+      desc = tr("{env} is set in this session, so {docker} uses another engine.", { env: mono(pinned), docker: mono("docker") });
+      pact = `<span class="pact kstate"><i class="busy"></i>${esc(pinned)}</span>`;
+    } else {
+      desc = tr("The {docker} command uses {engine}.", { docker: mono("docker"), engine: esc(ctxLabel(ui.status.context)) });
+      pact = `<span class="pact"><button class="btn primary" data-usekiri${ui.ctxSwitching ? " disabled" : ""}>${ui.ctxSwitching ? tr("Switching…") : tr("Use {app}", { app: esc(app) })}</button></span>`;
+    }
+    cliRow = `<div class="pref"><span class="t">${tr("{docker} command", { docker: mono("docker") })}</span><span class="d">${desc}</span>${pact}</div>`;
+  }
+  return sockRow + cliRow;
+}
+
+function vmNetRow() {
+  const v = ui.vmnet;
+  if (!v || v.supported === false) return "";
+  const nat = v.shared_nat !== false, on = v.awake || engineShown().on;
+  if (v.awake && v.running_shared_nat === nat) ui.vmNetSaved = false;
+  const pending = on && ((v.awake && v.running_shared_nat != null && v.running_shared_nat !== nat) || (!v.awake && ui.vmNetSaved));
+  const desc = nat
+    ? tr("macOS NAT: fastest. Switch to Host relay if Cloudflare WARP or a corporate firewall blocks container HTTPS. Applies on VM restart.")
+    : tr("Host relay: connections leave from Kiri on macOS instead of Virtualization.framework NAT. Applies on VM restart.");
+  const envNote = v.env ? ` ${tr("KIRI_SHARED_NAT is set in the environment and takes precedence.")}` : "";
+  return `<div class="pref"><span class="t">${tr("Outbound VM traffic")}</span>
+    <span class="d">${desc}${envNote}</span>
+    <div class="pact">${pending ? `<button class="btn" data-restartvm>${tr("Restart VM to apply")}</button>` : ""}<div class="seg" role="group" aria-label="${tr("Outbound VM traffic")}"><button data-vmnat="1" aria-pressed="${nat}"${v.env ? " disabled" : ""}>${tr("macOS NAT")}</button><button data-vmnat="0" aria-pressed="${!nat}"${v.env ? " disabled" : ""}>${tr("Host relay")}</button></div></div></div>`;
+}
+
 function networkPane() {
-  const p = ui.proxy;
-  if (!p) return `<div class="pane"><h3>${tr("Network")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
-  if (p.error) return `<div class="pane"><h3>${tr("Network")}</h3><p class="muted">${tr("Start Kiri to change its network settings. ({error})", { error: esc(p.error) })}</p></div>`;
+  const p = ui.proxy, sock = dockerSockRows(), vmnet = vmNetRow();
+  if (!p) return `<div class="pane"><h3>${tr("Network")}</h3>${sock}${vmnet}<p class="muted">${tr("Loading…")}</p></div>`;
+  if (p.error) return `<div class="pane"><h3>${tr("Network")}</h3>${sock}${vmnet}<p class="muted">${tr("Start Kiri to change its network settings. ({error})", { error: esc(p.error) })}</p></div>`;
   const d = ui.pxDraft, eff = p.effective;
   const seg = [["system", tr("{os} settings", { os: OS })], ["custom", tr("Custom")], ["none", tr("None")]].map(([v, l]) => `<button data-pxmode="${v}" aria-pressed="${d.mode === v}">${l}</button>`).join("");
   const now = eff.https || eff.http ? (eff.no_proxy.length ? tr("In use: {proxy}, except {hosts}.", { proxy: `<span class="mono">${esc(eff.https || eff.http)}</span>`, hosts: `<span class="mono">${esc(eff.no_proxy.join(", "))}</span>` }) : tr("In use: {proxy}.", { proxy: `<span class="mono">${esc(eff.https || eff.http)}</span>` })) : tr("No proxy is in use.");
   const field = (k, label, ph) => `<label class="pxf"><span>${label}</span><input class="field" id="px-${k}" value="${esc(d[k] || "")}" placeholder="${ph}" spellcheck="false" autocomplete="off"></label>`;
   return `<div class="pane"><h3>${tr("Network")}</h3>
+    ${sock}
+    ${vmnet}
     <div class="pref"><span class="t">${tr("Proxy")}</span><span class="d">${tr("For pulling and pushing images.")} ${d.mode === p.settings.mode ? now : ""}</span>
       <div class="seg" role="group" aria-label="${tr("Proxy")}">${seg}</div></div>
     ${d.mode === "system" && eff.pac ? `<p class="muted">${tr("{os} uses an automatic proxy configuration (PAC) file, which Kiri can't follow. Choose Custom and enter the proxy.", { os: OS })}</p>` : ""}
     ${d.mode === "custom" ? `<div class="pxgrid">${field("http", tr("HTTP proxy"), "proxy.example.com:3128")}${field("https", tr("HTTPS proxy"), "proxy.example.com:3128")}${field("no_proxy", tr("Bypass for"), "*.internal, registry.corp")}</div>` : ""}
-    <div class="pref"><span class="t">${tr("Pass to containers")}</span><span class="d">${tr("New containers get {http}, {https} and {no}.", { http: `<span class="mono">HTTP_PROXY</span>`, https: `<span class="mono">HTTPS_PROXY</span>`, no: `<span class="mono">NO_PROXY</span>` })}${WIN ? "" : ` ${tr("A proxy on this Mac is reached as {host}.", { host: `<span class="mono">host.docker.internal</span>` })}`}</span>
+    <div class="pref"><span class="t">${tr("Pass to containers")}</span><span class="d">${tr("New containers get {http}, {https} and {no}.", { http: `<span class="mono">HTTP_PROXY</span>`, https: `<span class="mono">HTTPS_PROXY</span>`, no: `<span class="mono">NO_PROXY</span>` })}${WIN ? "" : ` ${LINUX ? tr("A proxy on this computer is reached as {host}.", { host: `<span class="mono">host.docker.internal</span>` }) : tr("A proxy on this Mac is reached as {host}.", { host: `<span class="mono">host.docker.internal</span>` })}`}</span>
       <div class="seg" role="group" aria-label="${tr("Pass to containers")}"><button data-pxc="0" aria-pressed="${!d.containers}">${tr("Off")}</button><button data-pxc="1" aria-pressed="${!!d.containers}">${tr("On")}</button></div></div>
-    <div class="res-foot"><span class="muted">${WIN ? tr("Container traffic leaves through WSL's network.") : tr("VPNs need no setting: container traffic leaves through macOS.")}</span><span style="flex:1"></span><button class="btn primary" data-savepx>${tr("Save")}</button></div>
+    <div class="res-foot"><span class="muted">${WIN ? tr("Container traffic leaves through WSL's network.") : LINUX ? tr("VPNs need no setting: container traffic leaves through Linux.") : tr("VPNs need no setting: container traffic leaves through macOS.")}</span><span style="flex:1"></span><button class="btn primary" data-savepx>${tr("Save")}</button></div>
   </div>`;
 }
 
@@ -4409,21 +4777,23 @@ function routerPortsPref() {
 
 /* Settings → Resources: the most the Linux VM may use. */
 const gb = (mib) => `${Math.round(mib / 1024)} GB`;
+const diskGb = (g) => `${g} GB`;
 const cpuText = (n) => trn(n, "{n} CPU", "{n} CPUs");
+const swapText = (mib) => mib ? (mib % 1024 ? `${(mib / 1024).toFixed(1)} GB` : gb(mib)) : tr("Off");
 /* How far along its track a slider's blue fill reaches, as CSS: to the
    middle of the thumb, which travels the track less its own 26 px. */
 const rangeFill = (v, min, max) => {
   const f = max > min ? (v - min) / (max - min) : 0;
   return `calc(13px + (100% - 26px) * ${f.toFixed(4)})`;
 };
-const resChanged = () => ui.res && (ui.resDraft.cpus !== ui.res.cpus || ui.resDraft.memory_mib !== ui.res.memory_mib);
+const resChanged = () => ui.res && (ui.resDraft.cpus !== ui.res.cpus || ui.resDraft.memory_mib !== ui.res.memory_mib || (ui.res.disk_gb != null && ui.resDraft.disk_gb !== ui.res.disk_gb) || (ui.res.swap_mib != null && ui.resDraft.swap_mib !== ui.res.swap_mib));
 /* Settings › Resources: the engine's on/off, the same switch as the card. */
 function enginePane() {
   const { shown } = engineShown(), off = shown === "stopped";
   const d = off ? tr("Off: press Start engine to run containers. It stays off after a restart until you start it.")
     : shown === "running" ? tr("Running: it rests by itself when nothing runs and wakes when you use it.")
-    : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : "";
-  const busy = shown === "booting" || shown === "stopping";
+    : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : shown === "restarting" ? tr("Restarting…") : "";
+  const busy = shown === "booting" || shown === "stopping" || shown === "restarting";
   const btn = off ? `<button class="btn primary" data-vmpower="start"${busy ? " disabled" : ""}>${tr("Start engine")}</button>`
     : `<button class="btn" data-vmpower="stop"${busy ? " disabled" : ""}>${tr("Turn off engine")}</button>`;
   return `<div class="pane"><h3>${tr(VM)}</h3><div class="pref"><span class="t">${vmLabels[shown] != null ? tr(vmLabels[shown]) : "—"}</span><span class="d">${d}</span><span class="pact">${btn}</span></div></div>`;
@@ -4436,42 +4806,285 @@ function resourcesPane() {
   if (r.error) return `<div class="pane"><h3>${tr("Resources")}</h3><p class="muted">${tr("Start Kiri to change its resources. ({error})", { error: esc(r.error) })}</p></div>`;
   const d = ui.resDraft;
   const maxGb = Math.max(1, Math.floor(r.max_memory_mib / 1024));
-  const pending = r.awake && (r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64);
+  const hasDisk = r.disk_gb != null;
+  const minDisk = r.min_disk_gb ?? 64;
+  const maxDisk = Math.max(minDisk, r.max_disk_gb ?? 1024);
+  const diskVal = hasDisk ? Math.min(Math.max(d.disk_gb ?? r.disk_gb, minDisk), maxDisk) : minDisk;
+  const diskStep = minDisk % 8 === 0 && diskVal % 8 === 0 && maxDisk % 8 === 0 ? 8 : 1;
+  const hasSwap = r.swap_mib != null;
+  const maxSwap = r.max_swap_mib ?? 16384;
+  const swapVal = hasSwap ? Math.min(d.swap_mib ?? r.swap_mib, maxSwap) : 0;
+  const diff = r.running_cpus !== r.cpus || Math.abs(r.running_memory_mib - r.memory_mib) > 64 || (hasDisk && r.running_disk_gb != null && r.running_disk_gb !== r.disk_gb) || (hasSwap && r.running_swap_mib != null && r.running_swap_mib !== r.swap_mib);
+  if (r.awake && !diff) ui.resSaved = false;
+  const pending = (r.awake || engineShown().on) && (diff || (!r.awake && ui.resSaved));
   return `<div class="pane"><h3>${tr("Resources")}</h3>
-    <div class="pref"><span class="t">${tr("CPUs")}</span><span class="d">${tr("Shared with {os}: the VM only uses them while containers are busy.", { os: OS })}</span>
+    <div class="pref"><span class="t">${tr("CPUs")}</span><span class="d">${LINUX ? tr("Shared with Linux: containers only use them while busy.") : tr("Shared with {os}: the VM only uses them while containers are busy.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-cpus" min="1" max="${r.max_cpus}" step="1" value="${d.cpus}" aria-label="${tr("CPUs")}" style="--fill:${rangeFill(d.cpus, 1, r.max_cpus)}"><span class="num" id="res-cpus-v">${cpuText(d.cpus)}</span></div></div>
-    <div class="pref"><span class="t">${tr("Memory")}</span><span class="d">${tr("The most the VM may take. It uses memory only as containers need it and gives the rest back to {os}.", { os: OS })}</span>
+    <div class="pref"><span class="t">${tr("Memory")}</span><span class="d">${LINUX ? tr("The most containers and the engine may take. Unused memory stays free on Linux.") : tr("The most the VM may take. It uses memory only as containers need it and gives the rest back to {os}.", { os: OS })}</span>
       <div class="range"><input type="range" id="res-mem" min="1024" max="${maxGb * 1024}" step="1024" value="${Math.min(d.memory_mib, maxGb * 1024)}" aria-label="${tr("Memory")}" style="--fill:${rangeFill(Math.min(d.memory_mib, maxGb * 1024), 1024, maxGb * 1024)}"><span class="num" id="res-mem-v">${gb(d.memory_mib)}</span></div></div>
-    ${r.overridden ? `<p class="muted">${tr("KIRI_CPUS or KIRI_MEMORY_MIB is set for the daemon, and it takes precedence over these.")}</p>` : ""}
-    <div class="res-foot"><span class="muted">${r.awake ? tr("Running now with {cpus} and up to {mem}.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib) }) : tr("The VM is asleep; it starts with these next time.")}</span>
+    ${hasSwap ? `<div class="pref"><span class="t">${tr("Swap")}</span><span class="d">${tr("Disk space the VM may use when its memory runs out, so containers slow down instead of being stopped. Applies on restart.")}</span>
+      <div class="range"><input type="range" id="res-swap" min="0" max="${maxSwap}" step="512" value="${swapVal}" aria-label="${tr("Swap")}" style="--fill:${rangeFill(swapVal, 0, maxSwap)}"><span class="num" id="res-swap-v">${swapText(swapVal)}</span></div></div>` : ""}
+    ${hasDisk ? `<div class="pref"><span class="t">${tr("Disk image size")}</span><span class="d">${tr("The most the VM disk may grow to. Space is used on {os} only as data is written, and unused space can be reclaimed in {storage}. Applies on restart.", { os: OS, storage: `<button class="linkbtn" data-stgoto>${tr("Settings → Storage")}</button>` })}</span>
+      <div class="range"><input type="range" id="res-disk" min="${minDisk}" max="${maxDisk}" step="${diskStep}" value="${diskVal}" aria-label="${tr("Disk image size")}" style="--fill:${rangeFill(diskVal, minDisk, maxDisk)}"><span class="num" id="res-disk-v">${diskGb(diskVal)}</span></div></div>` : ""}
+    ${r.overridden ? `<p class="muted">${hasDisk ? tr("KIRI_CPUS, KIRI_MEMORY_MIB or KIRI_DISK_GB is set for the daemon, and it takes precedence over these.") : tr("KIRI_CPUS or KIRI_MEMORY_MIB is set for the daemon, and it takes precedence over these.")}</p>` : ""}
+    <div class="res-foot"><span class="muted">${r.awake ? (hasDisk ? tr("Running now with {cpus}, up to {mem}, and a {disk} disk.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib), disk: diskGb(r.running_disk_gb ?? r.disk_gb) }) : tr("Running now with {cpus} and up to {mem}.", { cpus: cpuText(r.running_cpus), mem: gb(r.running_memory_mib) })) : LINUX ? tr("The engine is off; it starts with these next time.") : tr("The VM is asleep; it starts with these next time.")}</span>
       <span style="flex:1"></span>
-      ${pending ? `<button class="btn" id="res-restart" data-restartvm>${tr("Restart VM to apply")}</button>` : ""}
+      ${pending ? `<button class="btn" id="res-restart" data-restartvm>${LINUX ? tr("Restart engine to apply") : tr("Restart VM to apply")}</button>` : ""}
       <button class="btn primary" id="res-save" data-saveres${resChanged() ? "" : " disabled"}>${tr("Save")}</button></div>
     ${pending ? `<p class="muted">${esc(r.restart_note || tr("Restarting stops the running containers; start them again afterwards."))}</p>` : ""}
   </div>`;
 }
 
+function wslPane() {
+  const list = ui.res?.wsl_distros;
+  const hasWatch = prefs.watchBindMounts != null || ui.res?.watch_bind_mounts != null;
+  if (!WIN && !Array.isArray(list) && !hasWatch) return "";
+  const watchOn = !!(prefs.watchBindMounts ?? ui.res?.watch_bind_mounts);
+  const watchRow = `<div class="pref"><span class="t">${tr("Windows bind-mount file events")}</span><span class="d">${tr("Forward file changes on Windows drives (like {path}) into containers for live reload. Uses no CPU when idle.", { path: '<span class="mono">C:\\</span>' })}</span>
+    <div class="seg" role="group" aria-label="${tr("Windows bind-mount file events")}"><button data-watchbinds="0" aria-pressed="${!watchOn}">${tr("Off")}</button><button data-watchbinds="1" aria-pressed="${watchOn}">${tr("On")}</button></div></div>`;
+  const distros = Array.isArray(list)
+    ? (list.length
+      ? list.map((w) => `<div class="pref"><span class="t">${esc(w.name)}</span><span class="d">${tr("docker, Compose and Docker-socket tools reach Kiri")}</span>
+    <div class="seg" role="group" aria-label="${esc(w.name)}"><button data-wsldistro="${esc(w.name)}" data-wslon="0" aria-pressed="${!w.on}">${tr("Off")}</button><button data-wsldistro="${esc(w.name)}" data-wslon="1" aria-pressed="${!!w.on}">${tr("On")}</button></div></div>`).join("")
+      : `<p class="muted">${tr("No other WSL distros installed.")}</p>`)
+    : WIN ? `<p class="muted">${tr("Loading…")}</p>` : "";
+  return `<div class="pane"><h3>${tr("WSL integration")}</h3>${watchRow}${distros}</div>`;
+}
+
+/* Settings → Storage: where Kiri keeps images, containers, and volumes. */
+const stPhaseText = (p) => ({
+  stopping: tr("Stopping containers…"),
+  copying: tr("Copying data…"),
+  verifying: tr("Verifying copy…"),
+  switching: tr("Switching storage…"),
+  restarting: tr("Restarting engine…"),
+}[p] || tr("Moving data…"));
+
+function storageUnavailableBox(s, linkSettings) {
+  return `<div class="st-box warn" role="alert">
+    <div class="st-hd"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg><span>${tr("Storage location unavailable")}</span></div>
+    <p>${tr("Kiri couldn't find its data in {path}. Connect its drive and retry, choose another folder, or reset to the default location.", { path: `<span class="mono st-path">${esc(s.path || "")}</span>` })}</p>
+    <div class="st-row">
+      <button class="btn primary" data-stretry>${tr("Retry")}</button>
+      <button class="btn" data-stpick>${tr("Change…")}</button>
+      <button class="btn" data-streset>${tr("Reset to default")}</button>
+      ${linkSettings ? `<button class="btn" data-stgoto>${tr("Open storage settings")}</button>` : ""}
+    </div>
+  </div>`;
+}
+
+function renderStorageUnavailable() {
+  const s = ui.storage || {};
+  $("content").innerHTML = `<div class="empty"><div><svg class="i art" viewBox="0 0 256 256"><path d="${PH.harddrive}"/></svg>
+    <h3>${tr("Storage location unavailable")}</h3>
+    <p>${tr("Kiri couldn't find its data in {path}. Connect its drive and retry, choose another folder, or reset to the default location.", { path: `<span class="mono st-path">${esc(s.path || "")}</span>` })}</p>
+    <div class="st-row" style="justify-content:center">
+      <button class="btn primary" data-stretry>${tr("Retry")}</button>
+      <button class="btn" data-stpick>${tr("Change…")}</button>
+      <button class="btn" data-streset>${tr("Reset to default")}</button>
+      <button class="btn" data-stgoto>${tr("Open storage settings")}</button>
+    </div></div></div>`;
+}
+
+function storageDiskRow(s, moving) {
+  if (LINUX) {
+    return `<div class="pref"><span class="t">${tr("VM disk space")}</span>
+      <span class="d">${tr("Native Linux uses your host filesystem directly — deleted images and volumes free space immediately.")}</span></div>`;
+  }
+  const vhdx = '<span class="mono">ext4.vhdx</span>';
+  const diskHost = s.disk_host, diskInUse = s.disk_in_use, reclaimable = s.reclaimable;
+  const btnLbl = WIN ? tr("Compact disk…") : tr("Reclaim space");
+  const busyLbl = WIN ? tr("Compacting…") : tr("Reclaiming…");
+  let d = "";
+  if (ui.stReclaiming) {
+    d = WIN
+      ? tr("Compacting {vhdx} and restarting the engine…", { vhdx })
+      : diskHost != null && diskInUse != null
+        ? tr("{host} on {os}, {inUse} in use inside the VM · trimming unused blocks…", { host: size(diskHost), os: OS, inUse: size(diskInUse) })
+        : tr("Trimming unused blocks inside the VM disk…");
+  } else if (ui.stReclaimed) {
+    const r = ui.stReclaimed, after = r.after ?? diskHost, inUse = r.in_use ?? diskInUse, freed = r.reclaimed || 0;
+    const freedHtml = `<span style="color:var(--moss)">${tr("Freed {size}", { size: size(freed) })}</span>`;
+    if (freed > 0) {
+      d = after != null && inUse != null
+        ? (WIN
+          ? tr("{host} on Windows ({vhdx}), {inUse} in use · {freed}.", { host: size(after), vhdx, inUse: size(inUse), freed: freedHtml })
+          : tr("{host} on {os}, {inUse} in use inside the VM · {freed}.", { host: size(after), os: OS, inUse: size(inUse), freed: freedHtml }))
+        : freedHtml;
+    } else {
+      d = after != null && inUse != null
+        ? (WIN
+          ? tr("{host} on Windows ({vhdx}), {inUse} in use · nothing to reclaim.", { host: size(after), vhdx, inUse: size(inUse) })
+          : tr("{host} on {os}, {inUse} in use inside the VM · nothing to reclaim.", { host: size(after), os: OS, inUse: size(inUse) }))
+        : tr("Nothing to reclaim.");
+    }
+  } else if (diskHost != null && diskInUse != null && reclaimable > 0) {
+    const can = `<b style="color:var(--text)">${tr("{size} can be given back", { size: size(reclaimable) })}</b>`;
+    d = WIN
+      ? tr("{host} on Windows ({vhdx}), {inUse} in use · {can}. Compacting restarts the engine.", { host: size(diskHost), vhdx, inUse: size(diskInUse), can })
+      : tr("{host} on {os}, {inUse} in use inside the VM · {can} without stopping containers.", { host: size(diskHost), os: OS, inUse: size(diskInUse), can });
+  } else if (diskHost != null && diskInUse != null) {
+    d = WIN
+      ? tr("{host} on Windows ({vhdx}), {inUse} in use · nothing to reclaim.", { host: size(diskHost), vhdx, inUse: size(diskInUse) })
+      : tr("{host} on {os}, {inUse} in use inside the VM · nothing to reclaim.", { host: size(diskHost), os: OS, inUse: size(diskInUse) });
+  } else if (diskHost != null) {
+    d = WIN
+      ? tr("{host} on Windows ({vhdx}). Compacting returns unused space and restarts the engine.", { host: size(diskHost), vhdx })
+      : tr("{host} on {os}. Reclaiming trims unused blocks in the VM disk without stopping containers.", { host: size(diskHost), os: OS });
+  } else {
+    d = WIN
+      ? tr("Returns unused space in {vhdx} to Windows. Compacting restarts the engine.", { vhdx })
+      : tr("Returns unused blocks in the VM disk to {os} without stopping containers.", { os: OS });
+  }
+  const dis = moving || (diskHost != null && diskInUse != null && !(reclaimable > 0));
+  const ctl = ui.stReclaiming
+    ? `<span class="st-acts"><span class="hbusy"><i class="hspin"></i>${busyLbl}</span></span>`
+    : `<span class="st-acts"><button class="btn" data-streclaim${dis ? " disabled" : ""}>${btnLbl}</button></span>`;
+  return `<div class="pref st-pref"><span class="t">${tr("VM disk space")}</span><span class="d num">${d}</span>${ctl}</div>`;
+}
+
+function storagePruneRow(moving) {
+  const stoppedN = ui.containers.filter((c) => c.State !== "running").length;
+  const danglingImgs = ui.images.filter((i) => !(i.RepoTags || []).some((t) => t && t !== "<none>:<none>" && !t.startsWith("sha256:")));
+  const danglingSize = danglingImgs.reduce((a, i) => a + (i.Size || 0), 0);
+  const hasCache = !!ui.builderVolume;
+  const hasUnused = stoppedN > 0 || danglingImgs.length > 0 || hasCache;
+  let d = "";
+  if (ui.stPruning) {
+    d = tr("Cleaning up stopped containers, untagged images, and build cache…");
+  } else if (hasUnused) {
+    const parts = [];
+    if (stoppedN > 0) parts.push(trn(stoppedN, "{n} stopped container", "{n} stopped containers"));
+    if (danglingImgs.length > 0) {
+      const cnt = trn(danglingImgs.length, "{n} untagged image", "{n} untagged images");
+      parts.push(danglingSize > 0 ? tr("{count} ({size})", { count: cnt, size: size(danglingSize) }) : cnt);
+    }
+    if (hasCache) parts.push(tr("build cache"));
+    d = `${parts.join(" · ")}.`;
+  } else if (ui.stPruned && ui.stPruned.freed > 0) {
+    d = tr("No stopped containers, untagged images or build cache · {freed}.", {
+      freed: `<span style="color:var(--moss)">${tr("Freed {size}", { size: size(ui.stPruned.freed) })}</span>`,
+    });
+  } else {
+    d = tr("No stopped containers, untagged images or build cache.");
+  }
+  const ctl = ui.stPruning
+    ? `<span class="st-acts"><span class="hbusy"><i class="hspin"></i>${tr("Cleaning up…")}</span></span>`
+    : `<span class="st-acts"><button class="btn" data-stprune${moving || !hasUnused ? " disabled" : ""}>${tr("Clean up…")}</button></span>`;
+  return `<div class="pref st-pref"><span class="t">${tr("Unused Docker data")}</span><span class="d num">${d}</span>${ctl}</div>`;
+}
+
+function storagePane() {
+  const s = ui.storage;
+  if (!s) return `<div class="pane"><h3>${tr("Storage")}</h3><p class="muted">${tr("Loading…")}</p></div>`;
+  if (s.error && !s.path) return `<div class="pane"><h3>${tr("Storage")}</h3><p class="muted">${tr("Start Kiri to change its storage location. ({error})", { error: esc(s.error) })}</p></div>`;
+  const moving = s.state === "moving", unavail = s.state === "unavailable", locked = moving || !!s.env;
+  const stats = [s.used != null ? tr("{size} used", { size: size(s.used) }) : "", s.free != null ? tr("{size} free", { size: size(s.free) }) : "", s.fs ? esc(s.fs) : ""].filter(Boolean).join(" · ");
+  const badge = !s.custom && !s.env ? `<span class="st-badge">${tr("Default")}</span>` : "";
+  const m = s.moving;
+  const pct = m && m.total > 0 ? Math.min(100, Math.round((m.done / m.total) * 100)) : null;
+  const progressBox = moving && m ? `<div class="st-box" role="status">
+    <div class="st-hd">${rspin("sm plain")}<span>${stPhaseText(m.phase)}</span></div>
+    <p>${tr("Moving Kiri's data to {path}.", { path: `<span class="mono st-path">${esc(m.to || "")}</span>` })}</p>
+    ${pct != null ? `<div class="st-bar"><span style="width:${pct}%"></span></div><p class="num">${size(m.done)} / ${size(m.total)} (${pct}%)</p>` : ""}
+    <p>${tr("Running containers pause while Kiri copies its data and start again once it's done.")}</p>
+  </div>` : "";
+  const errText = ui.stErr || (!moving && s.error ? s.error : "");
+  const errBox = errText ? `<div class="st-box err" role="alert">
+    <div class="st-hd"><svg class="i" viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg><span>${tr("Couldn't change storage location")}</span></div>
+    <p>${esc(errText)}</p>
+    ${ui.stErr ? `<div class="st-row"><button class="btn sm" data-sterrclose>${tr("Dismiss")}</button></div>` : ""}
+  </div>` : "";
+  const oldRow = s.old && s.state === "ok" ? `<div class="pref st-pref">
+    <span class="t">${tr("Old data")}</span>
+    <span class="d">${tr("Previous data is still in {path}. Remove it once everything works in the new location.", { path: `<span class="mono st-path">${esc(s.old)}</span>` })}</span>
+    <span class="st-acts"><button class="btn" data-strmold>${tr("Remove old data")}</button></span>
+  </div>` : "";
+  return `<div class="pane"><h3>${tr("Storage")}</h3>
+    ${unavail ? storageUnavailableBox(s, false) : ""}
+    <div class="pref st-pref">
+      <span class="t st-t"><span>${tr("Storage location")}</span>${badge}</span>
+      <span class="d"><span class="mono st-path">${esc(s.path || "")}</span>${stats ? `<span class="st-meta">${stats}</span>` : ""}</span>
+      <span class="st-acts">
+        <button class="btn" data-stpick${locked ? " disabled" : ""}>${tr("Change…")}</button>
+        ${s.custom ? `<button class="btn" data-streset${locked ? " disabled" : ""}>${tr("Reset to default")}</button>` : ""}
+      </span>
+    </div>
+    ${s.env ? `<p class="muted">${tr("{var} sets Kiri's storage location, so it can't be changed here.", { var: `<span class="mono">KIRI_DATA_DIR</span>` })}</p>` : ""}
+    ${progressBox}
+    ${errBox}
+    ${oldRow}
+    ${!unavail ? storageDiskRow(s, moving) : ""}
+    ${!unavail ? storagePruneRow(moving) : ""}
+    <p class="muted">${tr("Images, containers, and volumes live in this folder. External drives must use a native filesystem (APFS on macOS, ext4/xfs/btrfs on Linux, NTFS on Windows); FAT and exFAT drives aren't supported.")}</p>
+  </div>`;
+}
+
+function storageConfirm(c) {
+  $("st-dlg")?.remove();
+  const s = ui.storage || {};
+  const unavail = s.state === "unavailable";
+  const hasData = !unavail && ((s.used || 0) > 0 || ui.containers.length > 0 || ui.images.length > 0 || ui.volumes.length > 0);
+  const showMode = !c.reset && hasData;
+  const title = c.reset ? tr("Reset storage location to default?") : tr("Change storage location?");
+  const meta = !unavail && c.free != null ? `<p>${tr("Destination: {path} ({free} free).", { path: `<span class="mono st-path">${esc(c.path)}</span>`, free: size(c.free) })}</p>`
+    : `<p>${tr("Destination: {path}.", { path: `<span class="mono st-path">${esc(c.path)}</span>` })}</p>`;
+  const warn = c.replaces ? `<p>${tr("Existing Kiri data in this folder will be replaced.")}</p>` : "";
+  const modeHtml = showMode ? `<div class="st-opts" role="radiogroup" aria-label="${tr("Migration mode")}">
+    <label class="st-opt"><input type="radio" name="st-mode" value="move" checked><b>${tr("Move existing images, containers, and volumes")}</b><small>${tr("Stops running containers, copies your data, and starts them again.")}</small></label>
+    <label class="st-opt"><input type="radio" name="st-mode" value="fresh"><b>${tr("Start fresh")}</b><small>${tr("Starts empty in the new folder. Your old folder stays until you remove it.")}</small></label>
+  </div>` : `<p>${unavail ? tr("Kiri will switch to this folder and restart the engine.") : tr("Running containers will stop while Kiri moves your data and start again once it's done.")}</p>`;
+  const scrim = document.createElement("div");
+  scrim.className = "scrim"; scrim.id = "st-dlg";
+  scrim.innerHTML = `<div class="dialog alert" role="dialog" aria-modal="true" aria-labelledby="st-h">${alertIco(c.replaces ? "warn" : "info")}<h3 id="st-h">${title}</h3>
+    ${meta}${warn}${modeHtml}
+    <div class="row-end"><span></span><span><button class="btn" data-stcancel>${tr("Cancel")}</button> <button class="btn primary" data-stgo>${c.reset ? tr("Reset to default") : tr("Move data")}</button></span></div></div>`;
+  document.body.append(scrim);
+  const goBtn = scrim.querySelector("[data-stgo]");
+  const close = () => { scrim.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (ev) => { if (ev.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  scrim.querySelectorAll('input[name="st-mode"]').forEach((r) => r.addEventListener("change", () => {
+    goBtn.textContent = r.value === "fresh" && r.checked ? tr("Start fresh") : tr("Move data");
+  }));
+  scrim.addEventListener("click", (ev) => {
+    if (ev.target === scrim || ev.target.closest("[data-stcancel]")) return close();
+    if (ev.target.closest("[data-stgo]")) {
+      const fresh = scrim.querySelector('input[name="st-mode"]:checked')?.value === "fresh";
+      ui.stErr = "";
+      startRestartOverlay("storage", c.reset ? tr("Kiri will switch to this folder and restart the engine.") : tr("Moving Kiri's data to {path}.", { path: `<span class="mono st-path">${esc(c.path)}</span>` }), tr("Stopping containers…"));
+      if (c.reset) send("storagereset");
+      else send("storagemove", { path: c.path, value: { fresh } });
+      close();
+    }
+  });
+  goBtn.focus();
+}
+
 function renderSettings() {
   const tab = (id, icon, label) => `<button data-stab="${id}" aria-current="${prefs.tab === id}"><svg class="i" viewBox="0 0 256 256"><path d="${PH[icon]}"/></svg>${label}</button>`;
-  const opts = (list, current, system) => {
-    const memo = optsMemo[system];
-    if (memo?.list !== list || memo.current !== current) optsMemo[system] = { list, current, html: [system, ...list].map((f) =>
-      `<option value="${esc(f)}"${f === current ? " selected" : ""}>${f !== system ? esc(f) : f === "System" ? tr("System|font") : tr("System Mono|font")}</option>`).join("") };
-    return optsMemo[system].html;
-  };
-  /* A tiny window in each theme's colours, for the Theme choice. */
-  const mini = (dark) => {
-    const c = dark ? { bg: "#0F1419", side: "#121920", line: "#2A313A", bar: "#66707C", text: "#98A1AC" } : { bg: "#FFFFFF", side: "#EDF0F5", line: "#DDE3EB", bar: "#8A929C", text: "#5E6773" };
-    const accent = (ACCENTS.find(([id]) => id === prefs.accent) || ACCENTS[0])[2];
-    const rows = [0, 1, 2, 3].map((i) => `<rect x="46" y="${22 + i * 11}" width="${[40, 32, 44, 30][i]}" height="3" rx="1.5" fill="${i === 1 ? accent : c.text}"/><rect x="${96}" y="${22 + i * 11}" width="${[18, 24, 14, 20][i]}" height="3" rx="1.5" fill="${["#3FB68B", "#3FB68B", "#FFC23D", "#3FB68B"][i]}"/>`).join("");
-    return `<svg viewBox="0 0 132 74" aria-hidden="true"><rect x=".5" y=".5" width="131" height="73" rx="6" fill="${c.bg}" stroke="${c.line}"/>
-      <path d="M6.5 .5h32v73h-32a6 6 0 0 1-6-6v-61a6 6 0 0 1 6-6z" fill="${c.side}"/>${[0, 1, 2].map((i) => `<circle cx="${7 + i * 5}" cy="7" r="1.6" fill="${c.bar}"/>`).join("")}
-      ${[0, 1, 2, 3].map((i) => `<rect x="7" y="${18 + i * 9}" width="${[22, 18, 24, 16][i]}" height="3" rx="1.5" fill="${i === 0 ? accent : c.bar}"/>`).join("")}
-      <rect x="44" y="30.5" width="84" height="9" rx="2" fill="${accent}" fill-opacity=".14"/>${rows}<rect x="106" y="62" width="20" height="6" rx="2" fill="${accent}"/></svg>`;
-  };
-  const inUse = darkNow();
-  const sysName = LANGS.find(([id]) => id === resolveLang("system"))?.[1] || "English";
-  const appearance = `<div class="pane"><h3>${tr("Appearance")}</h3>
+  const appearancePane = () => {
+    const opts = (list, current, system) => {
+      const memo = optsMemo[system];
+      if (memo?.list !== list || memo.current !== current) optsMemo[system] = { list, current, html: [system, ...list].map((f) =>
+        `<option value="${esc(f)}"${f === current ? " selected" : ""}>${f !== system ? esc(f) : f === "System" ? tr("System|font") : tr("System Mono|font")}</option>`).join("") };
+      return optsMemo[system].html;
+    };
+    /* A tiny window in each theme's colours, for the Theme choice. */
+    const mini = (dark) => {
+      const c = dark ? { bg: "#0F1419", side: "#121920", line: "#2A313A", bar: "#66707C", text: "#98A1AC" } : { bg: "#FFFFFF", side: "#EDF0F5", line: "#DDE3EB", bar: "#8A929C", text: "#5E6773" };
+      const accent = (ACCENTS.find(([id]) => id === prefs.accent) || ACCENTS[0])[2];
+      const rows = [0, 1, 2, 3].map((i) => `<rect x="46" y="${22 + i * 11}" width="${[40, 32, 44, 30][i]}" height="3" rx="1.5" fill="${i === 1 ? accent : c.text}"/><rect x="${96}" y="${22 + i * 11}" width="${[18, 24, 14, 20][i]}" height="3" rx="1.5" fill="${["#3FB68B", "#3FB68B", "#FFC23D", "#3FB68B"][i]}"/>`).join("");
+      return `<svg viewBox="0 0 132 74" aria-hidden="true"><rect x=".5" y=".5" width="131" height="73" rx="6" fill="${c.bg}" stroke="${c.line}"/>
+        <path d="M6.5 .5h32v73h-32a6 6 0 0 1-6-6v-61a6 6 0 0 1 6-6z" fill="${c.side}"/>${[0, 1, 2].map((i) => `<circle cx="${7 + i * 5}" cy="7" r="1.6" fill="${c.bar}"/>`).join("")}
+        ${[0, 1, 2, 3].map((i) => `<rect x="7" y="${18 + i * 9}" width="${[22, 18, 24, 16][i]}" height="3" rx="1.5" fill="${i === 0 ? accent : c.bar}"/>`).join("")}
+        <rect x="44" y="30.5" width="84" height="9" rx="2" fill="${accent}" fill-opacity=".14"/>${rows}<rect x="106" y="62" width="20" height="6" rx="2" fill="${accent}"/></svg>`;
+    };
+    const inUse = darkNow();
+    const sysName = LANGS.find(([id]) => id === resolveLang("system"))?.[1] || "English";
+    const startAtLogin = prefs.startAtLogin ?? !LINUX;
+    const stopOnQuit = prefs.stopOnQuit === true;
+    return `<div class="pane"><h3>${tr("Appearance")}</h3>
     <div class="pref"><span class="t" id="pref-lang-t">${tr("Language")}</span><span class="d">${tr("Follow {os} (now {lang}), or always use one language.", { os: OS, lang: sysName })}</span>
       ${langButton(sysName)}
       <select id="pref-lang" class="lsrc" aria-label="${tr("Language")}" aria-hidden="true" tabindex="-1" inert>${[["system", `${tr("System")} (${sysName})`], ...LANGS].map(([v, l]) => `<option value="${v}"${(prefs.lang || "system") === v ? " selected" : ""}${v === "system" ? "" : ` lang="${v}"`}>${l}</option>`).join("")}</select></div>
@@ -4488,11 +5101,23 @@ function renderSettings() {
       <div class="seg" role="group" aria-label="${tr("Text size")}">${SIZES.map((z) => `<button data-scale="${z}" aria-pressed="${Math.abs((prefs.scale || 1) - z) < 0.01}">${Math.round(z * 100)}%</button>`).join("")}</div></div>
     <div class="pref"><span class="t">${tr("Log text")}</span><span class="d">${tr("Container, Kubernetes and diagnostics logs.")}</span>
       <div class="seg" role="group" aria-label="${tr("Log text")}">${LOG_SIZES.map(([px, l]) => `<button data-logsize="${px}" aria-pressed="${prefs.logSize === px}">${tr(l)}</button>`).join("")}</div></div>
+    <div class="pref"><span class="t">${tr("Closing the window")}</span><span class="d">${prefs.closeButton === "close"
+      ? tr("Close: the memory the window uses is freed. It takes a moment to open again, and open terminals end.")
+      : tr("Hide: the window stays ready and opens again at once.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Closing the window")}"><button data-closebtn="hide" aria-pressed="${prefs.closeButton !== "close"}">${tr("Hide")}</button><button data-closebtn="close" aria-pressed="${prefs.closeButton === "close"}">${tr("Close")}</button></div></div>
     <div class="preview"><div class="p-title">web · nginx:alpine</div><div>Up 3 minutes · 26.3 MB · localhost:8080 → 80</div><div class="p-mono">ef9a6e2b45c2  docker run -p 8080:80 nginx</div></div>
+    <div class="pref"><span class="t">${tr("Start Kiri at sign-in")}</span><span class="d">${tr("Start Kiri in the background when you sign in.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Start Kiri at sign-in")}"><button data-startlogin="0" aria-pressed="${!startAtLogin}">${tr("Off")}</button><button data-startlogin="1" aria-pressed="${startAtLogin}">${tr("On")}</button></div></div>
+    <div class="pref"><span class="t">${tr("Stop the engine when Kiri quits")}</span><span class="d">${tr("Quitting Kiri stops running containers and the engine. Opening Kiri starts it again.")}</span>
+      <div class="seg" role="group" aria-label="${tr("Stop the engine when Kiri quits")}"><button data-stopquit="0" aria-pressed="${!stopOnQuit}">${tr("Off")}</button><button data-stopquit="1" aria-pressed="${stopOnQuit}">${tr("On")}</button></div></div>
+    ${ui.shellPath && ui.shellPath.supported !== false ? `<div class="pref"><span class="t">${tr("Command-line tools in shell")}</span><span class="d">${tr("Add {bin} to {zshrc} and {zprofile} so {docker}, {kubectl} and {kiri} work in new terminals.", { bin: '<span class="mono">~/.kiri/bin</span>', zshrc: '<span class="mono">.zshrc</span>', zprofile: '<span class="mono">.zprofile</span>', docker: '<span class="mono">docker</span>', kubectl: '<span class="mono">kubectl</span>', kiri: '<span class="mono">kiri</span>' })}</span>
+      <div class="seg" role="group" aria-label="${tr("Command-line tools in shell")}"><button data-shellpath="0" aria-pressed="${!ui.shellPath.enabled}"${ui.shellPathBusy ? " disabled" : ""}>${tr("Off")}</button><button data-shellpath="1" aria-pressed="${!!ui.shellPath.enabled}"${ui.shellPathBusy ? " disabled" : ""}>${tr("On")}</button></div></div>` : ""}
   </div>`;
-  const portsPref = routerPortsPref();
-  // On Linux: kiri.localhost only, for now; nothing to switch.
-  const domainsPane = LINUX ? `<div class="pane"><h3>${tr("Domains")}</h3>
+  };
+  const domainsPane = () => {
+    const portsPref = routerPortsPref();
+    // On Linux: kiri.localhost only, for now; nothing to switch.
+    return LINUX ? `<div class="pane"><h3>${tr("Domains")}</h3>
     <div class="pref"><span class="t">${tr("Local names")}</span><span class="d">${tr("Running containers answer at <span class=mono>&lt;name&gt;.kiri.localhost</span>, which needs no setup.")}</span></div>
     ${portsPref}
     <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.kiri.localhost</span>` })} ${tr("{local} names and HTTPS aren't on Linux yet.", { local: `<span class="mono">.kiri.local</span>` })}</p>
@@ -4517,9 +5142,12 @@ function renderSettings() {
     ${portsPref}
     <p class="muted">${tr("Compose services answer at {addr}.", { addr: `<span class="mono">&lt;service&gt;.&lt;project&gt;.${ui.suffix}</span>` })} ${tr("Changing this needs admin rights (an administrator password), since it adds or removes {path}.", { path: `<span class="mono">/etc/resolver/kiri.local</span>` })}</p>
   </div>`;
-  const a = about;
-  const mib = (b) => (b ? `${(b / 1073741824).toFixed(1)} GB` : "—");
-  const aboutPane = `<div class="pane about"><div class="about-head">
+  };
+  const aboutPane = () => {
+    const a = about;
+    const mib = (b) => (b ? `${(b / 1073741824).toFixed(1)} GB` : "—");
+    const canUninstall = a?.can_uninstall ?? (!WIN && !LINUX);
+    return `<div class="pane about"><div class="about-head">
       <svg viewBox="0 0 64 64" aria-hidden="true"><g transform="translate(6 0) skewX(-10)"><clipPath id="lid2"><rect x="22" y="12" width="34" height="40" rx="10"/></clipPath>
         <rect x="22" y="12" width="34" height="40" rx="10" fill="#E0B420"/><g clip-path="url(#lid2)"><rect x="10" y="0" width="60" height="21.5" fill="#F2CF5B"/></g>
         <g fill="#0F1419"><ellipse cx="41.5" cy="29" rx="3.1" ry="3.6"/><ellipse cx="50.5" cy="29" rx="3.1" ry="3.6"/></g></g>
@@ -4533,22 +5161,37 @@ function renderSettings() {
       <dt>${tr("Memory")}</dt><dd>${a?.running ? tr("up to {size}", { size: mib(a.memory) }) : "—"}</dd>
       <dt>${tr("Website")}</dt><dd><a data-open-site="https://runkiri.com">runkiri.com</a></dd>
       <dt>${tr("Made by")}</dt><dd><a data-open-site="https://canestack.com">Canestack Labs</a></dd>
+      <dt>${tr("Community")}</dt><dd><a data-open-site="https://discord.gg/K5A8wuqcC"><svg class="soc-i" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.74 19.74 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.11 13.11 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.099.246.198.373.292a.077.077 0 0 1-.006.127 12.3 12.3 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.06.06 0 0 0-.031-.028ZM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418Zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418Z"/></svg>Discord</a> <span class="muted">·</span> <a data-open-site="https://x.com/runkiri"><svg class="soc-i" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>@runkiri</a></dd>
     </dl>
-    <p class="muted">${tr("The name comes from the Igbo word ntakịrị, “small”.")}</p></div>`;
-  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${loginsOn() ? tab("registries", "lock", tr("Registries")) : ""}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
-    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" && loginsOn() ? registriesPane() : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
+    <p class="muted">${tr("The name comes from the Igbo word ntakịrị, “small”.")}</p>
+    ${canUninstall ? `<div class="pref"><span class="t">${tr("Uninstall Kiri")}</span>
+      <span class="d">${tr("Stops the engine, removes Kiri's background service, CLI links and shell profile entries, and restores your previous Docker context ({cmd}).", { cmd: '<span class="mono">kiri setup --uninstall</span>' })}</span>
+      <span class="pact"><button class="btn danger" data-uninstall>${tr("Uninstall Kiri…")}</button></span></div>` : ""}</div>`;
+  };
+  const body = prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane() : prefs.tab === "domains" ? domainsPane() : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}${wslPane()}</div>` : prefs.tab === "storage" ? storagePane() : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" ? `<div class="panes">${loginsOn() ? registriesPane() : ""}${regListPane("insecure")}${regListPane("mirrors")}</div>` : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearancePane();
+  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("storage", "harddrive", tr("Storage"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${tab("registries", "lock", tr("Registries"))}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
+    <div class="settings-body">${body}</div></div>`;
   // The container lists arrive every few seconds; rebuilding an unchanged page
   // closes an open menu. The font menus list names in the interface font: an
   // option in its own font made WebKit load every installed font (438 here)
   // the first time Appearance showed, freezing the window for about 3 s. The
   // preview below them shows the chosen fonts.
   if (html === settingsShown.html && settingsShown.el?.isConnected) return;
-  const kept = signinKeep($("content"));
-  $("content").innerHTML = html;
-  signinPut($("content"), kept);
-  settingsShown.html = html; settingsShown.el = $("content").firstElementChild;
+  const c = $("content"), sameTab = settingsShown.el?.isConnected && settingsShown.tab === prefs.tab;
+  const tscroll = c.querySelector(".settings .tabs")?.scrollTop || 0;
+  const bscroll = sameTab ? (c.querySelector(".settings-body")?.scrollTop || 0) : 0;
+  const kept = signinKeep(c);
+  c.innerHTML = html;
+  signinPut(c, kept);
+  if (tscroll) c.querySelector(".settings .tabs").scrollTop = tscroll;
+  if (bscroll) c.querySelector(".settings-body").scrollTop = bscroll;
+  settingsShown.html = html; settingsShown.el = c.firstElementChild; settingsShown.tab = prefs.tab;
   diagDrawn();
   for (const k of ["http", "https", "no_proxy"]) $(`px-${k}`)?.addEventListener("input", (ev) => { ui.pxDraft[k] = ev.target.value; });
+  for (const k of ["insecure", "mirrors"]) {
+    $(`reg-${k}`)?.addEventListener("input", (ev) => { ui.regAdd[k] = ev.target.value; });
+    $(`reg-${k}`)?.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); regListAdd(k); } });
+  }
   for (const k of ["http", "https"]) $(`rp-${k}`)?.addEventListener("input", (ev) => {
     ui.rpDraft[k] = ev.target.value;
     const save = document.querySelector("#content [data-saverp]");
@@ -4560,10 +5203,11 @@ function renderSettings() {
     const go = document.querySelector("#content [data-impgo]"), n = importCount();
     if (go) { go.disabled = !n; go.textContent = n ? trn(n, "Import {n} item", "Import {n} items") : tr("Import"); }
   }));
-  for (const id of ["res-cpus", "res-mem"]) $(id)?.addEventListener("input", (ev) => {
-    ui.resDraft[id === "res-cpus" ? "cpus" : "memory_mib"] = +ev.target.value;
-    ev.target.style.setProperty("--fill", rangeFill(+ev.target.value, +ev.target.min, +ev.target.max));
-    $(`${id}-v`).textContent = id === "res-cpus" ? cpuText(+ev.target.value) : gb(+ev.target.value);
+  for (const id of ["res-cpus", "res-mem", "res-disk", "res-swap"]) $(id)?.addEventListener("input", (ev) => {
+    const v = +ev.target.value;
+    ui.resDraft[{ "res-cpus": "cpus", "res-mem": "memory_mib", "res-disk": "disk_gb", "res-swap": "swap_mib" }[id]] = v;
+    ev.target.style.setProperty("--fill", rangeFill(v, +ev.target.min, +ev.target.max));
+    $(`${id}-v`).textContent = id === "res-cpus" ? cpuText(v) : id === "res-mem" ? gb(v) : id === "res-swap" ? swapText(v) : diskGb(v);
     $("res-save").disabled = !resChanged();
   });
   $("pref-font")?.addEventListener("change", (ev) => setPref("font", ev.target.value));
@@ -4573,6 +5217,22 @@ function renderSettings() {
   // A list left open over a page that's gone (another view) closes; over the page drawn again, it stays.
   if (langPopState.close) $("pref-lang-btn")?.setAttribute("aria-expanded", "true");
   $("pref-mono")?.addEventListener("change", (ev) => setPref("mono", ev.target.value));
+  $("bld-cache")?.addEventListener("input", (ev) => {
+    const v = +ev.target.value;
+    ui.bsetDraft = { ...(ui.bsetDraft || {}), cache_gb: v };
+    ev.target.style.setProperty("--fill", rangeFill(v, +ev.target.min, +ev.target.max));
+    $("bld-cache-v").textContent = diskGb(v);
+  });
+  $("bld-cache")?.addEventListener("change", (ev) => {
+    const v = +ev.target.value;
+    ui.bsetDraft = { ...(ui.bsetDraft || {}), cache_gb: v };
+    if (ui.bset) ui.bset = { ...ui.bset, cache_gb: v };
+    send("setbuildersettings", { value: { cache_gb: v, idle_secs: ui.bsetDraft?.idle_secs ?? ui.bset?.idle_secs ?? 300 } });
+  });
+  $("k8s-ver")?.addEventListener("change", (ev) => {
+    const v = ev.target.value, c = k8s.config || {};
+    if (v !== (c.version || "")) k8sDo("set", { lan: !!c.lan, tls_san: c.tls_san || [], version: v || "default" });
+  });
 }
 /* i18n */ void [tr("Blue"), tr("Purple"), tr("Orange"), tr("Teal"), tr("Pink"), tr("Green"), tr("Small"), tr("Medium"), tr("Large")];
 
@@ -4583,14 +5243,17 @@ function show(view) {
   needClose();
   ui.view = view; ui.filter = ""; $("gq").value = "";
   if (view === "builds") send("builds");
+  if (view === "volumes") requestVolumeSizes();
   if (view === "compose") { cmp.open = null; cmp.asked = 0; cmpAsk(); }
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("storage"); send("dockersock"); send("proxy"); send("vmnet"); send("buildersettings"); send("shellpath"); send("registryconfig"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
   $("content").scrollTop = 0;
+  const sb = $("content").querySelector(".settings-body");
+  if (sb) sb.scrollTop = 0;
 }
 
 const empty = {
@@ -6109,13 +6772,47 @@ function renderImageDetail() {
     ${d.tab === "security" ? scanView(i, { own: tr("this image") }) : layersView(d.layers, null, { own: tr("Added in this image"), base: tr("From its base image") })}`;
 }
 
+const VOL_SIZES_TTL = 30000;
+function volumeListKey() {
+  return kept("volumes").map((v) => v.Name).sort().join("\0");
+}
+function requestVolumeSizes(force = false) {
+  if (ui.vm === "stopped" || !kept("volumes").length) return;
+  const key = volumeListKey();
+  const changed = key !== ui.volSizesKey;
+  const stale = !ui.volSizesAt || Date.now() - ui.volSizesAt >= VOL_SIZES_TTL;
+  if (!force && !changed && !stale) return;
+  if (ui.volSizesLoading && !changed && !force) return;
+  ui.volSizesKey = key;
+  ui.volSizesInFlight++;
+  ui.volSizesLoading = true;
+  send("volumesizes");
+}
+function volumeSizeOf(v) {
+  if (Object.prototype.hasOwnProperty.call(ui.volSizes, v.Name)) return ui.volSizes[v.Name];
+  if (typeof v.UsageData?.Size === "number") return v.UsageData.Size;
+  return null;
+}
+function volumeSizeCell(v) {
+  const s = volumeSizeOf(v);
+  if (typeof s === "number" && Number.isFinite(s) && s >= 0) return `<td class="r muted num">${esc(size(s))}</td>`;
+  if (ui.volSizesLoading && s === null) return '<td class="r muted num">…</td>';
+  return '<td class="r muted num">—</td>';
+}
+const VOLUME_SORT = {
+  name: (v) => v.Name || "",
+  driver: (v) => v.Driver || "",
+  size: (v) => { const s = volumeSizeOf(v); return typeof s === "number" && Number.isFinite(s) && s >= 0 ? s : -1; },
+  created: (v) => (v.CreatedAt ? Date.parse(v.CreatedAt) || 0 : 0),
+};
 function renderVolumes() {
-  const items = listed("volumes");
+  const items = sortBy(listed("volumes"), "volumes", VOLUME_SORT);
   if (!kept("volumes").length) return renderEmpty("volumes");
   if (!items.length) return noMatch();
-  table([[tr("Name")], [tr("Driver")], [tr("Created")]], items.map((v) => `<tr class="row${chosen("volumes", v)}" data-key="${esc(v.Name)}"${pickAt("volumes", v)}>
+  table([[tr("Name"), "", "name"], [tr("Driver"), "", "driver"], [tr("Size"), "r", "size"], [tr("Created"), "", "created"]], items.map((v) => `<tr class="row${chosen("volumes", v)}" data-key="${esc(v.Name)}"${pickAt("volumes", v)}>
     ${pickCell("volumes", v)}<td><div class="name">${tile(null, "database")}<span class="${v.Name.length > 40 ? "mono" : ""}">${esc(v.Name.length > 40 ? short(v.Name) : v.Name)}</span></div></td>
     <td class="muted">${esc(v.Driver)}</td>
+    ${volumeSizeCell(v)}
     <td class="muted">${v.CreatedAt ? ago(Date.parse(v.CreatedAt) / 1000) : ""}</td>
     <td class="actions"><div class="acts-row">${ibtn("trash", tr("Remove"), `data-rmvol="${esc(v.Name)}"`, "danger")}</div></td></tr>`), "volumes");
 }
@@ -6300,7 +6997,7 @@ const blSpan = (a, b) => (a && b ? Date.parse(b) - Date.parse(a) : a ? Date.now(
 // Dockerfile steps are "[stage 3/9] …" or "[2/4] …"; the rest is BuildKit's own work.
 const blInternal = (name) => !/^\[([^\]]* )?\d+\/\d+\]/.test(name || "");
 function pickBuild(b) {
-  ui.bl.sel = b; ui.bl.d = null; ui.bl.open = new Set(); ui.bl.confirm = null; ui.bl.layers = null; ui.bl.plat = null;
+  ui.bl.sel = b; ui.bl.d = null; ui.bl.open = new Set(); ui.bl.confirm = null; ui.bl.layers = null; ui.bl.plat = null; ui.bl.asking = b.id;
   send("build", { name: b.builder, id: b.id });
   if (ui.bl.tab === "layers" || ui.bl.tab === "security") send("buildlayers", { name: b.builder, id: b.id });
 }
@@ -6676,7 +7373,7 @@ function renderStatus() {
   const k8s = ui.containers.find((c) => c.Names?.[0] === "/kiri-k8s" && c.State === "running");
   const k8sVersion = k8s ? (k8s.Image.split(":")[1] || "").replace(/-k3s\d+$/, "") : "";
   const { shown: vshown } = engineShown();
-  const vmText = { running: tr("{vm} running", { vm: tr(VM) }), stopped: tr("{vm} off", { vm: tr(VM) }), booting: tr("Starting…"), stopping: tr("Stopping…") }[vshown] || vshown;
+  const vmText = { running: tr("{vm} running", { vm: tr(VM) }), stopped: tr("{vm} off", { vm: tr(VM) }), booting: tr("Starting…"), stopping: tr("Stopping…"), restarting: tr("Restarting…") }[vshown] || vshown;
   const mem = ui.mem ? tr("{used} of {total}", { used: memText(ui.mem.used), total: `${Math.round(ui.mem.ceiling / 1024)} GB` }) : "";
   const parts = [
     `<span class="item">${KDOT}<span>Kiri ${esc(ui.status?.version || "")}</span>${ui.status?.dev ? `<span class="dev" title="${tr("{app}: its own engine, containers and settings", { app: esc(ui.status?.app || "Kiri Dev") })}">DEV</span>` : ""}</span>`,
@@ -6743,7 +7440,7 @@ function aboutUpdate(version) {
   } else if (u?.phase === "ready") {
     row = `<span>${tr("Kiri {version} is downloaded", { version: esc(u.version) })}</span>${btn(tr("Restart to update"), 'data-upd="restart"', "primary")}`;
   } else if (u?.phase === "available") {
-    const whatsNew = u.notes.trim() || NOTES_URL.test(u.notesUrl) ? `<button class="linkbtn" data-upd="notes">${tr("What's new")}</button>` : "";
+    const whatsNew = (u.notes || "").trim() || NOTES_URL.test(u.notesUrl) ? `<button class="linkbtn" data-upd="notes">${tr("What's new")}</button>` : "";
     row = `<span>${tr("Version {version}", { version: v })}</span><span class="updpill new">${tr("{version} available", { version: esc(u.version) })}</span>${btn(u.error ? tr("Try again") : tr("Download"), 'data-upd="download"', "primary")}${whatsNew}`;
   } else if (s?.state === "available") {
     row = `<span>${tr("Version {version}", { version: v })}</span><span class="updpill new">${tr("{version} available", { version: esc(s.latest) })}</span>${btn(tr("Show"), "data-updcheck", "primary")}`;
@@ -6756,7 +7453,7 @@ function aboutUpdate(version) {
   } else if (s?.state === "error") {
     row = `<span>${tr("Version {version}", { version: v })}</span><span class="faint">${tr("Couldn't check: {error}", { error: esc(s.error || "") })}</span>${check}`;
   } else row = `<span>${tr("Version {version}", { version: v })}</span>${check}`;
-  const notes = u?.phase === "available" && u.notes.trim() ? `<div class="updnotes"><b>${tr("What's new in {version}", { version: esc(u.version) })}</b>${notesHtml(u.notes)}</div>` : "";
+  const notes = u?.phase === "available" && (u.notes || "").trim() ? `<div class="updnotes"><b>${tr("What's new in {version}", { version: esc(u.version) })}</b>${notesHtml(u.notes)}</div>` : "";
   const fixed = s?.state === "test" || s?.state === "dev";
   const auto = prefs.updateAuto !== false;
   return `<div class="updrow">${row}</div>${notes}${fixed ? "" : `<div class="pref"><span class="t">${tr("Check for updates automatically")}</span><span class="d">${auto ? tr("On: Kiri checks each time it opens. It never updates without asking.") : tr("Off: Kiri checks only when you click Check now.")}</span>
@@ -6772,8 +7469,8 @@ function renderUpdate() {
     <div class="head"><div class="ic ${ic === "ok" ? "ok" : ""}">${UPD_ICON[ic]}</div><div class="txt"><h4>${esc(title)}</h4><div class="sub">${sub}</div></div>
     ${close ? `<button class="close" data-upd="${close}" aria-label="${tr("Close")}" title="${tr("Hide until Kiri next opens")}">${UPD_ICON.x}</button>` : ""}</div>${body}</div>`;
   if (u && !u.hidden && u.phase === "available") {
-    const whatsNew = u.notes.trim() || NOTES_URL.test(u.notesUrl) ? ` · <button data-upd="notes">${tr("What's new")}</button>` : "";
-    const sub = `${tr("You have {version}", { version: esc(u.current) })}${whatsNew}${u.error ? `<div class="err">${tr("Couldn't download it: {error}", { error: esc(u.error) })}</div>` : ""}`;
+    const whatsNew = (u.notes || "").trim() || NOTES_URL.test(u.notesUrl) ? ` · <button data-upd="notes">${tr("What's new")}</button>` : "";
+    const sub = `${tr("You have {version}", { version: esc(u.current || "") })}${whatsNew}${u.error ? `<div class="err">${tr("Couldn't download it: {error}", { error: esc(u.error) })}</div>` : ""}`;
     el.innerHTML = card("up", tr("Kiri {version} is available", { version: u.version }), sub, "hide", `<div class="row">
       ${btn(u.error ? tr("Try again") : tr("Download"), 'data-upd="download"', "primary")}
       ${u.snoozing ? `<span class="snooze">${btn(tr("Tomorrow"), 'data-upd="snooze1"')}${btn(tr("In a week"), 'data-upd="snooze7"')}</span>` : btn(tr("Snooze ▾"), 'data-upd="snooze" aria-haspopup="true"')}
@@ -6798,9 +7495,9 @@ function updateAction(a) {
     case "snooze1": snooze(1); break;
     case "snooze7": snooze(7); break;
     case "skip": setPref("updateSkip", u.version); ui.upd = null; break;
-    case "notes": if (u.notes.trim()) openNotes(); else send("updatenotes", { name: u.notesUrl }); break;
-    case "restart": send("updaterestart"); break;
-    case "engine": send("restartengine"); ui.engineStale = null; break;
+    case "notes": if ((u?.notes || "").trim()) openNotes(); else send("updatenotes", { name: u?.notesUrl || "" }); break;
+    case "restart": startRestartOverlay("update", tr("Finish updating to Kiri {version}", { version: esc(u?.version || "") }), tr("Restarting…")); send("updaterestart"); break;
+    case "engine": startRestartOverlay("engine", tr("Finish updating to Kiri {version}", { version: esc(ui.status?.version || "") }), tr("Restarting engine…")); send("restartengine"); ui.engineStale = null; break;
     case "enginelater": ui.staleHidden = true; break;
     case "showengine": ui.staleHidden = false; break;
   }
@@ -6906,6 +7603,7 @@ function navTags() {
 addEventListener("resize", navTags);
 function render() {
   if (held(render)) return;
+  schedulePlaceFloats();
   if (ui.view !== "compose") cmpHWait(false);
   if (langPopState.close) queueMicrotask(() => { if (langPopState.close && !$("pref-lang-btn")) langPopState.close(false); });
   themeBtn();
@@ -6946,6 +7644,7 @@ function render() {
   if (v === "share") return renderShare();
   // The devices are the computer's: listed whether the engine runs or not.
   if (v === "usb") return renderUsb();
+  if (ui.storage?.state === "unavailable") return renderStorageUnavailable();
   if (ui.vm === "stopped") return renderEmpty("stopped");
   if ((v === "containers" || v === "compose") && ui.detail) {
     // The list refreshes while you edit the environment: keep your place.
@@ -6962,6 +7661,10 @@ function render() {
 }
 
 function setVm(state, error) {
+  if (ui.restarting && ["vm", "engine", "reclaim"].includes(ui.restarting.kind)) {
+    if (state === "stopping") setRestartStep(tr("Stopping containers…"));
+    else if (state === "booting") setRestartStep(tr("Starting…"));
+  }
   if (ui.vm !== state) {
     const was = ui.vm;
     ui.vm = state;
@@ -6972,6 +7675,8 @@ function setVm(state, error) {
     if (ui.view === "settings" && prefs.tab === "resources") render();
     // Asleep, the VM holds no memory and the vm event says so (0 MB); off, there's nothing to read.
     if (state === "stopped" || state === "stopping") ["vm-mem"].forEach((id) => ($(id).textContent = "—")), ($("vm-meter").style.width = "0");
+    if (state === "stopped") { ui.volSizesInFlight = 0; ui.volSizesLoading = false; ui.volSizesAt = 0; ui.resSaved = false; ui.vmNetSaved = false; }
+    if (state === "running" && was !== "running") { ui.volSizesAt = 0; if (ui.view === "volumes") { requestVolumeSizes(); render(); } }
     if (state === "stopped" || was === "stopped") render();
   }
   if (error) toast("error", error);
@@ -6983,6 +7688,7 @@ function setVm(state, error) {
    VM rests to save memory and the next docker command wakes it, so it reads
    Running, and waking does too. Off is only Stop (or no engine at all). */
 function engineShown() {
+  if (ui.restarting && ui.restarting.kind !== "k8s") return { look: "restarting", on: false, shown: "restarting" };
   const look = ui.vmLook || ui.vm;
   const shown = ui.vm === "stopped" ? "stopped"
     : ui.vm === "stopping" ? "stopping"
@@ -7002,16 +7708,19 @@ function paintEngine() {
   const { shown } = engineShown();
   document.body.dataset.vm = shown;
   const label = tr(vmLabels[shown] ?? shown);
-  /* i18n */ void [tr("Off"), tr("Starting…"), tr("Running"), tr("Stopping…")];
+  /* i18n */ void [tr("Off"), tr("Starting…"), tr("Running"), tr("Stopping…"), tr("Restarting…")];
   $("vm-state").textContent = label;
   const sub = $("vm-sub");
   sub.textContent = ""; sub.hidden = true;
   if (document.body.classList.contains("rail")) document.querySelector(".vm").title = `${tr(VM)}: ${label}`;
   const b = $("vm-toggle");
   b.hidden = false;
-  b.textContent = shown === "running" ? tr("Stop") : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : tr("Start");
-  b.classList.toggle("primary", shown !== "running");
-  b.disabled = shown === "booting" || shown === "stopping";
+  /* When it last turned into a Stop button: see the press guard below. */
+  const act = shown === "running" ? "stop" : "start";
+  if (b.dataset.act !== act) { b.dataset.act = act; b.dataset.flipped = String(Date.now()); }
+  b.textContent = shown === "running" ? tr("Stop") : shown === "booting" ? tr("Starting…") : shown === "stopping" ? tr("Stopping…") : shown === "restarting" ? tr("Restarting…") : tr("Start");
+  b.classList.toggle("primary", shown !== "running" && shown !== "restarting");
+  b.disabled = shown === "booting" || shown === "stopping" || shown === "restarting";
   headTitles();
 }
 /* The name or state says itself on hover only when it is cut. */
@@ -7143,7 +7852,7 @@ function toast(kind, text, op, open, act, why) {
   // Resources saved while the VM runs: restart it now to use them.
   if (!error && act === "restartvm") {
     el.querySelector(".txt").insertAdjacentHTML("beforeend", `<div class="dg-tacts"><button class="lnk" data-trestart>${tr("Restart now")}</button></div>`);
-    el.querySelector("[data-trestart]").addEventListener("click", () => { el.remove(); send("restartvm"); });
+    el.querySelector("[data-trestart]").addEventListener("click", () => { el.remove(); restartVm(); });
   }
   $("toasts").append(el);
   retire(el, ms);
@@ -7240,8 +7949,8 @@ function runTip(image, text, id) {
     // Before the button in reading order: on its left, or on its right right to left (.run-tip's transform).
     el.style.left = `${rtl() ? r.right : r.left}px`;
     el.style.top = `${r.top + r.height / 2}px`;
-    requestAnimationFrame(place);
   };
+  el._place = place;
   place();
   el.timer = setTimeout(() => el.remove(), 8000);
   return true;
@@ -7260,6 +7969,7 @@ function runTipFailed(id) {
   el.innerHTML = `<svg viewBox="0 0 256 256" aria-hidden="true"><path d="${PH.warning}"/></svg><span class="t">${why.short ? tr("{name} stopped: {why}", { name: `<b>${esc(name)}</b>`, why: esc(why.short) }) : tr("{name} stopped", { name: `<b>${esc(name)}</b>` })}</span>`
     + (why.kind === "env" ? `<button class="lnk" data-tfix>${tr("Set it and start")}</button>` : `<button class="lnk" data-tview>${tr("See why")}</button>`)
     + `<span class="sep">·</span><button class="lnk" data-tlogs>${tr("Logs")}</button>`;
+  el._place?.();
 }
 
 /* Why a container stopped, from its own words: the last lines of its log
@@ -7387,7 +8097,19 @@ function needClose(done) {
   p.el.remove();
   if (ui.view === "images") render();
 }
-// Below the Run button, or above it when there's no room; it follows the list as it redraws.
+// Below the Run button, or above it when there's no room; it follows the list on scroll, resize and redraw.
+let floatRaf = 0;
+function placeFloats() {
+  floatRaf = 0;
+  document.querySelector(".run-tip")?._place?.();
+  if (ui.need) needPlace();
+}
+function schedulePlaceFloats() {
+  if (floatRaf || (!ui.need && !document.querySelector(".run-tip"))) return;
+  floatRaf = requestAnimationFrame(placeFloats);
+}
+addEventListener("scroll", schedulePlaceFloats, { capture: true, passive: true });
+addEventListener("resize", schedulePlaceFloats, { passive: true });
 function needPlace() {
   const p = ui.need;
   if (!p || !p.el.isConnected) return;
@@ -7402,7 +8124,6 @@ function needPlace() {
   const up = h > roomBelow && roomAbove > roomBelow;
   el.classList.toggle("above", up); el.classList.toggle("below", !up);
   el.style.top = `${up ? Math.max(8, r.top - 9 - h) : r.bottom + 9}px`;
-  requestAnimationFrame(needPlace);
 }
 // What Run sends, or null while something it needs is missing.
 function needEnv() {
@@ -7432,6 +8153,7 @@ function needCheck() {
   }
   p.el.classList.toggle("sec-off", !!p.el.querySelector("[data-needoff]")?.checked);
   p.el.querySelector("[data-needgo]").disabled = !needEnv();
+  needPlace();
 }
 document.addEventListener("input", (ev) => { if (ev.target.closest(".need")) needCheck(); });
 document.addEventListener("change", (ev) => { if (ev.target.closest(".need")) needCheck(); });
@@ -7461,6 +8183,7 @@ document.addEventListener("click", (ev) => {
   } else if (b?.matches("[data-needdisc]")) {
     const x = b.getAttribute("aria-expanded") !== "true";
     b.setAttribute("aria-expanded", x); b.nextElementSibling.hidden = !x;
+    needPlace();
   }
 });
 const appName = (image) => { const b = (image || "").split("@")[0].split(":")[0].split("/").pop(); return APPS[b] || (b ? b[0].toUpperCase() + b.slice(1) : tr("This image")); };
@@ -7777,9 +8500,9 @@ function dgMark(text) {
 }
 const dgFields = (l) => Object.entries(l.fields || {}).map(([k, v]) => ` ${k}=${typeof v === "string" ? (/\s/.test(v) || !v ? JSON.stringify(v) : v) : JSON.stringify(v)}`);
 const dgText = (l) => `${l.msg || ""}${dgFields(l).join("")}`;
-function dgRow(l) {
+function dgRow(l, key = "") {
   const lv = ["error", "warn", "info", "debug"].includes(l.level) ? l.level : "info";
-  return `<div class="dg-row ${lv}${lv === "error" ? " hit" : ""}"><span class="t">${esc(dgTime(l.time))}</span><span class="lv">${lv.toUpperCase()}</span><span class="p">${(DG_PART[l.part] && tr(DG_PART[l.part])) || esc(l.part || "")}</span><span class="m">${dgMark(l.msg || "")}${dgFields(l).map((f) => `<span class="k">${dgMark(f)}</span>`).join("")}</span></div>`;
+  return `<div class="dg-row ${lv}${lv === "error" ? " hit" : ""}"${key ? ` data-key="${esc(key)}"` : ""}><span class="t">${esc(dgTime(l.time))}</span><span class="lv">${lv.toUpperCase()}</span><span class="p">${(DG_PART[l.part] && tr(DG_PART[l.part])) || esc(l.part || "")}</span><span class="m">${dgMark(l.msg || "")}${dgFields(l).map((f) => `<span class="k">${dgMark(f)}</span>`).join("")}</span></div>`;
 }
 // A line as text, for Copy: local time, level, part, message and fields.
 const dgPlain = (l) => `${dgTime(l.time)} ${(l.level || "").toUpperCase().padEnd(5)} ${(DG_PART[l.part] || l.part || "").padEnd(6)} ${dgText(l)}`;
@@ -7803,10 +8526,16 @@ function drawDiagLog() {
   const key = `${rows.length}|${rows.at(-1)?.time}|${rows[0]?.time}|${dg.find}`;
   $("dg-count").textContent = dg.lines ? trn(rows.length, "{n} line", "{n} lines") : "";
   if (key === dg.shown && el.childElementCount) return;
+  const sel = getSelection();
+  if (dg.shown && sel && !sel.isCollapsed && (el.contains(sel.anchorNode) || el.contains(sel.focusNode))) return;
   dg.shown = key;
-  const top = el.scrollTop;
-  el.innerHTML = !dg.lines ? `<div class="dg-empty">${tr("Reading the log…")}</div>` : rows.length ? rows.map(dgRow).join("")
-    : `<div class="dg-empty">${dg.find || dg.level || dg.part || dg.op ? tr("No lines match.") : tr("Nothing logged yet.")}</div>`;
+  const top = el.scrollTop, seen = new Map();
+  const html = !dg.lines ? `<div class="dg-empty">${tr("Reading the log…")}</div>` : rows.length ? rows.map((l) => {
+    const base = `${l.time}|${l.level}|${l.part}|${l.msg || ""}`, n = (seen.get(base) || 0) + 1;
+    seen.set(base, n);
+    return dgRow(l, `${base}#${n}`);
+  }).join("") : `<div class="dg-empty">${dg.find || dg.level || dg.part || dg.op ? tr("No lines match.") : tr("Nothing logged yet.")}</div>`;
+  morph(el, html);
   el.scrollTop = dg.follow ? el.scrollHeight : top;
 }
 
@@ -7908,16 +8637,16 @@ function drawReport() {
   const item = (t, d) => `<div class="rp-item">${dgIcon("check")}<span class="t">${t}</span><span class="d">${d}</span></div>`;
   scrim.innerHTML = `<div class="dialog rp-dialog" role="dialog" aria-modal="true" aria-labelledby="rp-t">
     <h3 id="rp-t">${send_ ? tr("Send a report to Kiri") : tr("Create a diagnostics report")}</h3>
-    <p>${send_ ? tr("We get the file below, redacted, and you get an ID to quote when you write to us. If you're signed in to Kiri Cloud, it says it's from you, so we can reply.") : tr("One text file, redacted, saved to your Desktop and shown in Finder. Read it before you share it.")}</p>
+    <p>${send_ ? tr("We get the file below, redacted, and you get an ID to quote when you write to us. If you're signed in to Kiri Cloud, it says it's from you, so we can reply.") : WIN || LINUX ? tr("One text file, redacted, saved to your Desktop. Read it before you share it.") : tr("One text file, redacted, saved to your Desktop and shown in Finder. Read it before you share it.")}</p>
     <div class="rp-list">${item(tr("Kiri's logs"), tr("The last 300 lines from the window, the engine and kiri commands, and the engine's own output"))}
-      ${item(tr("Crash reports"), tr("The 5 newest, and macOS's own crash reports for Kiri from the last 30 days"))}
-      ${item(tr("Kiri and this Mac"), tr("Versions, macOS, whether the engine runs, how many containers and images"))}
+      ${item(tr("Crash reports"), WIN || LINUX ? tr("The 5 newest crash reports for Kiri") : tr("The 5 newest, and macOS's own crash reports for Kiri from the last 30 days"))}
+      ${item(WIN ? tr("Kiri and this PC") : LINUX ? tr("Kiri and this computer") : tr("Kiri and this Mac"), WIN || LINUX ? tr("Versions, {os}, whether the engine runs, how many containers and images", { os: OS }) : tr("Versions, macOS, whether the engine runs, how many containers and images"))}
       <label class="rp-item opt"><input type="checkbox" data-rpopt${rp.containers ? " checked" : ""}${rp.state ? " disabled" : ""}><span class="t">${tr("Container list")}</span><span class="d">${tr("Names, images and status. Not their files, logs or environment.")}</span></label></div>
     <div class="rp-red">${dgIcon("shieldcheck")}<span>${tr("Your home folder's path, tokens, passwords and other secrets are blanked before anything is written.")}</span></div>
     ${done ? `<div class="rp-id"><span class="lab">${tr("Report ID")}</span><span class="val">${esc(rp.id)}</span><button class="btn sm" data-rpcopy>${dgIcon("copy")}${tr("Copy")}</button></div>` : ""}
     ${rp.error ? `<p class="err">${send_ ? tr("Couldn't send it: {error}", { error: esc(rp.error) }) : tr("Couldn't save it: {error}", { error: esc(rp.error) })}</p>` : ""}
     <div class="row-end"><span></span><span>${done ? `<button class="btn primary" data-close>${tr("Done")}</button>`
-      : `<button class="btn" data-close>${tr("Cancel")}</button> <button class="btn primary" data-rpgo${rp.state === "busy" ? " disabled" : ""}>${rp.state === "busy" ? (send_ ? tr("Sending…") : tr("Saving…")) : rp.error ? tr("Try again") : send_ ? tr("Send") : tr("Save to Desktop")}</button>`}</span></div></div>`;
+      : `<button class="btn" data-close>${tr("Cancel")}</button> <button class="btn primary" data-rpgo${rp.state === "busy" ? " disabled" : ""}>${rp.state === "busy" ? `${rspin("sm plain")}${send_ ? tr("Sending…") : tr("Saving…")}` : rp.error ? tr("Try again") : send_ ? tr("Send") : tr("Save to Desktop")}</button>`}</span></div></div>`;
 }
 
 /* The card after a crash, in the update card's place (an update offer goes
@@ -8058,12 +8787,21 @@ window.kiri = {
         // rest of the builder (its image, its cache volume) in Images and Volumes.
         ui.containers = (e.containers || []).filter((c) => !c.Labels?.["io.kiri.probe"] && !isBuildWorker(c)); oomCheck(); starCheck(); ui.builderImage = (e.images || []).find(isBuilderImage) || null; ui.builderVolume = (e.volumes || []).find(isBuilderVolume) || null;
         ui.images = (e.images || []).filter((i) => !isBuilderImage(i)); ui.volumes = (e.volumes || []).filter((v) => !isBuilderVolume(v)); ui.networks = e.networks || [];
+        if (!kept("volumes").length) { ui.volSizes = {}; ui.volSizesKey = ""; ui.volSizesAt = 0; ui.volSizesInFlight = 0; ui.volSizesLoading = false; }
+        else if (ui.view === "volumes") requestVolumeSizes();
         shPublished(); ctrActed(); groupActed();
         fixWatch();
         if (ui.view === "compose") cmpAsk();
         render();
         paintEngine();
         if (ui.openAfter && ui.containers.some((c) => c.Id === ui.openAfter)) { openDetail(ui.openAfter); ui.openAfter = null; openedTab(); }
+        break;
+      case "volumesizes":
+        ui.volSizes = e.sizes && typeof e.sizes === "object" ? e.sizes : {};
+        ui.volSizesInFlight = Math.max(0, ui.volSizesInFlight - 1);
+        ui.volSizesLoading = ui.volSizesInFlight > 0;
+        ui.volSizesAt = Date.now();
+        if (ui.view === "volumes") render();
         break;
       case "pull": pullEvent(e); break;
       case "composeprojects": case "composefile": case "composeplan": case "composelogs": case "composeapply": case "composeopened": case "composerestored": case "composeaction": cmpEvent(e); break;
@@ -8078,6 +8816,7 @@ window.kiri = {
         if (e.kind === "search" && [...ui.pulls.values()].some((p) => p.kind === "notfound")) pullsChanged();
         break;
       case "notice":
+        if (ui.restarting && (ui.restarting.kind === "vm" || (e.kind === "error" && ["storage", "engine", "update", "reclaim"].includes(ui.restarting.kind)))) stopRestartOverlay();
         // Each pod a batch deletes says so; the batch's own toast already has.
         if (e.kind === "ok" && /^Deleting pod /.test(e.text) && ui.batches.some((b) => b.view === "pods" && b.phase === "going")) break;
         if (e.kind === "ok" && e.image && e.open) { ui.launched.set(e.image, e.open); runHold(e.image, e.text, e.open, e.ms); break; }
@@ -8107,7 +8846,8 @@ window.kiri = {
       case "textsize": if (htHasFocus()) htStep(e.step); else stepTextSize(e.step); break;
       case "term": htOn(e); break;
       case "closekey": htCloseKey(); break;
-      case "enginerestarted": engineToast(e); break;
+      case "vmrestarted": if (e.ok) { ui.resSaved = false; ui.vmNetSaved = false; } if (ui.restarting?.kind === "vm") stopRestartOverlay(); if (ui.view === "settings") render(); break;
+      case "enginerestarted": if (ui.restarting?.kind === "engine") stopRestartOverlay(); if (!e.error) engineToast(e); break;
       case "view": if (empty[e.view] || e.view === "settings") show(e.view); break;
       case "prefs": { const was = prefs.lang; Object.assign(prefs, e.prefs || {}); prefsIn = true; if (prefs.lang !== was) relang(); applyPrefs(); render(); paintEngine(); renderStatus(); break; }
       case "starprompt": starCard(tr("Kiri started your container.")); break;
@@ -8117,6 +8857,14 @@ window.kiri = {
       case "onboarding": onboarding(e); break;
       case "buildask": buildAsk(e.engine); break;
       case "buildwith": ui.bw = e; if (ui.view === "settings") render(); break;
+      case "buildersettings":
+        ui.bset = e;
+        if (!e.error) ui.bsetDraft = { cache_gb: e.cache_gb ?? e.default_cache_gb ?? 20, idle_secs: e.idle_secs ?? 300 };
+        if (ui.view === "settings") render();
+        break;
+      case "vmnet": ui.vmnet = e; if (ui.view === "settings") render(); break;
+      case "shellpath": ui.shellPath = e; ui.shellPathBusy = false; if (ui.view === "settings") render(); break;
+      case "dockersock": ui.dockersock = e; ui.sockTaking = false; if (ui.view === "settings") render(); break;
       case "status":
         ui.status = e;
         document.body.classList.toggle("dev", !!e.dev);
@@ -8139,10 +8887,10 @@ window.kiri = {
         if (ui.upd.phase !== "downloading") Object.assign(ui.upd, { phase: "downloading", t0: Date.now(), g0: e.got });
         Object.assign(ui.upd, { got: e.got, total: e.total }); renderUpdate(); break;
       case "updatestate": ui.updState = { ...e, checking: false }; if (ui.view === "settings" && prefs.tab === "about") render(); break;
-      case "updateready": if (ui.upd?.phase === "ready" && ui.upd.version === e.version && ui.upd.hidden) break; ui.upd = { ...(ui.upd || {}), phase: "ready", version: e.version, hidden: false, error: "" }; renderUpdate(); break;
+      case "updateready": if (ui.upd?.phase === "ready" && ui.upd.version === e.version && ui.upd.hidden) break; ui.upd = { notes: "", notesUrl: "", ...(ui.upd || {}), phase: "ready", version: e.version, hidden: false, error: "" }; renderUpdate(); break;
       case "updatecancelled": if (ui.upd) Object.assign(ui.upd, { phase: "available", hidden: true }); renderUpdate(); break;
-      case "updateerror": if (ui.upd) Object.assign(ui.upd, { phase: "available", hidden: false, error: e.error }); else toast("error", e.error); renderUpdate(); break;
-      case "enginestale": ui.engineStale = e.version; ui.staleHidden = false; renderUpdate(); break;
+      case "updateerror": if (ui.restarting?.kind === "update") stopRestartOverlay(); if (ui.upd) Object.assign(ui.upd, { phase: "available", hidden: false, error: e.error }); else toast("error", e.error); renderUpdate(); break;
+      case "enginestale": if (e.version && ui.restarting?.kind === "engine") stopRestartOverlay(); ui.engineStale = e.version; ui.staleHidden = false; renderUpdate(); break;
       case "tools": toolsBar(e); break;
       case "share": case "shares": case "shareaccount": case "sharelogin": case "shareusage": case "sharetunnels": case "sharetraffic": shEvent(e); break;
       case "builds": {
@@ -8152,7 +8900,8 @@ window.kiri = {
         b.items = (e.builds || b.items || []).filter((x) => !seen.has(x.id) && seen.add(x.id)); b.error = e.error || "";
         const sel = b.sel && b.items.find((x) => x.id === b.sel.id);
         if (!sel && b.items.length) pickBuild(b.items[0]);
-        else if (sel && (sel.status === "Running" || sel.status !== b.sel.status)) { b.sel = sel; send("build", { name: sel.builder, id: sel.id }); }
+        // One ask at a time for a running build: each reads its log for a moment (#923).
+        else if (sel && (sel.status !== b.sel.status || (sel.status === "Running" && b.asking !== sel.id))) { b.sel = sel; b.asking = sel.id; send("build", { name: sel.builder, id: sel.id }); }
         if (ui.view === "builds") render(); else if ($("n-builds")) $("n-builds").textContent = b.items.length;
         break;
       }
@@ -8169,15 +8918,85 @@ window.kiri = {
       case "scanhistory": { const x = ui.scans.get(e.name) || {}; x.history = e.scans || []; x.histErr = e.error || null; ui.scans.set(e.name, x); rerenderScan(); break; }
       case "imagelayers": if (ui.imgd?.name === e.name) { ui.imgd.layers = e; if (ui.view === "images") render(); } break;
       case "buildlayers": if (ui.bl.sel?.id === e.id) { ui.bl.layers = e; if (ui.view === "builds") renderBuilds(); } break;
-      case "build": if (ui.bl.sel?.id === e.id) { ui.bl.d = e; if (ui.view === "builds") renderBuilds(); } break;
-      case "usedcontext": if (e.error) toast("error", tr("Couldn't switch docker: {error}", { error: e.error })); break;
+      case "build": if (ui.bl.asking === e.id) ui.bl.asking = null; if (ui.bl.sel?.id === e.id) { ui.bl.d = e; if (ui.view === "builds") renderBuilds(); } break;
+      case "usedcontext": ui.ctxSwitching = false; if (e.error) toast("error", tr("Couldn't switch docker: {error}", { error: e.error })); if (ui.view === "settings") render(); break;
       case "importsources": ui.imp.sources = e.sources; { const s = e.sources.find((x) => x.id === ui.imp.source) || e.sources.find((x) => x.running && x.id === ui.status?.context) || e.sources.find((x) => x.running) || e.sources[0]; if (s) { ui.imp.source = s.id; if (s.running) send("inventory", { name: s.id }); } } if (ui.view === "settings") render(); break;
       case "inventory": ui.imp.inv = e; if (ui.view === "settings") render(); renderImportStrip(); drawImportModal(); break;
       case "importstep": ctxStep(e); ui.imp.steps[`${e.kind}/${e.name}`] = e; if (e.state !== "running") ui.imp.picked[e.kind].delete(e.name); if (ui.view === "settings") render(); drawImportModal(); break;
       case "importdone": if (ctx.card?.total) { ctx.card.finished = true; drawCtxCard(); } ui.imp.running = false; ui.imp.summary = e.failed ? tr("Imported {done}; {failed} failed (hover “Failed” for why).", { done: e.done, failed: e.failed }) : trn(e.done, "Imported {n} item.", "Imported {n} items."); send("inventory", { name: ui.imp.source }); toast(e.failed ? "error" : "ok", ui.imp.summary); drawImportModal(); break;
       case "routerports": ui.rports = e; ui.rpDraft = {}; render(); break;
       case "proxy": ui.proxy = e; ui.pxDraft = { ...(e.settings || {}) }; if (ui.view === "settings") render(); break;
-      case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib }; if (ui.view === "settings") render(); break;
+      case "registryconfig": {
+        // A list with edits not yet saved keeps them: saving the other list,
+        // a save the daemon refused, a read that crossed a save, or a daemon
+        // that went away must not throw them away. A list takes the file's
+        // version when it has no edits (against the last file read), or when
+        // it is the one this save saved (`saved`, only on a save's answer),
+        // even if the file reads the same as before (the save wrote what
+        // was typed in the file's own spelling). What is typed in a field
+        // and not added yet goes only with its own list's save.
+        const answer = "saved" in e, saving = answer ? ui.regSaving : null;
+        if (answer) ui.regSaving = null;
+        if (!e.error) {
+          const base = ui.regBase;
+          const same = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || []);
+          for (const k of Object.keys(REG_KEY)) {
+            const fresh = e[REG_KEY[k]] || [];
+            const clean = !base || same(ui.regDraft[k], base[REG_KEY[k]]);
+            const savedNow = saving === k && e.saved === true;
+            if (clean || savedNow) ui.regDraft[k] = [...fresh];
+            if (savedNow) ui.regAdd[k] = "";
+          }
+          ui.regBase = e;
+        }
+        ui.regcfg = e;
+        if (ui.view === "settings") render();
+        break;
+      }
+      case "resources": ui.res = e; if (e.watch_bind_mounts != null && prefs.watchBindMounts == null) prefs.watchBindMounts = !!e.watch_bind_mounts; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib, ...(e.disk_gb != null ? { disk_gb: e.disk_gb } : {}), ...(e.swap_mib != null ? { swap_mib: e.swap_mib } : {}) }; if (ui.view === "settings") render(); break;
+      case "storage": {
+        const wasUnavail = ui.storage?.state === "unavailable";
+        ui.storage = e;
+        if (e.state === "moving") {
+          ui.stErr = "";
+          const m = e.moving, pct = m && m.total > 0 ? Math.min(100, Math.round((m.done / m.total) * 100)) : null;
+          startRestartOverlay("storage", m?.to ? tr("Moving Kiri's data to {path}.", { path: `<span class="mono st-path">${esc(m.to)}</span>` }) : tr("Kiri will switch to this folder and restart the engine."), stPhaseText(m?.phase), pct);
+        } else if (ui.restarting?.kind === "storage") {
+          stopRestartOverlay();
+        }
+        if (e.reclaimable > 0) ui.stReclaimed = null;
+        if (ui.view === "settings" || e.state === "unavailable" || wasUnavail) render();
+        break;
+      }
+      case "storagereclaimed":
+        ui.stReclaiming = false;
+        if (ui.restarting?.kind === "reclaim") stopRestartOverlay();
+        if (e.error) {
+          toast("error", tr("Couldn't reclaim disk space: {error}", { error: e.error }));
+        } else {
+          ui.stReclaimed = e;
+          if (ui.storage && e.after != null) {
+            ui.storage = { ...ui.storage, disk_host: e.after, ...(e.in_use != null ? { disk_in_use: e.in_use } : {}), reclaimable: e.reclaimable ?? 0 };
+          }
+          toast("ok", e.reclaimed > 0 ? tr("Reclaimed {size} on {os}", { size: size(e.reclaimed), os: OS }) : tr("Nothing to reclaim"));
+        }
+        if (ui.view === "settings") render();
+        break;
+      case "storagepruned":
+        ui.stPruning = false;
+        if (e.error) {
+          toast("error", tr("Couldn't clean up unused Docker data: {error}", { error: e.error }));
+        } else {
+          ui.stPruned = e;
+          toast("ok", e.freed > 0 ? tr("Cleaned up {size} of unused Docker data", { size: size(e.freed) }) : tr("Cleaned up unused Docker data"));
+        }
+        if (ui.view === "settings") render();
+        break;
+      case "storagecheck":
+        if (ui.restarting?.kind === "storage") stopRestartOverlay();
+        if (e.error) { ui.stErr = e.error; if (ui.view === "settings") render(); else toast("error", e.error); }
+        else { ui.stErr = ""; storageConfirm(e); }
+        break;
       case "detail": openDetail(e.id); break;
       case "inspect":
         if (ui.detail?.id === e.id) {
@@ -8208,7 +9027,7 @@ window.kiri = {
       case "stats": if (ui.detail?.id === e.id) { e.at = Date.now(); addSample(e); } break;
       case "stats-end": if (ui.detail?.id === e.id) ui.detail.statsOn = false; break;
       case "logs": if (ui.detail?.id === e.id) addLogs(e.parts); break;
-      case "logs-end": if (ui.detail?.id === e.id) { const d = document.createElement("div"); d.className = "quiet"; d.textContent = tr("— the log stream ended —"); logEl.append(d); ui.detail.logsOn = false; } break;
+      case "logs-end": if (ui.detail?.id === e.id) { appendLogEnd(logEl, tr("— the log stream ended —")); ui.detail.logsOn = false; } break;
       case "exec": if (ui.detail?.id === e.id) finishExec(e); break;
       case "files": if (ui.detail?.name === e.name) { Object.assign(ui.detail.files, { path: e.path, entries: e.entries, error: e.error, loading: false }); render(); } break;
       case "preview": if (ui.detail?.name === e.name && ui.detail.files.selected === e.path) { ui.detail.files.preview = e; render(); } break;
@@ -8277,13 +9096,69 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
   else if ((el = t("[data-group]"))) toggleGroup(el);
   else if (composeClick(t)) {}
-  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "storage") send("storage"); if (prefs.tab === "network") { send("proxy"); send("dockersock"); send("vmnet"); } if (prefs.tab === "builds") { send("buildwith"); send("buildersettings"); } if (prefs.tab === "appearance") send("shellpath"); if (prefs.tab === "registries") { send("logins"); send("registryconfig"); } if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if (t("[data-stpick]")) { ui.stErr = ""; send("storagepick"); }
+  else if (t("[data-streclaim]")) {
+    if (WIN) {
+      confirmRemove(tr("Compact WSL disk?"), tr("Compacting {vhdx} returns unused space to Windows and briefly restarts Kiri's engine and running containers.", { vhdx: '<span class="mono">ext4.vhdx</span>' }), tr("Compact disk"), () => { ui.stReclaiming = true; ui.stReclaimed = null; startRestartOverlay("reclaim", tr("Compacting {vhdx} and restarting the engine…", { vhdx: '<span class="mono">ext4.vhdx</span>' }), tr("Restarting engine…")); send("storagereclaim"); render(); }, "primary");
+    } else {
+      ui.stReclaiming = true; ui.stReclaimed = null; send("storagereclaim"); render();
+    }
+  }
+  else if (t("[data-stprune]")) {
+    confirmRemove(tr("Clean up unused Docker data?"), tr("Removes stopped containers, untagged images, and BuildKit's build cache. Running containers and tagged images are kept."), tr("Clean up"), () => { ui.stPruning = true; ui.stPruned = null; send("storageprune"); render(); });
+  }
+  else if (t("[data-streset]")) {
+    if (ui.storage?.state === "unavailable") {
+      confirmRemove(tr("Reset storage location to default?"), tr("Kiri will switch back to its default folder and restart the engine. Data on the disconnected drive isn't deleted."), tr("Reset to default"), () => { startRestartOverlay("storage", tr("Kiri will switch to this folder and restart the engine."), tr("Restarting engine…")); send("storagereset"); }, "primary");
+    } else {
+      ui.stErr = "";
+      send("storagecheck", { path: "", value: { reset: true } });
+    }
+  }
+  else if (t("[data-stretry]")) { ui.stErr = ""; send("storageretry"); }
+  else if (t("[data-strmold]")) { confirmRemove(tr("Remove old data?"), tr("Everything in {path} will be deleted for good.", { path: `<span class="mono st-path">${esc(ui.storage?.old || "")}</span>` }), tr("Remove"), () => send("storageremoveold")); }
+  else if (t("[data-sterrclose]")) { ui.stErr = ""; render(); }
+  else if (t("[data-stgoto]")) { prefs.tab = "storage"; show("settings"); }
   else if (diagClick(t)) {}
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
+  else if ((el = t("[data-closebtn]"))) setPref("closeButton", el.dataset.closebtn);
+  else if ((el = t("[data-startlogin]"))) setPref("startAtLogin", el.dataset.startlogin === "1");
+  else if ((el = t("[data-stopquit]"))) setPref("stopOnQuit", el.dataset.stopquit === "1");
   else if ((el = t("[data-theme-pick]"))) setPref("theme", el.dataset.themePick);
   else if ((el = t("[data-accent]"))) setPref("accent", el.dataset.accent);
   else if (t("[data-buildprune]")) { ui.bwPruning = true; send("buildprune"); render(); }
+  else if ((el = t("[data-bldidle]"))) {
+    const secs = +el.dataset.bldidle;
+    if (ui.bset && !ui.bset.error && secs !== Number(ui.bsetDraft?.idle_secs ?? ui.bset.idle_secs)) {
+      ui.bsetDraft = { ...(ui.bsetDraft || {}), idle_secs: secs };
+      ui.bset = { ...ui.bset, idle_secs: secs };
+      send("setbuildersettings", { value: { idle_secs: secs } });
+      render();
+    }
+  }
+  else if ((el = t("[data-vmnat]"))) {
+    const shared_nat = el.dataset.vmnat === "1";
+    if (ui.vmnet && !ui.vmnet.env && !!ui.vmnet.shared_nat !== shared_nat) {
+      if (engineShown().on) ui.vmNetSaved = true;
+      ui.vmnet = { ...ui.vmnet, shared_nat };
+      send("setvmnet", { value: { shared_nat } });
+      render();
+    }
+  }
+  else if ((el = t("[data-shellpath]"))) {
+    const enabled = el.dataset.shellpath === "1";
+    if (ui.shellPath && !ui.shellPathBusy && !!ui.shellPath.enabled !== enabled) {
+      ui.shellPath = { ...ui.shellPath, enabled };
+      ui.shellPathBusy = true;
+      send("setshellpath", { value: { enabled } });
+      render();
+    }
+  }
+  else if (t("[data-uninstall]")) {
+    confirmRemove(tr("Uninstall Kiri?"), tr("Stops the engine, removes Kiri's background service, CLI links and shell profile entries, and restores your previous Docker context. Your images and volumes stay in Kiri's data folder until you delete it."), tr("Uninstall Kiri"), () => send("uninstall"));
+  }
   else if ((el = t("[data-bw]"))) { const v = el.dataset.bw; if (ui.bw && !ui.bw.error && (v !== ui.bw.with || (v === "kiri" && !ui.bw.taken))) { ui.bw = { ...ui.bw, with: v }; send("buildwith", { value: v }); render(); } }
   else if ((el = t("[data-domains]"))) { if (!!+el.dataset.domains !== !!ui.domainsOn) send("domains", { value: !!+el.dataset.domains }); }
   else if ((el = t("[data-open-site]"))) send("open", { name: el.dataset.openSite });
@@ -8296,10 +9171,24 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-pxmode]"))) { ui.pxDraft.mode = el.dataset.pxmode; render(); }
   else if ((el = t("[data-pxc]"))) { ui.pxDraft.containers = !!+el.dataset.pxc; render(); }
   else if ((el = t("[data-savepx]"))) send("setproxy", { value: ui.pxDraft });
+  else if (t("[data-takesock]")) { ui.sockTaking = true; send("takesocket"); render(); }
+  else if (t("[data-usekiri]")) { ui.ctxSwitching = true; send("usecontext", { name: ui.status.ours }); render(); }
+  else if ((el = t("[data-regadd]"))) regListAdd(el.dataset.regadd);
+  else if ((el = t("[data-regdel]"))) { const [k, i] = el.dataset.regdel.split(":"); ui.regDraft[k].splice(+i, 1); render(); }
+  else if ((el = t("[data-regsave]"))) { ui.regSaving = el.dataset.regsave; send("setregistryconfig", { value: { [REG_KEY[el.dataset.regsave]]: ui.regDraft[el.dataset.regsave] } }); }
   else if ((el = t("[data-saverp]")) && ui.rports && !ui.rports.error) send("setrouterports", { value: { http: +(ui.rpDraft.http ?? ui.rports.http.port), https: +(ui.rpDraft.https ?? ui.rports.https.port) } });
-  else if ((el = t("[data-saveres]"))) send("setresources", { value: ui.resDraft });
+  else if ((el = t("[data-saveres]"))) { if (engineShown().on) ui.resSaved = true; send("setresources", { value: ui.resDraft }); render(); }
+  else if ((el = t("[data-watchbinds]"))) {
+    const on = el.dataset.watchbinds === "1";
+    if (!!(prefs.watchBindMounts ?? ui.res?.watch_bind_mounts) !== on) setPref("watchBindMounts", on);
+  }
+  else if ((el = t("[data-wsldistro]"))) {
+    const name = el.dataset.wsldistro, on = el.dataset.wslon === "1";
+    const cur = ui.res?.wsl_distros?.find((d) => d.name === name);
+    if (cur && !!cur.on !== on) { cur.on = on; send("setresources", { value: { wsl_distro: name, on } }); render(); }
+  }
   else if ((el = t("[data-vmpower]"))) { el.disabled = true; powerEngine(el.dataset.vmpower); }
-  else if ((el = t("[data-restartvm]"))) { el.disabled = true; el.textContent = tr("Restarting…"); send("restartvm"); }
+  else if ((el = t("[data-restartvm]"))) { el.disabled = true; el.textContent = tr("Restarting…"); restartVm(); }
   else if ((el = t("[data-detail]"))) openDetail(el.dataset.detail);
   else if (t("[data-ctrcompose]")) show("compose");
   else if ((el = t("[data-img]"))) openImage(el.dataset.img);
@@ -8328,7 +9217,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-file]"))) { ui.detail.files.selected = el.dataset.file; ui.detail.files.preview = null; send("preview", { name: ui.detail.name, path: el.dataset.file }); render(); }
   else if ((el = t("[data-reveal]"))) send("reveal", { name: ui.detail.name, path: el.dataset.reveal });
   else if ((el = t("[data-terminal]"))) send("terminal", { name: ui.detail.name });
-  else if ((el = t("[data-logclear]"))) { logEl.textContent = ""; logCount(); }
+  else if ((el = t("[data-logclear]"))) clearLogConsole(logEl, "log-count", ui.detail, ui.partial, () => { ui.logN = 0; });
   else if ((el = t("[data-save]"))) send("download", { name: ui.detail.name, path: el.dataset.save });
 });
 $("impstrip").addEventListener("click", (ev) => {
@@ -8370,7 +9259,23 @@ document.addEventListener("keydown", (ev) => {
     f.focus(); f.select();
   }
 });
-$("vm-toggle").addEventListener("click", () => powerEngine(engineShown().shown === "running" ? "stop" : "start"));
+/* The card's one button reads Start or Stop and turns over when the engine's
+   state changes, often just as the engine comes back while someone reaches
+   for Start. A press that began on Start, or within half a second of it
+   turning to Stop, is not a Stop: that recorded a Stop nobody asked for,
+   and docker then said "Kiri is stopped" until Start (#93). */
+$("vm-toggle").addEventListener("pointerdown", (ev) => {
+  const b = ev.currentTarget;
+  b.dataset.pressed = b.dataset.act === "stop" && Date.now() - Number(b.dataset.flipped || 0) < 500 ? "start" : b.dataset.act || "";
+});
+/* A press dragged off the button is over: a later press by keyboard is its own. */
+$("vm-toggle").addEventListener("pointerleave", (ev) => { delete ev.currentTarget.dataset.pressed; });
+$("vm-toggle").addEventListener("click", (ev) => {
+  const b = ev.currentTarget, act = engineShown().shown === "running" ? "stop" : "start", pressed = b.dataset.pressed;
+  delete b.dataset.pressed;
+  if (pressed && pressed !== act) return;
+  powerEngine(act);
+});
 
 /* Window chrome: a mouse-down on empty header or sidebar space drags the
    window, and a double-click zooms it, like a native title bar. */
@@ -8396,8 +9301,8 @@ document.addEventListener("dblclick", (ev) => {
    the sidebar's counts, every 30 s, and only while the node runs (the VM is
    awake for it then anyway). Nothing here starts the cluster but Start. */
 const K8S_VIEWS = new Set(["pods", "services"]);
-const k8s = { state: null, ready: false, pods: [], services: [], icon: null, asked: 0, sig: "", detail: null, svc: null, partial: "",
-  op: "", opAt: 0, opLine: "", context: "", config: null, sanDraft: null, port: null, wantPort: 6443, portDraft: null };
+const k8s = { state: null, ready: false, pods: [], services: [], icon: null, asked: 0, sig: "", detail: null, svc: null, partial: { false: "", true: "" }, logN: 0,
+  op: "", opAt: 0, opLine: "", context: "", config: null, sanDraft: null, port: null, wantPort: 6443, portDraft: null, argsDraft: null, defaultVer: "", manifestsDir: "" };
 empty.pods = { title: "No pods", body: "Pods you create with <code>kubectl</code> show up here, grouped by namespace.", art: "pods" };
 empty.services = { title: "No services", body: "Services you create with <code>kubectl expose</code> show up here. LoadBalancer services answer on <code>localhost</code>.", art: "services" };
 /* i18n */ void [tr("No pods"), tr("Pods you create with <code>kubectl</code> show up here, grouped by namespace."), tr("No services"), tr("Services you create with <code>kubectl expose</code> show up here. LoadBalancer services answer on <code>localhost</code>.")];
@@ -8428,7 +9333,6 @@ function k8sSettings() {
   closePod();
   prefs.tab = "kubernetes";
   show("settings");
-  document.querySelector("#content .pane")?.scrollIntoView({ block: "start" });
 }
 /* Short enough for the group label's row: a restart is a start there. */
 const SIDE_WORDS = { start: "Starting", stop: "Stopping", set: "Starting", deletecluster: "Deleting" };
@@ -8473,6 +9377,8 @@ function k8sOn(e) {
       Object.assign(k8s, { state: e.state, ready: !!e.ready, error: e.error || "", context: e.context || k8s.context, config: e.config || k8s.config });
       if ("port" in e) k8s.port = e.port;
       if (e.want_port) k8s.wantPort = e.want_port;
+      if (e.default_version) k8s.defaultVer = e.default_version;
+      if (e.manifests_dir) k8s.manifestsDir = e.manifests_dir;
       if (e.ready) { Object.assign(k8s, { pods: e.pods || [], services: e.services || [], icon: e.icon }); kGone(); }
       k8sCounts();
       k8sSide();
@@ -8487,10 +9393,12 @@ function k8sOn(e) {
     case "k8sop":
       if (e.state === "progress") {
         k8s.opLine = e.line.endsWith("…") || e.line.endsWith(".") || e.line.endsWith(")") ? e.line : `${e.line}…`;
+        if (ui.restarting?.kind === "k8s") setRestartStep(k8s.opLine);
         if (k8sShown()) { const el = $("k8s-step"); if (el) el.textContent = k8s.opLine; else render(); }
         break;
       }
-      k8s.op = ""; k8s.opLine = ""; k8s.opAt = 0; k8s.sanDraft = null; k8s.portDraft = null;
+      if (ui.restarting?.kind === "k8s") stopRestartOverlay();
+      k8s.op = ""; k8s.opLine = ""; k8s.opAt = 0; k8s.sanDraft = null; k8s.portDraft = null; k8s.argsDraft = null;
       if (e.port) k8s.port = e.port;
       if (e.want_port) k8s.wantPort = e.want_port;
       if (e.state === "error") toast("error", tr("Kubernetes: {error}", { error: e.error }));
@@ -8505,10 +9413,7 @@ function k8sOn(e) {
     case "k8slogs": if (d?.logKey === e.key) addKLogs(e.parts); break;
     case "k8slogs-end":
       if (d?.logKey === e.key) {
-        const div = document.createElement("div");
-        div.className = "quiet";
-        div.textContent = d.previous ? tr("— the end of the run before the last restart —") : tr("— the log stream ended —");
-        klogEl.append(div);
+        appendLogEnd(klogEl, d.previous ? tr("— the end of the run before the last restart —") : tr("— the log stream ended —"));
         d.logsOn = false;
       }
       break;
@@ -8519,6 +9424,9 @@ function k8sOn(e) {
 function k8sDo(op, value) {
   if (k8s.op) return;
   Object.assign(k8s, { op, opAt: Date.now(), opLine: op === "start" ? tr("Starting Kubernetes…") : tr(OP_WORDS[op]) });
+  if (op === "set" && (k8sNode()?.State === "running" || k8s.state === "running")) {
+    startRestartOverlay("k8s", esc(tr("Kiri's Kubernetes cluster")), tr("Restarting…"));
+  }
   send("k8s", { action: op, value });
   k8sSide();
   render();
@@ -8608,6 +9516,29 @@ function kubernetesPane() {
     <div class="pref"><span class="t">${tr("Additional certificate names")}</span><span class="d">${tr("IP addresses or domain names, separated by commas, that the API server's certificate also covers, such as this {host}'s address on your network. Saving restarts the cluster.", { host: tr(HOST) })}</span>
       <div class="ksan"><input class="field mono" id="k8s-san" value="${esc(draft)}" placeholder="192.168.1.20, my-mac.local" spellcheck="false" autocomplete="off"${dis}>
         <button class="btn" data-k8ssan${dis || draft === (cfg.tls_san || []).join(", ") ? " disabled" : ""}>${tr("Save")}</button></div></div>
+    <h4 class="ksub">${tr("Cluster")}</h4>
+    ${(() => {
+      const defVer = k8s.defaultVer || "v1.37.1-k3s1";
+      const savedVer = cfg.version || "";
+      const presets = ["v1.37.1-k3s1", "v1.36.0-k3s1", "v1.35.0-k3s1", "v1.34.1-k3s1", "v1.33.1-k3s1", "v1.32.1-k3s1", "v1.31.4-k3s1"];
+      const list = [defVer, ...presets.filter((v) => v !== defVer)];
+      if (savedVer && !list.includes(savedVer)) list.push(savedVer);
+      const optsHtml = list.map((v, i) => {
+        const val = i === 0 ? "" : v;
+        const lbl = i === 0 ? `${v} (${tr("default")})` : v;
+        return `<option value="${esc(val)}"${savedVer === val ? " selected" : ""}>${esc(lbl)}</option>`;
+      }).join("");
+      const savedArgs = (cfg.k3s_args || []).join(" ");
+      const argsDraft = k8s.argsDraft ?? savedArgs;
+      const mdir = k8s.manifestsDir || (WIN ? "%LOCALAPPDATA%\\Kiri\\k8s-manifests" : "~/.kiri/k8s-manifests");
+      return `<div class="pref"><span class="t">${tr("k3s version")}</span><span class="d">${tr("Image version for the cluster node ({cmd}). Applies when recreated.", { cmd: '<span class="mono">kiri k8s set --version</span>' })}</span>
+        <select id="k8s-ver" aria-label="${tr("k3s version")}"${dis}>${optsHtml}</select></div>
+      <div class="pref"><span class="t">${tr("Extra server flags")}</span><span class="d">${tr("Passed to {srv} ({flag}), separated by spaces.", { srv: '<span class="mono">k3s server</span>', flag: '<span class="mono">--k3s-arg</span>' })}</span>
+        <div class="ksan"><input class="field mono" id="k8s-args" value="${esc(argsDraft)}" placeholder="--disable=servicelb" spellcheck="false" autocomplete="off"${dis}>
+          <button class="btn" data-k8sargs${dis || argsDraft === savedArgs ? " disabled" : ""}>${tr("Save")}</button></div></div>
+      <div class="pref"><span class="t">${tr("Startup manifests")}</span><span class="d">${tr("YAML files in {path} are applied whenever the cluster starts.", { path: `<span class="mono">${esc(mdir)}</span>` })}</span>
+        <span class="pact"><button class="btn" data-k8smanifests>${tr("Open folder")}</button></span></div>`;
+    })()}
     <div class="pref"><span class="t">${tr("Delete cluster")}</span><span class="d">${tr("Removes the cluster's container, everything in it (the {volume} volume) and the {context} kubectl context, as {cmd} does.", { volume: '<span class="mono">kiri-k8s</span>', context: `<span class="mono">${esc(k8sContext())}</span>`, cmd: '<span class="mono">kiri k8s delete</span>' })}</span>
       <button class="btn danger kdelete" data-k8sdelete${dis || !node ? " disabled" : ""}>${tr("Delete cluster")}</button></div>
   </div>`;
@@ -8707,15 +9638,14 @@ function deletePod(key) {
   scrim.querySelector("[data-go]")?.focus();
 }
 
-/* A pod's page: Info and Logs. The log console is kept as a live element,
-   as the container page's is. */
-const klogEl = Object.assign(document.createElement("div"), { className: "console", tabIndex: 0 });
-klogEl.setAttribute("role", "log");
+/* A pod's page: Info and Logs. Shares the numbered log console component with
+   container logs (`makeLogConsole`, `appendLogParts`, `logToolbarHtml`). */
+const klogEl = makeLogConsole();
 function openPod(key, tab = "info") {
   closePod();
   const [ns, name] = key.split("/");
   k8s.detail = { ns, name, tab: "info", container: "", previous: false, follow: true, logFilter: "", logLevel: "", logsOn: false, logKey: "" };
-  klogEl.textContent = "";
+  clearLogConsole(klogEl, "klog-count", k8s.detail, k8s.partial, () => { k8s.logN = 0; });
   if (tab === "logs") podTab("logs"); else render();
   $("content").scrollTop = 0;
 }
@@ -8738,42 +9668,12 @@ function podLogs(again = false) {
   const key = `${d.ns}/${d.name}/${d.container}${d.previous ? "/previous" : ""}`;
   if (!again && d.logKey === key && (d.logsOn || d.previous)) return;
   Object.assign(d, { logKey: key, logsOn: !d.previous });
-  klogEl.textContent = "";
-  k8s.partial = "";
+  clearLogConsole(klogEl, "klog-count", d, k8s.partial, () => { k8s.logN = 0; });
   send("k8s", { action: "logs", value: { ns: d.ns, pod: d.name, container: d.container, previous: d.previous } });
 }
-function addKLogs(parts) {
-  const d = k8s.detail, atEnd = klogEl.scrollHeight - klogEl.scrollTop - klogEl.clientHeight < 40;
-  const filter = d.logFilter.toLowerCase(), frag = document.createDocumentFragment();
-  for (const p of parts) {
-    const lines = (k8s.partial + p.t.replace(ansi, "")).split("\n");
-    k8s.partial = lines.pop();
-    for (const line of lines) {
-      const div = document.createElement("div"), lvl = levelOf(line);
-      div.dataset.lvl = lvl || "none";
-      if (lvl && lvl !== "info") div.className = `lvl-${lvl}`;
-      div.textContent = line || " ";
-      if (!shown(div, filter, d.logLevel)) div.classList.add("hide");
-      frag.append(div);
-    }
-  }
-  klogEl.append(frag);
-  while (klogEl.childElementCount > LOG_MAX) klogEl.firstElementChild.remove();
-  if (d.follow && atEnd || d.follow && parts.length > 50) klogEl.scrollTop = klogEl.scrollHeight;
-  klogCount();
-}
-function klogCount() {
-  const el = $("klog-count"), d = k8s.detail;
-  if (!el || !d) return;
-  const all = klogEl.childElementCount;
-  const showing = d.logFilter || d.logLevel ? [...klogEl.children].filter((x) => !x.classList.contains("hide")).length : all;
-  el.textContent = d.logFilter || d.logLevel ? tr("{showing} of {all} lines", { showing: showing.toLocaleString(), all: all.toLocaleString() }) : tr("{all} lines", { all: all.toLocaleString() });
-}
-function filterKLogs() {
-  const d = k8s.detail, f = d.logFilter.toLowerCase();
-  for (const div of klogEl.children) div.classList.toggle("hide", !shown(div, f, d.logLevel));
-  klogCount();
-}
+function addKLogs(parts) { appendLogParts(klogEl, "klog-count", k8s.detail, k8s.partial, () => ++k8s.logN, parts); }
+function klogCount() { updateLogCount(klogEl, "klog-count", k8s.detail); }
+function filterKLogs() { applyLogFilter(klogEl, "klog-count", k8s.detail); }
 
 function renderPod() {
   const d = k8s.detail, p = podOf(d);
@@ -8792,15 +9692,10 @@ function renderPod() {
     <div id="dbody"></div>`;
   const body = $("dbody");
   if (d.tab === "info") { body.innerHTML = podInfo(p); return; }
-  const levels = [["", tr("All levels")], ["error", tr("Error")], ["warn", tr("Warn")], ["info", tr("Info")], ["debug", tr("Debug")]];
   const picker = p.containers.length > 1 ? `<select id="klog-container" aria-label="${tr("Container")}">${p.containers.map((c) => `<option${c.name === d.container ? " selected" : ""}>${esc(c.name)}</option>`).join("")}</select>` : "";
   const restarted = p.containers.find((c) => c.name === d.container)?.restarts > 0;
-  body.innerHTML = `<div class="logbar">${picker}<input class="field" id="klog-filter" placeholder="${tr("Find in logs")}" spellcheck="false" value="${esc(d.logFilter)}">
-    <select id="klog-level" aria-label="${tr("Level")}">${levels.map(([v, l]) => `<option value="${v}"${d.logLevel === v ? " selected" : ""}>${l}</option>`).join("")}</select>
-    <span class="logcount" id="klog-count"></span>
-    <span class="spacer" style="flex:1"></span>
-    ${restarted || d.previous ? `<label class="toggle" title="${tr("The run before the container's last restart")}"><input type="checkbox" id="klog-previous"${d.previous ? " checked" : ""}> ${tr("Previous run")}</label>` : ""}
-    <label class="toggle"><input type="checkbox" id="klog-follow"${d.follow ? " checked" : ""}> ${tr("Follow")}</label>${btn(tr("Reload"), "data-klogreload")}${btn(tr("Clear"), "data-klogclear")}</div>`;
+  const prevToggle = restarted || d.previous ? `<label class="toggle" title="${tr("The run before the container's last restart")}"><input type="checkbox" id="klog-previous"${d.previous ? " checked" : ""}> ${tr("Previous run")}</label>` : "";
+  body.innerHTML = logToolbarHtml({ prefix: "klog", filter: d.logFilter, level: d.logLevel, follow: d.follow, left: picker, right: prevToggle, reloadAttr: "data-klogreload", clearAttr: "data-klogclear" });
   body.append(klogEl);
   klogCount();
   $("klog-container")?.addEventListener("change", (ev) => { d.container = ev.target.value; podLogs(); });
@@ -9118,9 +10013,11 @@ $("content").addEventListener("click", (ev) => {
     else k8sDo("set", { lan: !!c.lan, tls_san: c.tls_san || [], port });
   }
   else if (t("[data-k8ssan]")) { const c = k8s.config || {}; k8sDo("set", { lan: !!c.lan, tls_san: ($("k8s-san")?.value || "").split(",").map((x) => x.trim()).filter(Boolean) }); }
+  else if (t("[data-k8sargs]")) { const c = k8s.config || {}; const list = ($("k8s-args")?.value || "").trim().split(/\s+/).filter(Boolean); k8sDo("set", { lan: !!c.lan, tls_san: c.tls_san || [], k3s_args: list }); }
+  else if (t("[data-k8smanifests]")) send("k8s", { action: "manifests" });
   else if (t("[data-k8sdelete]")) deleteCluster();
   else if (t("[data-klogreload]")) podLogs(true);
-  else if (t("[data-klogclear]")) { klogEl.textContent = ""; klogCount(); }
+  else if (t("[data-klogclear]")) clearLogConsole(klogEl, "klog-count", k8s.detail, k8s.partial, () => { k8s.logN = 0; });
 });
 $("title").addEventListener("click", (ev) => { if (ev.target.closest("[data-kback]")) { closePod(); render(); } });
 $("content").addEventListener("paste", envPaste);
@@ -9130,6 +10027,12 @@ $("content").addEventListener("input", (ev) => {
     k8s.portDraft = ev.target.value;
     const b = document.querySelector("[data-k8sport]");
     if (b) b.disabled = !!k8s.op || ev.target.value === String(k8s.wantPort);
+    return;
+  }
+  if (ev.target.id === "k8s-args") {
+    k8s.argsDraft = ev.target.value;
+    const b = document.querySelector("[data-k8sargs]");
+    if (b) b.disabled = !!k8s.op || ev.target.value === (k8s.config?.k3s_args || []).join(" ");
     return;
   }
   if (ev.target.id !== "k8s-san") return;
@@ -9190,7 +10093,7 @@ setInterval(() => {
 }, 4000);
 // Animations rest while another window is in front, or this one is hidden.
 const away = () => document.body.classList.toggle("away", document.hidden || !document.hasFocus());
-addEventListener("focus", away); addEventListener("blur", away); document.addEventListener("visibilitychange", away);
+addEventListener("focus", () => { away(); send("dockersock"); }); addEventListener("blur", away); document.addEventListener("visibilitychange", away);
 // The crane's sway (.is-art), once every 20 s while Kiri is the window in use.
 setInterval(() => {
   document.body.classList.remove("sway");
@@ -11056,6 +11959,39 @@ function loginDone(e) {
   signinRedraw();
   if (failed) document.querySelector(`[data-signin="${CSS.escape(failed)}"] [name="t"]`)?.select();
 }
+/* Settings → Registries: Kiri's daemon.json lists, with Docker's names
+   (`insecure-registries`, `registry-mirrors`), the same ones `kiri registry`
+   edits. Insecure: only the hosts and networks listed go without a checked
+   certificate. Mirrors: Docker Hub's, tried in order before Docker Hub. */
+const REG_KEY = { insecure: "insecure-registries", mirrors: "registry-mirrors" };
+function regListPane(k) {
+  const c = ui.regcfg, title = k === "insecure" ? tr("Insecure registries") : tr("Registry mirrors");
+  if (!c) return `<div class="pane"><h3>${title}</h3><p class="muted">${tr("Loading…")}</p></div>`;
+  if (c.error) return `<div class="pane"><h3>${title}</h3><p class="muted">${tr("Start Kiri to change its registry settings. ({error})", { error: esc(c.error) })}</p></div>`;
+  const draft = ui.regDraft[k];
+  const rows = draft.length
+    ? draft.map((v, i) => `<div class="pref"><span class="t mono">${esc(v)}</span><button class="btn" data-regdel="${k}:${i}">${tr("Remove")}</button></div>`).join("")
+    : `<p class="muted">${k === "insecure" ? tr("None: every registry is checked over HTTPS.") : tr("No mirrors yet: Docker Hub images come from Docker Hub itself.")}</p>`;
+  const changed = JSON.stringify(draft) !== JSON.stringify(c[REG_KEY[k]] || []);
+  const about = k === "insecure"
+    ? tr("Registries reached without a verified certificate (self-signed, or plain HTTP). Kiri tries HTTPS without checking the certificate, then HTTP. Only the hosts and networks listed; every other registry is checked as usual.")
+    : tr("Docker Hub images pull through these in order; the first that has the image answers, and Docker Hub itself is the fallback. Other registries are pulled directly.");
+  const label = k === "insecure" ? tr("Host or network") : tr("Mirror address");
+  const hint = k === "insecure" ? "registry.lan:5000" : "MIRROR_URL";
+  const foot = k === "mirrors" ? `<p class="muted">${tr("Kept in {path} with Docker's names, for docker pull, push, login and build. Docker Desktop's file is left alone.", { path: `<span class="mono">${esc(c.path || "~/.kiri/daemon.json")}</span>` })}</p>${(c.problems || []).map((x) => `<p class="muted" role="alert">${tr("Skipped: {problem}", { problem: esc(x) })}</p>`).join("")}` : "";
+  return `<div class="pane"><h3>${title}</h3>
+    <p class="muted">${about}</p>
+    ${rows}
+    <div class="res-foot" style="margin-top:14px"><input class="field mono" id="reg-${k}" style="flex:1;max-width:420px" aria-label="${label}" value="${esc(ui.regAdd[k])}" placeholder="${hint}" spellcheck="false" autocomplete="off"><button class="btn" data-regadd="${k}">${tr("Add")}</button><span style="flex:1"></span><button class="btn primary" data-regsave="${k}"${changed ? "" : " disabled"}>${tr("Save")}</button></div>
+    ${foot}</div>`;
+}
+function regListAdd(k) {
+  const v = (ui.regAdd[k] || "").trim();
+  if (!v) return;
+  if (!ui.regDraft[k].includes(v)) ui.regDraft[k].push(v);
+  ui.regAdd[k] = "";
+  render();
+}
 /* Settings → Registries: where you're signed in, and signing in to another. */
 function registriesPane() {
   const L = ui.logins;
@@ -11644,6 +12580,17 @@ function htOn(e) {
     ht.def = e.default || ht.shells[0]?.id || "";
     if (!htQ(".htmenu").hidden) htMenu();
     if (ht.wantTab) { const want = ht.wantTab; ht.wantTab = false; htNewTab(want === true ? undefined : want); }
+    return;
+  }
+  if (e.ev === "paste" && e.id === "__field") {
+    const el = ctxPasteField;
+    ctxPasteField = null;
+    if (el && el.isConnected && !el.readOnly && !el.disabled) {
+      const raw = String(e.text || "");
+      const text = el.tagName === "INPUT" ? raw.replace(/[\r\n]+/g, " ") : raw;
+      const [s, end, hasRange] = fieldRange(el);
+      replaceFieldText(el, text, s, end, hasRange);
+    }
     return;
   }
   const p = htPane(e.id);

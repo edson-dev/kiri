@@ -16,11 +16,17 @@
 //! never happened). `kiri update` does it all at once; `--check` only
 //! reports.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+#[cfg(target_os = "macos")]
+use std::io::Read;
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 
 /// Each Mac reads its own feed, so a release for one never reaches the other
@@ -35,6 +41,7 @@ const FEED: &str = "https://download.runkiri.com/latest-mac-x86_64.json";
 #[cfg(target_os = "linux")]
 const FEED: &str = "https://download.runkiri.com/latest.json";
 /// The biggest download accepted (the app is about 60 MB packed).
+#[cfg(target_os = "macos")]
 const MAX_DOWNLOAD: u64 = 2 << 30;
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
@@ -48,8 +55,27 @@ pub struct Release {
     pub notes_url: String,
 }
 
-/// `1.2.10` > `1.2.9`; a missing part counts as 0.
+/// Whether `v` reads as a version: `[v]N(.N)*`, optionally `-` and
+/// dot-separated alphanumeric identifiers (`0.1.8-dev.42`).
+fn is_version(v: &str) -> bool {
+    let s = v.strip_prefix('v').unwrap_or(v);
+    let (core, pre) = match s.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (s, None),
+    };
+    let numeric = |seg: &str| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit());
+    let ident = |id: &str| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    core.split('.').all(numeric) && pre.is_none_or(|p| p.split('.').all(ident))
+}
+
+/// `1.2.10` > `1.2.9`; a missing part counts as 0, and a test build
+/// (`0.1.8-dev.42`, scripts/ci/test-version.sh) sorts above its release.
+/// A string that isn't a version is never newer, and nothing is newer
+/// than one.
 pub fn newer(candidate: &str, current: &str) -> bool {
+    if !is_version(candidate) || !is_version(current) {
+        return false;
+    }
     let parts = |v: &str| -> Vec<u64> { v.trim_start_matches('v').split(['.', '-']).map(|p| p.parse().unwrap_or(0)).collect() };
     let (a, b) = (parts(candidate), parts(current));
     for i in 0..a.len().max(b.len()) {
@@ -61,18 +87,31 @@ pub fn newer(candidate: &str, current: &str) -> bool {
     false
 }
 
+/// The same guard the registry client (`kiri-image/src/connect.rs`) uses: a
+/// read that sits silent this long fails, so a stalled server cannot hang
+/// `kiri update`'s feed check or download forever.
+const STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
+        .timeout_per_read(Some(STALL))
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
+        // The system's roots merged with webpki's, like the registry client
+        // (#303); the feed often sits behind a corporate proxy's CA.
+        .tls_config(kiri_image::tls_config(&kiri_image::roots::trusted()))
         .build()
         .into()
 }
 
 pub fn latest() -> io::Result<Release> {
     let url = std::env::var("KIRI_UPDATE_URL").unwrap_or_else(|_| FEED.to_owned());
+    latest_from(&url)
+}
+
+fn latest_from(url: &str) -> io::Result<Release> {
     let release = (|| -> io::Result<Release> {
-        let body = agent().get(&url).call().map_err(io::Error::other)?.body_mut().with_config().limit(64 << 10).read_to_vec().map_err(io::Error::other)?;
+        let body = agent().get(url).call().map_err(io::Error::other)?.body_mut().with_config().limit(64 << 10).read_to_vec().map_err(io::Error::other)?;
         serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{url}: {e}")))
     })();
     match &release {
@@ -83,6 +122,7 @@ pub fn latest() -> io::Result<Release> {
 }
 
 /// The running Kiri.app.
+#[cfg(target_os = "macos")]
 pub fn app() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?.canonicalize()?;
     let app = exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")).map(Path::to_path_buf);
@@ -91,6 +131,7 @@ pub fn app() -> io::Result<PathBuf> {
 
 /// `.kiri-update/` beside the app: on the same volume, so installing is a
 /// rename.
+#[cfg(target_os = "macos")]
 fn stage_dir(app: &Path) -> io::Result<PathBuf> {
     Ok(app.parent().ok_or_else(|| io::Error::other("Kiri.app has no parent directory"))?.join(".kiri-update"))
 }
@@ -98,6 +139,7 @@ fn stage_dir(app: &Path) -> io::Result<PathBuf> {
 /// Downloads `release`, checks it and stages it for `install_staged`.
 /// `progress` gets the bytes so far and the total when the server says;
 /// setting `cancel` stops the download.
+#[cfg(target_os = "macos")]
 pub fn download(release: &Release, progress: &mut dyn FnMut(u64, Option<u64>), cancel: &AtomicBool) -> io::Result<()> {
     let app = app()?;
     if !newer(&release.version, env!("CARGO_PKG_VERSION")) {
@@ -119,6 +161,7 @@ pub fn download(release: &Release, progress: &mut dyn FnMut(u64, Option<u64>), c
     result
 }
 
+#[cfg(target_os = "macos")]
 fn fetch_and_check(release: &Release, app: &Path, dir: &Path, progress: &mut dyn FnMut(u64, Option<u64>), cancel: &AtomicBool) -> io::Result<()> {
     // Download, hashing as it streams to disk.
     let tgz = dir.join("Kiri.tar.gz");
@@ -163,6 +206,7 @@ fn fetch_and_check(release: &Release, app: &Path, dir: &Path, progress: &mut dyn
 }
 
 /// The staged update's version, when there is one newer than this build.
+#[cfg(target_os = "macos")]
 pub fn staged() -> Option<String> {
     let dir = stage_dir(&app().ok()?).ok()?;
     let version = std::fs::read_to_string(dir.join("version")).ok()?.trim().to_owned();
@@ -171,6 +215,7 @@ pub fn staged() -> Option<String> {
 
 /// Swaps the staged app in for the running one, checking it again first:
 /// the folder sat on disk since the download. Returns its version.
+#[cfg(target_os = "macos")]
 pub fn install_staged() -> io::Result<String> {
     let app = app()?;
     let dir = stage_dir(&app)?;
@@ -203,6 +248,7 @@ pub fn install_staged() -> io::Result<String> {
 /// launchd alone (`kickstart -k`) missed the last two: the job it restarted
 /// found the old engine still on the socket and exited, and the old one kept
 /// running while the window said it had restarted.
+#[cfg(target_os = "macos")]
 pub fn restart_engine(expect: &str) -> io::Result<String> {
     crate::diag::info!("restarting the engine", version = expect);
     stop_engine()?;
@@ -219,31 +265,59 @@ pub fn restart_engine(expect: &str) -> io::Result<String> {
 }
 
 /// Starts the engine if it is not running: through the LaunchAgent when it
-/// starts this copy of Kiri, so launchd owns the one engine there is, else
-/// as a child of its own session. Returns once it answers.
+/// starts this copy of Kiri, so launchd owns the one engine there is, falling
+/// back to spawning the daemon directly when `launchctl kickstart` exits 0
+/// without bringing the engine up (#602). Returns once it answers.
+#[cfg(target_os = "macos")]
 pub fn start_engine() -> io::Result<()> {
-    if crate::client::alive() {
+    start_engine_with(
+        crate::client::alive,
+        crate::setup::start_agent,
+        spawn_daemon,
+        std::thread::sleep,
+        || log_path().display().to_string(),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn start_engine_with(
+    mut alive: impl FnMut() -> bool,
+    start_agent: impl FnOnce() -> io::Result<bool>,
+    spawn_daemon: impl FnOnce() -> io::Result<()>,
+    mut sleep: impl FnMut(std::time::Duration),
+    log_display: impl FnOnce() -> String,
+) -> io::Result<()> {
+    if alive() {
         return Ok(());
     }
     crate::diag::info!("starting the engine");
-    if !crate::setup::start_agent().unwrap_or(false) {
-        spawn_daemon()?;
+    if start_agent().unwrap_or(false) {
+        for _ in 0..50 {
+            if alive() {
+                return Ok(());
+            }
+            sleep(std::time::Duration::from_millis(50));
+        }
+        crate::diag::warn!("LaunchAgent kickstart did not bring up engine; starting daemon directly");
     }
+    spawn_daemon()?;
     for _ in 0..200 {
-        if crate::client::alive() {
+        if alive() {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        sleep(std::time::Duration::from_millis(50));
     }
-    Err(io::Error::other(format!("kiri daemon did not start; see {}", log_path().display())))
+    Err(io::Error::other(format!("kiri daemon did not start; see {}", log_display())))
 }
 
+#[cfg(target_os = "macos")]
 fn log_path() -> PathBuf {
     crate::client::socket().ok().and_then(|s| Some(s.parent()?.parent()?.join("daemon.log"))).unwrap_or_else(|| PathBuf::from("daemon.log"))
 }
 
 /// `kiri daemon` in its own session, so quitting the window does not take
 /// it down; its output goes to daemon.log.
+#[cfg(target_os = "macos")]
 fn spawn_daemon() -> io::Result<()> {
     let log_file = log_path();
     if let Some(dir) = log_file.parent() {
@@ -266,7 +340,8 @@ fn spawn_daemon() -> io::Result<()> {
 /// Stops the engine on the socket, if one answers: SIGTERM (it powers the
 /// VM off and removes the socket), then SIGKILL if it is still there after
 /// 30 seconds.
-fn stop_engine() -> io::Result<()> {
+#[cfg(target_os = "macos")]
+pub fn stop_engine() -> io::Result<()> {
     let Some(pid) = engine_pid() else { return Ok(()) };
     crate::diag::info!("stopping the engine", pid = pid);
     for (sig, wait) in [(libc::SIGTERM, 30_000u64), (libc::SIGKILL, 5_000)] {
@@ -286,6 +361,7 @@ fn stop_engine() -> io::Result<()> {
 
 /// The process answering on the engine's socket (macOS's LOCAL_PEERPID):
 /// the engine itself, however it was started.
+#[cfg(target_os = "macos")]
 fn engine_pid() -> Option<libc::pid_t> {
     use std::os::fd::AsRawFd;
     let conn = std::os::unix::net::UnixStream::connect(crate::client::socket().ok()?).ok()?;
@@ -298,6 +374,7 @@ fn engine_pid() -> Option<libc::pid_t> {
 
 /// The engine's version once it answers as `expect`, or the last other
 /// version it gave when `limit` runs out (None if it never answered).
+#[cfg(target_os = "macos")]
 pub fn wait_for_version(expect: &str, limit: std::time::Duration) -> Option<String> {
     let began = std::time::Instant::now();
     let mut last = None;
@@ -314,6 +391,7 @@ pub fn wait_for_version(expect: &str, limit: std::time::Duration) -> Option<Stri
 }
 
 /// Whether `new_app` is a genuine Kiri `promised`, newer than this build.
+#[cfg(target_os = "macos")]
 fn check(new_app: &Path, app: &Path, promised: &str) -> io::Result<()> {
     // A valid signature is not enough: `--verify` alone passes for any
     // self-consistent signature, including an attacker's own Developer ID or
@@ -363,6 +441,7 @@ fn check(new_app: &Path, app: &Path, promised: &str) -> io::Result<()> {
 
 /// Whether a Mach-O executable (its first bytes) has code for this CPU:
 /// a thin binary of this architecture, or a universal one with a slice of it.
+#[cfg(any(target_os = "macos", test))]
 fn runs_here(head: &[u8]) -> bool {
     const ARM64: u32 = 0x0100_000c;
     const X86_64: u32 = 0x0100_0007;
@@ -370,6 +449,7 @@ fn runs_here(head: &[u8]) -> bool {
     has_cpu(head, want)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn has_cpu(head: &[u8], want: u32) -> bool {
     let word = |at: usize, be: bool| -> Option<u32> {
         let b: [u8; 4] = head.get(at..at + 4)?.try_into().ok()?;
@@ -389,33 +469,55 @@ fn has_cpu(head: &[u8], want: u32) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
+const USAGE: &str = "usage: kiri update [--check]";
+#[cfg(target_os = "linux")]
+const USAGE: &str = "usage: kiri update --check";
+
 pub fn run(args: &[String]) -> io::Result<()> {
-    if crate::flavor::dev() {
+    run_with_lookup(args, crate::flavor::dev(), env!("CARGO_PKG_VERSION"), &mut io::stdout(), latest)
+}
+
+fn run_with_lookup(args: &[String], dev: bool, current: &str, out: &mut dyn Write, lookup: impl FnOnce() -> io::Result<Release>) -> io::Result<()> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        return writeln!(out, "{USAGE}");
+    }
+    if dev {
         return Err(io::Error::other(format!("{} doesn't update itself: rebuild it with `cargo xtask app-dev`", crate::flavor::APP)));
     }
-    let current = env!("CARGO_PKG_VERSION");
-    let release = latest()?;
+    let release = lookup()?;
+    run_release(args, &release, current, out)
+}
+
+fn run_release(args: &[String], release: &Release, current: &str, out: &mut dyn Write) -> io::Result<()> {
     if !newer(&release.version, current) {
-        println!("Kiri {current} is up to date");
+        writeln!(out, "Kiri {current} is up to date")?;
         return Ok(());
     }
-    println!("Kiri {} is available (this is {current}){}", release.version, if release.notes.is_empty() { String::new() } else { format!(": {}", release.notes) });
-    if args.iter().any(|a| a == "--check") {
-        return Ok(());
+    writeln!(out, "Kiri {} is available (this is {current}){}", release.version, if release.notes.is_empty() { String::new() } else { format!(": {}", release.notes) })?;
+    #[cfg(target_os = "linux")]
+    {
+        let _ = args;
+        writeln!(out, "download the new .deb or .rpm from https://runkiri.com/releases/ and install it as before")?;
+        Ok(())
     }
-    if cfg!(target_os = "linux") {
-        return Err(io::Error::other("download the new .deb or .rpm from https://runkiri.com/releases/ and install it as before"));
+    #[cfg(target_os = "macos")]
+    {
+        if args.iter().any(|a| a == "--check") {
+            return Ok(());
+        }
+        download(release, &mut |_, _| {}, &AtomicBool::new(false))?;
+        let version = install_staged()?;
+        // The daemon runs from the app: restart it on the new binary.
+        restart_engine(&version)?;
+        writeln!(out, "updated to Kiri {version}, and the engine runs it")?;
+        Ok(())
     }
-    download(&release, &mut |_, _| {}, &AtomicBool::new(false))?;
-    let version = install_staged()?;
-    // The daemon runs from the app: restart it on the new binary.
-    restart_engine(&version)?;
-    println!("updated to Kiri {version}, and the engine runs it");
-    Ok(())
 }
 
 /// `CFBundleShortVersionString` from an Info.plist: the key, then the next
 /// `<string>`. The file is our own (xtask writes it as XML), so a scan does.
+#[cfg(any(target_os = "macos", test))]
 fn bundle_version(plist: &str) -> Option<String> {
     const KEY: &str = "<key>CFBundleShortVersionString</key>";
     let after = &plist[plist.find(KEY)? + KEY.len()..];
@@ -426,15 +528,96 @@ fn bundle_version(plist: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Release, bundle_version, has_cpu, newer, runs_here};
+    use std::io::{self, Read, Write};
+    use std::net::TcpListener;
+
+    use super::{Release, USAGE, bundle_version, has_cpu, latest_from, newer, run_with_lookup, runs_here};
+
+    fn run_with(args: &[String], url: &str, current: &str, out: &mut dyn Write) -> io::Result<()> {
+        run_with_lookup(args, false, current, out, || latest_from(url))
+    }
+
+    fn serve_feed(status: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req = [0u8; 1024];
+                let _ = stream.read(&mut req);
+                let resp = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/latest.json")
+    }
+
+    #[test]
+    fn help_skips_release_lookup() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(USAGE, "usage: kiri update [--check]");
+        #[cfg(target_os = "linux")]
+        assert_eq!(USAGE, "usage: kiri update --check");
+
+        for dev in [false, true] {
+            for (args, help) in [
+                (&["--help"][..], true),
+                (&["-h"], true),
+                (&["--check", "--help"], true),
+                (&[], false),
+                (&["--check"], false),
+            ] {
+                let args = args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+                let mut out = Vec::new();
+                let mut looked_up = false;
+                let result = run_with_lookup(&args, dev, "0.2.0", &mut out, || {
+                    looked_up = true;
+                    Err(io::Error::other("feed unavailable"))
+                });
+                if help {
+                    assert!(!looked_up, "help must not look up release for {args:?} (dev={dev})");
+                    result.unwrap();
+                    assert_eq!(String::from_utf8(out).unwrap(), format!("{USAGE}\n"));
+                } else if dev {
+                    assert!(!looked_up, "dev guard must not look up release for {args:?}");
+                    assert!(result.unwrap_err().to_string().contains("doesn't update itself"));
+                } else {
+                    assert!(looked_up, "expected release lookup for {args:?}");
+                    assert_eq!(result.unwrap_err().to_string(), "feed unavailable");
+                }
+            }
+        }
+    }
+
+    /// The update agent verifies against the merged roots, every one of
+    /// them and in order, not the bundled set only (#303).
+    #[test]
+    fn the_update_agent_trusts_the_merged_roots() {
+        let agent = super::agent();
+        let ureq::tls::RootCerts::Specific(certs) = agent.config().tls_config().root_certs() else {
+            panic!("the update agent must trust a list of roots of its own");
+        };
+        let roots = kiri_image::roots::trusted();
+        assert_eq!(certs.len(), roots.len());
+        assert!(certs.iter().zip(roots.iter()).all(|(a, b)| a.der() == b.as_ref()));
+    }
 
     #[test]
     fn compares_versions() {
         assert!(newer("0.2.0", "0.1.9"));
         assert!(newer("1.2.10", "1.2.9"));
         assert!(newer("v1.0.1", "1.0"));
+        assert!(!newer("1.0.0", "1.0"));
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("0.1.0", "0.2.0"));
+        // A test build (scripts/ci/test-version.sh) sorts above its release.
+        assert!(newer("0.1.8-dev.42", "0.1.8"));
+        assert!(!newer("0.1.8", "0.1.8-dev.42"));
+        assert!(newer("0.1.8-dev.43", "0.1.8-dev.42"));
+        for bad in ["", "vv1.0.0", "1.+2.0", "1.2.", "1.2.0-", "1.2.0-rc..1", "99.0.0/../../evil", "99.0.0\\evil"] {
+            assert!(!newer(bad, "0.2.0"), "accepted invalid candidate {bad:?}");
+            assert!(!newer("99.0.0", bad), "accepted invalid current {bad:?}");
+        }
     }
 
     #[test]
@@ -472,5 +655,118 @@ mod tests {
         assert_eq!(r.notes_url, "https://runkiri.com/");
         let r: Release = serde_json::from_str(r###"{"version":"0.1.5","url":"u","sha256":"ab","notes":"## New\n- a line"}"###).unwrap();
         assert_eq!(r.notes, "## New\n- a line");
+    }
+
+    #[test]
+    fn reports_up_to_date_when_feed_is_not_newer() {
+        let url = serve_feed("200 OK", r#"{"version":"0.0.1","url":"https://runkiri.com/download","sha256":""}"#);
+        let mut out = Vec::new();
+        run_with(&["--check".into()], &url, "0.2.0", &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "Kiri 0.2.0 is up to date\n");
+
+        let url = serve_feed("200 OK", r#"{"version":"0.0.0","url":"https://runkiri.com/download","sha256":""}"#);
+        let mut out = Vec::new();
+        run_with(&["--check".into()], &url, env!("CARGO_PKG_VERSION"), &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), format!("Kiri {} is up to date\n", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn reports_newer_version_from_feed() {
+        let url = serve_feed("200 OK", r#"{"version":"99.0.0","url":"https://runkiri.com/download","sha256":""}"#);
+        let mut out = Vec::new();
+        run_with(&["--check".into()], &url, env!("CARGO_PKG_VERSION"), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with(&format!("Kiri 99.0.0 is available (this is {})\n", env!("CARGO_PKG_VERSION"))), "got {text:?}");
+        if cfg!(target_os = "linux") {
+            assert!(text.contains("download the new .deb or .rpm from https://runkiri.com/releases/ and install it as before\n"), "got {text:?}");
+            let url = serve_feed("200 OK", r#"{"version":"99.0.0","url":"https://runkiri.com/download","sha256":""}"#);
+            let mut bare_out = Vec::new();
+            run_with(&[], &url, env!("CARGO_PKG_VERSION"), &mut bare_out).unwrap();
+            assert_eq!(String::from_utf8(bare_out).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_json_and_http_500() {
+        let bad_json = serve_feed("200 OK", "{not json");
+        let err = latest_from(&bad_json).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let err_500 = serve_feed("500 Internal Server Error", r#"{"error":"boom"}"#);
+        assert!(latest_from(&err_500).is_err());
+    }
+
+    #[test]
+    fn routes_container_update_to_docker_and_self_update_to_kiri() {
+        let a = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(crate::docker::is_container_update(&a(&["--memory", "128m", "c1"])));
+        assert!(crate::docker::is_container_update(&a(&["--cpus", "2", "my-ctr"])));
+        assert!(!crate::docker::is_container_update(&a(&["--check"])));
+        assert!(!crate::docker::is_container_update(&a(&["--help"])));
+        assert!(!crate::docker::is_container_update(&a(&["-h"])));
+        assert!(!crate::docker::is_container_update(&a(&[])));
+    }
+
+    /// Regression test for #602: when `launchctl kickstart` exits 0 without
+    /// actually starting the daemon, `start_engine` waits 2.5s (`50 * 50ms`),
+    /// then spawns the daemon directly and polls for up to 10s (`200 * 50ms`).
+    #[test]
+    fn start_engine_falls_back_to_direct_spawn_when_kickstart_leaves_daemon_down() {
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        let polls = Cell::new(0usize);
+        let spawned = Cell::new(false);
+        let sleeps = Cell::new(0usize);
+        super::start_engine_with(
+            || {
+                let n = polls.get() + 1;
+                polls.set(n);
+                n >= 4
+            },
+            || Ok(true),
+            || {
+                spawned.set(true);
+                Ok(())
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+            || "/tmp/daemon.log".into(),
+        )
+        .unwrap();
+        assert!(!spawned.get(), "healthy LaunchAgent must not spawn a second daemon");
+        assert_eq!(sleeps.get(), 2);
+
+        let polls = Cell::new(0usize);
+        let spawned = Cell::new(false);
+        let total_ms = Cell::new(0u64);
+        super::start_engine_with(
+            || {
+                let n = polls.get() + 1;
+                polls.set(n);
+                spawned.get() && n >= 55
+            },
+            || Ok(true),
+            || {
+                assert_eq!(total_ms.get(), 2500, "fallback runs after 50 * 50ms");
+                spawned.set(true);
+                Ok(())
+            },
+            |d: Duration| total_ms.set(total_ms.get() + d.as_millis() as u64),
+            || "/tmp/daemon.log".into(),
+        )
+        .unwrap();
+        assert!(spawned.get());
+
+        let total_ms = Cell::new(0u64);
+        let err = super::start_engine_with(
+            || false,
+            || Ok(true),
+            || Ok(()),
+            |d: Duration| total_ms.set(total_ms.get() + d.as_millis() as u64),
+            || "/custom/daemon.log".into(),
+        )
+        .unwrap_err();
+        assert_eq!(total_ms.get(), 12_500);
+        assert!(err.to_string().contains("/custom/daemon.log"), "{err}");
     }
 }

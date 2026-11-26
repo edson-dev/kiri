@@ -10,7 +10,8 @@ use crate::client;
 
 const USAGE: &str = "usage: kiri domains                          the routers' ports, and whether each runs
        kiri domains set [--http N] [--https N]   move them (no restart)
-       kiri domains reset                    back to the ports a start gives (a test copy's: off)";
+       kiri domains reset                    back to the ports a start gives (a test copy's: off)
+       --json, with any of them, prints the engine's answer as one line of JSON";
 
 #[derive(Debug, PartialEq)]
 enum Cmd {
@@ -76,7 +77,23 @@ fn answer(r: client::Response) -> io::Result<Value> {
 }
 
 pub fn run(args: &[String]) -> io::Result<()> {
-    let v = match parse(args).map_err(io::Error::other)? {
+    run_with(args, client::alive)
+}
+
+fn run_with(args: &[String], alive: impl FnOnce() -> bool) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let json = args.iter().any(|a| a == "--json");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
+    let cmd = parse(&args).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    if !alive() {
+        return Err(io::Error::other("kiri daemon is not running: open Kiri or run `kiri daemon`"));
+    }
+    let v = match cmd {
         Cmd::Show => client::get("/kiri/domains")?,
         Cmd::Set { http, https } => {
             let now = if http.is_none() || https.is_none() { client::get("/kiri/domains")? } else { Value::Null };
@@ -86,14 +103,19 @@ pub fn run(args: &[String]) -> io::Result<()> {
         }
         Cmd::Reset => answer(client::request("DELETE", "/kiri/domains", None)?)?,
     };
-    print!("{}", format(&v));
+    if json {
+        println!("{v}");
+    } else {
+        print!("{}", format(&v));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, format, parse};
+    use super::{Cmd, format, parse, run_with};
     use serde_json::json;
+    use std::io;
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
@@ -129,5 +151,28 @@ mod tests {
         assert_eq!(format(&off), "HTTP   80     off\nHTTPS  443    off\n");
         let moved = json!({"http": {"port": 18780, "running": true, "serving": false, "env": "KIRI_HTTP_PORT"}, "https": {"port": 18743, "running": true, "serving": true, "env": null}});
         assert_eq!(format(&moved), "HTTP   18780  on, a container has the port for now (set by KIRI_HTTP_PORT)\nHTTPS  18743  on\n");
+    }
+
+    #[test]
+    fn help_succeeds_without_touching_the_socket() {
+        for h in ["--help", "-h", "help", "set --help", "reset -h"] {
+            run_with(&args(h), || panic!("help must not check daemon: {h}")).unwrap();
+        }
+    }
+
+    #[test]
+    fn bad_arguments_fail_before_touching_the_socket() {
+        for bad in ["set --http nope", "set --http 0", "set --https 70000", "set --http", "set", "set --port 80", "reset now", "show", "--unknown", "--json show"] {
+            let err = run_with(&args(bad), || panic!("checked daemon before arguments: {bad}")).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn says_when_the_daemon_is_not_running() {
+        for cmd in ["", "--json", "set --http 8080 --https 8443", "set --http 8080 --json", "reset"] {
+            let err = run_with(&args(cmd), || false).unwrap_err();
+            assert_eq!(err.to_string(), "kiri daemon is not running: open Kiri or run `kiri daemon`", "{cmd}");
+        }
     }
 }

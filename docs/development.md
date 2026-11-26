@@ -68,6 +68,25 @@ that boot their own guest are `kiri raw run|pull|images|rmi`.
 
 `kiri` keeps its data in `~/Library/Application Support/Kiri` (override with
 `KIRI_DATA_DIR`). It does not touch `/usr/local/bin/docker`.
+
+On macOS the VM starts with a sparse 64 GiB data disk. Change its size in
+Settings → Resources (saved as `"disk_gb"` in `~/.kiri/vm.json`), or set
+`KIRI_DISK_GB` for the daemon to override it on the next VM start, for example
+`KIRI_DISK_GB=128 ./target/release/kiri daemon`. The backing file grows before
+the VM opens it, and the guest grows ext4 online before starting containers. No
+Homebrew tools are needed. Existing images and volumes are kept; lowering or
+removing the setting never shrinks an existing disk. The extra capacity uses
+space on the Mac only as it is written. Linux and WSL use their host's storage
+instead of this disk image.
+
+The VM also keeps a swap file on that disk, 1 GiB unless Settings → Resources
+says otherwise (`"swap_mib"` in `~/.kiri/vm.json`, 0 for none) or `KIRI_SWAP_MIB`
+overrides it. The guest makes, resizes or removes `/var/lib/kiri/swapfile` at
+boot; freed swap is discarded, so it too uses space on the Mac only while in use.
+
+`python3 tests/disk-grow.py` checks growth and data preservation across
+restarts in a disposable VM, after building the host and guest above.
+
 `/var/run/docker.sock` changes only when you ask: `kiri setup --docker-socket`
 (or the password prompt for `*.kiri.local` names) links it to Kiri's socket
 when no other engine has it, after macOS asks for an administrator password,

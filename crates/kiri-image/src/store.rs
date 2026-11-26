@@ -74,6 +74,10 @@ pub struct Image {
     /// Unix seconds when this image was pulled.
     pub pulled_at: u64,
     pub config: RunConfig,
+    /// The Docker Hub mirror (`host[:port]`) a pull took the image from,
+    /// when it did not come from the registry its name says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<String>,
 }
 
 impl Image {
@@ -117,6 +121,18 @@ impl Image {
         let same_repo = Reference::parse(&self.name).is_ok_and(|n| n.registry == r.registry && n.repository == r.repository);
         same_repo && (self.digest == r.reference || self.index_digest.as_deref() == Some(r.reference.as_str()))
     }
+
+    /// Every blob digest this image record owns in the store: its config,
+    /// its layers, and (when pulled from a registry) its raw manifest and
+    /// multi-arch index blobs so Kiri's build mirror can serve exact
+    /// digest-verified bytes.
+    pub fn referenced_digests(&self) -> impl Iterator<Item = &str> {
+        let manifest = (self.digest != self.config_digest).then_some(self.digest.as_str());
+        std::iter::once(self.config_digest.as_str())
+            .chain(manifest)
+            .chain(self.index_digest.as_deref())
+            .chain(self.layers.iter().map(|l| l.digest.as_str()))
+    }
 }
 
 #[derive(Debug)]
@@ -131,8 +147,10 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 static INDEX_LOCK: Mutex<()> = Mutex::new(());
 
 /// Taken around a blob's rename into place by a writer that holds it
-/// ([`Ingest::finish_pinned`]) and around a removal's check of the holds
-/// and its delete, so the two never interleave.
+/// ([`BlobWriter::finish_pinned`], [`Ingest::finish_pinned`]), around taking a
+/// hold ([`Store::pin`], [`Store::pin_existing`], [`Store::hold_image`]), and
+/// around a removal's check of the holds and its delete, so none of them ever
+/// interleave.
 static BLOB_LOCK: Mutex<()> = Mutex::new(());
 
 /// Blobs something in this process is using that an image's removal must
@@ -252,13 +270,22 @@ pub fn digest_hex(digest: &str) -> io::Result<&str> {
 }
 
 impl Store {
-    /// The per-user data directory: `~/Library/Application Support/Kiri` on
-    /// macOS, `$XDG_DATA_HOME/kiri` (or `~/.local/share/kiri`) elsewhere.
-    /// `KIRI_DATA_DIR` overrides both.
+    /// The data directory: `KIRI_DATA_DIR` if set, else the folder chosen
+    /// in Settings → Storage (`~/.kiri/storage.json`, see
+    /// [`crate::storage`]), else [`Store::os_default_root`]. A chosen folder
+    /// without its marker (a drive that isn't connected) is an error that
+    /// [`crate::storage::unavailable`] recognises, never a fresh folder.
     pub fn default_root() -> io::Result<PathBuf> {
         if let Some(dir) = std::env::var_os("KIRI_DATA_DIR") {
             return Ok(PathBuf::from(dir));
         }
+        crate::storage::resolve(crate::storage::read()?, Self::os_default_root()?)
+    }
+
+    /// The per-user data directory when nothing else is chosen:
+    /// `~/Library/Application Support/Kiri` on macOS, `$XDG_DATA_HOME/kiri`
+    /// (or `~/.local/share/kiri`) elsewhere.
+    pub fn os_default_root() -> io::Result<PathBuf> {
         let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
         Ok(if cfg!(target_os = "macos") {
             home.join("Library/Application Support/Kiri")
@@ -271,8 +298,14 @@ impl Store {
 
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Store> {
         let root = root.into();
-        fs::create_dir_all(root.join("blobs/sha256"))?;
-        fs::create_dir_all(root.join("tmp"))?;
+        let blobs = root.join("blobs/sha256");
+        if !blobs.is_dir() {
+            fs::create_dir_all(blobs)?;
+        }
+        let tmp = root.join("tmp");
+        if !tmp.is_dir() {
+            fs::create_dir_all(tmp)?;
+        }
         Ok(Store { root })
     }
 
@@ -284,6 +317,7 @@ impl Store {
     /// registry could serve a huge blob under that name, so anything over
     /// `MAX_CONFIG` is refused rather than loaded into memory.
     pub fn read_config(&self, digest: &str) -> std::io::Result<Vec<u8>> {
+        let _pin = self.pin(digest);
         let path = self.blob_path(digest)?;
         let len = std::fs::metadata(&path)?.len();
         if len > MAX_CONFIG {
@@ -299,7 +333,7 @@ impl Store {
     /// True if the blob is present with the expected size. Blobs are only
     /// renamed into place after their digest was verified, so presence is proof.
     pub fn has_blob(&self, digest: &str, size: u64) -> bool {
-        self.blob_path(digest).is_ok_and(|p| fs::metadata(p).is_ok_and(|m| m.len() == size))
+        self.blob_path(digest).is_ok_and(|p| blob_ready(&p, size))
     }
 
     pub fn blob_writer(&self, digest: &str) -> io::Result<BlobWriter> {
@@ -331,6 +365,25 @@ impl Store {
                 self.read_locked()
             }
         }
+    }
+
+    /// Reads the image index under the in-process index lock and passes it to
+    /// `f`, so `f` can pin blobs ([`Store::pin`], [`Store::hold_image`])
+    /// atomically before a concurrent [`Store::put_image`] or
+    /// [`Store::remove_image`] can replace the index and delete them.
+    /// `f` must not call methods that re-acquire the index lock.
+    pub fn with_images<T>(&self, f: impl FnOnce(&[Image]) -> T) -> io::Result<T> {
+        let guard = INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let images = match self.read_index()? {
+            Index::Valid(images) => images,
+            Index::Corrupt(..) => {
+                drop(guard);
+                let _lock = self.lock_index()?;
+                let images = self.read_locked()?;
+                return Ok(f(&images));
+            }
+        };
+        Ok(f(&images))
     }
 
     fn read_index(&self) -> io::Result<Index> {
@@ -439,13 +492,33 @@ impl Store {
         Ok(self.images()?.into_iter().find(|i| i.name == name || i.digest == name || r.as_ref().is_some_and(|r| i.matches(r))))
     }
 
-    /// Adds `image`, replacing any image with the same name.
+    /// As [`Store::find`], holding every blob the found image references
+    /// ([`Store::hold_image`]) before releasing the index lock so a concurrent
+    /// tag replacement or removal cannot delete them in between.
+    pub fn find_pinned(&self, name: &str) -> io::Result<Option<(Image, Vec<Pin>)>> {
+        let r = Reference::parse(name).ok();
+        self.with_images(|images| {
+            let found = images
+                .iter()
+                .find(|i| i.name == name || i.digest == name || r.as_ref().is_some_and(|r| i.matches(r)))
+                .cloned()?;
+            let pins = self.hold_image(&found);
+            Some((found, pins))
+        })
+    }
+
+    /// Adds `image`, replacing any image with the same name. The blobs only
+    /// the replaced image used go, as [`Store::remove_image`] deletes them:
+    /// nothing would name them any more (#864).
     pub fn put_image(&self, image: Image) -> io::Result<()> {
         let _lock = self.lock_index()?;
-        let mut images = self.read_locked()?;
-        images.retain(|i| i.name != image.name);
+        let (replaced, mut images): (Vec<Image>, Vec<Image>) = self.read_locked()?.into_iter().partition(|i| i.name == image.name);
         images.push(image);
-        self.write_index(&images)
+        self.write_index(&images)?;
+        for old in &replaced {
+            self.remove_unused_blobs(old, &images);
+        }
+        Ok(())
     }
 
     /// Records the manifest a push of `name` left in its registry, so
@@ -464,13 +537,34 @@ impl Store {
     }
 
     /// Keeps the blob `digest` from deletion while the pin lives. Pin first,
-    /// then check the blob is there: a pin taken after the check could miss
-    /// a removal in between.
+    /// then check the blob is there: taking the blob lock serialises the pin
+    /// with [`Store::remove_unpinned`] so a deletion already past its check
+    /// finishes before this returns.
     pub fn pin(&self, digest: &str) -> Pin {
         match self.blob_path(digest) {
-            Ok(p) => Pin::take(p),
+            Ok(p) => {
+                let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                Pin::take(p)
+            }
             Err(_) => Pin(None),
         }
+    }
+
+    /// Keeps the blob `digest` from deletion if it is already on disk with
+    /// `size` bytes. The presence check and the hold both run under the blob
+    /// lock so a concurrent [`Store::put_image`] or [`Store::remove_image`]
+    /// cannot delete the blob in between.
+    pub fn pin_existing(&self, digest: &str, size: u64) -> Option<Pin> {
+        let path = self.blob_path(digest).ok()?;
+        let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        blob_ready(&path, size).then(|| Pin::take(path))
+    }
+
+    /// Keeps every blob `image` references (config, raw manifest, multi-arch
+    /// index, and layers) from deletion until the returned pins are dropped.
+    pub fn hold_image(&self, image: &Image) -> Vec<Pin> {
+        let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        image.referenced_digests().filter_map(|d| self.blob_path(d).ok()).map(Pin::take).collect()
     }
 
     /// Removes the image and deletes blobs no remaining image uses and
@@ -481,13 +575,20 @@ impl Store {
         let Some(pos) = images.iter().position(|i| i.name == name) else { return Ok(None) };
         let removed = images.remove(pos);
         self.write_index(&images)?;
-        let in_use = |d: &str| images.iter().any(|i| i.config_digest == d || i.layers.iter().any(|l| l.digest == d));
-        for d in std::iter::once(&removed.config_digest).chain(removed.layers.iter().map(|l| &l.digest)) {
+        self.remove_unused_blobs(&removed, &images);
+        Ok(Some(removed))
+    }
+
+    /// Deletes the blobs of `gone` that no image in `images` uses and
+    /// nothing holds ([`Store::pin`]). Called with the index lock held,
+    /// once `images` is written.
+    fn remove_unused_blobs(&self, gone: &Image, images: &[Image]) {
+        let in_use = |d: &str| images.iter().any(|i| i.referenced_digests().any(|r| r == d));
+        for d in gone.referenced_digests() {
             if !in_use(d) {
                 self.remove_unpinned(d);
             }
         }
-        Ok(Some(removed))
     }
 
     /// Deletes the blob `digest` if no image uses it and nothing holds it,
@@ -496,7 +597,7 @@ impl Store {
     pub fn remove_if_unused(&self, digest: &str) -> io::Result<()> {
         let _lock = self.lock_index()?;
         let images = self.read_locked()?;
-        if !images.iter().any(|i| i.config_digest == digest || i.layers.iter().any(|l| l.digest == digest)) {
+        if !images.iter().any(|i| i.referenced_digests().any(|r| r == digest)) {
             self.remove_unpinned(digest);
         }
         Ok(())
@@ -548,7 +649,16 @@ impl Write for BlobWriter {
 
 impl BlobWriter {
     /// Verifies the digest and publishes the blob. Returns bytes written.
-    pub fn finish(mut self) -> io::Result<u64> {
+    pub fn finish(self) -> io::Result<u64> {
+        let written = self.written;
+        self.finish_pinned()?;
+        Ok(written)
+    }
+
+    /// As [`BlobWriter::finish`], holding the blob ([`Store::pin`]) from before
+    /// it is in place: a concurrent removal or tag replacement cannot delete it
+    /// between the rename and the caller recording an image that names it.
+    pub fn finish_pinned(mut self) -> io::Result<Pin> {
         let actual = format!("sha256:{}", hex(&std::mem::take(&mut self.hasher).finalize()));
         if actual != self.expected {
             let _ = fs::remove_file(&self.tmp);
@@ -558,8 +668,14 @@ impl BlobWriter {
             ));
         }
         self.file.sync_all()?;
+        let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pin = Pin::take(self.dest.clone());
+        if blob_ready(&self.dest, self.written) {
+            let _ = fs::remove_file(&self.tmp);
+            return Ok(pin);
+        }
         fs::rename(&self.tmp, &self.dest)?;
-        Ok(self.written)
+        Ok(pin)
     }
 }
 
@@ -594,12 +710,21 @@ impl Write for Ingest {
     }
 }
 
+fn blob_ready(dest: &Path, expected_size: u64) -> bool {
+    fs::symlink_metadata(dest).is_ok_and(|m| m.is_file() && m.len() == expected_size)
+}
+
 impl Ingest {
     /// Publishes the blob under its digest. Returns (digest, size).
     pub fn finish(mut self) -> io::Result<(String, u64)> {
         let hex = hex(&std::mem::take(&mut self.hasher).finalize());
+        let dest = self.root.join("blobs/sha256").join(&hex);
+        if blob_ready(&dest, self.written) {
+            let _ = fs::remove_file(&self.tmp);
+            return Ok((format!("sha256:{hex}"), self.written));
+        }
         self.file.sync_all()?;
-        fs::rename(&self.tmp, self.root.join("blobs/sha256").join(&hex))?;
+        fs::rename(&self.tmp, dest)?;
         Ok((format!("sha256:{hex}"), self.written))
     }
 
@@ -609,10 +734,14 @@ impl Ingest {
     /// an image that names it (`docker load`).
     pub fn finish_pinned(mut self) -> io::Result<(String, u64, Pin)> {
         let hex = hex(&std::mem::take(&mut self.hasher).finalize());
-        self.file.sync_all()?;
         let dest = self.root.join("blobs/sha256").join(&hex);
         let _one = BLOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pin = Pin::take(dest.clone());
+        if blob_ready(&dest, self.written) {
+            let _ = fs::remove_file(&self.tmp);
+            return Ok((format!("sha256:{hex}"), self.written, pin));
+        }
+        self.file.sync_all()?;
         fs::rename(&self.tmp, &dest)?;
         Ok((format!("sha256:{hex}"), self.written, pin))
     }
@@ -622,6 +751,22 @@ impl Drop for Ingest {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.tmp);
     }
+}
+
+/// Hashes every byte of `r` with SHA-256, returning `(digest, bytes_read)`.
+pub fn hash_stream(mut r: impl io::Read) -> io::Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((format!("sha256:{}", hex(&hasher.finalize())), total))
 }
 
 pub fn sha256_digest(bytes: &[u8]) -> String {
@@ -652,7 +797,7 @@ mod tests {
         let mut ingest = store.ingest().unwrap();
         ingest.write_all(b"a layer a save is sending").unwrap();
         let (layer, size) = ingest.finish().unwrap();
-        let image = |name: &str| Image {
+        let image = |name: &str| Image { mirror: None,
             name: name.into(),
             digest: "sha256:manifest".into(),
             index_digest: None,
@@ -688,7 +833,7 @@ mod tests {
         assert!(store.blob_writer(&path).is_err());
         assert!(store.read_config(&path).is_err());
 
-        let image = Image {
+        let image = Image { mirror: None,
             name: "malicious:latest".into(),
             digest: "sha256:manifest".into(),
             index_digest: None,
@@ -712,7 +857,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kiri-store-index-test-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let (index, manifest) = (format!("sha256:{}", "1".repeat(64)), format!("sha256:{}", "2".repeat(64)));
-        let image = Image {
+        let image = Image { mirror: None,
             name: format!("kindest/node@{index}"),
             digest: manifest.clone(),
             index_digest: Some(index.clone()),
@@ -735,11 +880,46 @@ mod tests {
     }
 
     #[test]
+    fn removes_raw_manifest_and_index_blobs_when_no_image_references_them() {
+        let root = std::env::temp_dir().join(format!("kiri-store-raw-manifest-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let put = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let (cfg, cfg_sz) = put(b"{\"os\":\"linux\",\"architecture\":\"amd64\"}");
+        let (man, man_sz) = put(b"{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\"}");
+        let (idx, idx_sz) = put(b"{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\"}");
+        let img = |name: &str| Image {
+            name: name.into(),
+            digest: man.clone(),
+            index_digest: Some(idx.clone()),
+            config_digest: cfg.clone(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: RunConfig::default(),
+            mirror: None,
+        };
+        store.put_image(img("app:1")).unwrap();
+        store.put_image(img("app:latest")).unwrap();
+        store.remove_image("app:1").unwrap();
+        assert!(store.has_blob(&cfg, cfg_sz) && store.has_blob(&man, man_sz) && store.has_blob(&idx, idx_sz), "second tag still holds all blobs");
+        store.remove_image("app:latest").unwrap();
+        assert!(!store.has_blob(&cfg, cfg_sz) && !store.has_blob(&man, man_sz) && !store.has_blob(&idx, idx_sz), "last tag frees raw manifest and index blobs");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn a_push_leaves_the_registry_manifest_in_repo_digests() {
         let root = std::env::temp_dir().join(format!("kiri-store-push-test-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let d = |c: &str| format!("sha256:{}", c.repeat(64));
-        let image = |name: &str, config: &str, index: Option<String>| Image {
+        let image = |name: &str, config: &str, index: Option<String>| Image { mirror: None,
             name: name.into(),
             digest: d(config),
             index_digest: index,
@@ -786,7 +966,7 @@ mod tests {
     }
 
     fn named(name: &str) -> Image {
-        Image {
+        Image { mirror: None,
             name: name.into(),
             digest: format!("sha256:{}", "1".repeat(64)),
             index_digest: None,
@@ -961,7 +1141,7 @@ mod tests {
 
     #[test]
     fn repo_strips_a_tag_but_not_a_port() {
-        let named = |name: &str| Image {
+        let named = |name: &str| Image { mirror: None,
             name: name.into(),
             digest: String::new(),
             index_digest: None,
@@ -977,5 +1157,236 @@ mod tests {
         assert_eq!(named("localhost:5000/app:1").repo(), "localhost:5000/app");
         assert_eq!(named("localhost:5000/app").repo(), "localhost:5000/app");
         assert_eq!(named(&format!("kindest/node@sha256:{}", "a".repeat(64))).repo(), "kindest/node");
+    }
+
+    #[test]
+    fn ingest_skips_rewrite_only_when_existing_blob_matches_size() {
+        let root = scratch("ingest-skip");
+        let _ = fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let data = b"hello content addressed store";
+        let mut w = store.ingest().unwrap();
+        w.write_all(data).unwrap();
+        let (digest, size) = w.finish().unwrap();
+        let path = store.blob_path(&digest).unwrap();
+        assert_eq!(size, data.len() as u64);
+
+        // Existing matching file: finish_pinned keeps it without replacing it.
+        let mut w2 = store.ingest().unwrap();
+        w2.write_all(data).unwrap();
+        let (d2, s2, _pin) = w2.finish_pinned().unwrap();
+        assert_eq!((d2, s2), (digest.clone(), size));
+        assert_eq!(fs::read(&path).unwrap(), data);
+
+        // Truncated/corrupted blob of wrong size on disk is repaired by rename.
+        fs::write(&path, b"short").unwrap();
+        let mut w3 = store.ingest().unwrap();
+        w3.write_all(data).unwrap();
+        w3.finish().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), data);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An image put under a name another image had (a commit, build, pull,
+    /// load or tag onto it) takes that image's place, and the blobs only the
+    /// old one used go as `remove_image` would delete them. Before, they
+    /// stayed with no image naming them and nothing could remove them (#864).
+    #[test]
+    fn an_image_put_under_a_taken_name_frees_the_blobs_only_the_old_one_used() {
+        let root = scratch("replace");
+        let _ = fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let put = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let layer = |(digest, size): &(String, u64)| Layer { digest: digest.clone(), size: *size, media_type: "application/vnd.oci.image.layer.v1.tar".into() };
+        let (shared, old_layer, new_layer) = (put(b"base layer"), put(b"layer of the first build"), put(b"layer of the second build"));
+        let (old_cfg, new_cfg) = (put(b"{\"created\":\"first\"}"), put(b"{\"created\":\"second\"}"));
+        let (old_man, old_idx) = (put(b"{\"schemaVersion\":2,\"first\":true}"), put(b"{\"schemaVersion\":2,\"manifests\":[]}"));
+        let pinned_layer = put(b"layer a save or pull is still using");
+        let img = |name: &str, cfg: &(String, u64), manifest: Option<&(String, u64)>, index: Option<&(String, u64)>, layers: &[&(String, u64)]| Image {
+            name: name.into(),
+            digest: manifest.map_or_else(|| cfg.0.clone(), |m| m.0.clone()),
+            index_digest: index.map(|i| i.0.clone()),
+            config_digest: cfg.0.clone(),
+            layers: layers.iter().map(|l| layer(l)).collect(),
+            size: 0,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: RunConfig::default(),
+            mirror: None,
+        };
+        let has = |(digest, size): &(String, u64)| store.has_blob(digest, *size);
+
+        // The old image under a second name keeps all its blobs.
+        store.put_image(img("app:latest", &old_cfg, Some(&old_man), Some(&old_idx), &[&shared, &old_layer])).unwrap();
+        store.put_image(img("app:v1", &old_cfg, Some(&old_man), Some(&old_idx), &[&shared, &old_layer])).unwrap();
+        store.put_image(img("app:latest", &new_cfg, None, None, &[&shared, &new_layer])).unwrap();
+        assert!(has(&old_cfg) && has(&old_man) && has(&old_idx) && has(&old_layer), "app:v1 still names the old image");
+
+        // Its last name taken: its own config, manifest, index and layer go;
+        // the shared layer and the new image's blobs stay.
+        store.put_image(img("app:v1", &new_cfg, None, None, &[&shared, &new_layer])).unwrap();
+        assert!(!has(&old_cfg) && !has(&old_man) && !has(&old_idx) && !has(&old_layer), "nothing names the old image's blobs any more");
+        assert!(has(&shared) && has(&new_cfg) && has(&new_layer), "the new image uses these");
+
+        // Putting the exact same image again under its own name deletes nothing.
+        store.put_image(img("app:v1", &new_cfg, None, None, &[&shared, &new_layer])).unwrap();
+        assert!(has(&shared) && has(&new_cfg) && has(&new_layer));
+
+        // A blob something still holds outlives the replacement.
+        let held_cfg = put(b"{\"created\":\"held\"}");
+        store.put_image(img("held:1", &held_cfg, None, None, &[&pinned_layer])).unwrap();
+        let pin = store.pin(&pinned_layer.0);
+        store.put_image(img("held:1", &new_cfg, None, None, &[&new_layer])).unwrap();
+        assert!(has(&pinned_layer), "a pin still holds it");
+        assert!(!has(&held_cfg), "unpinned old config went");
+        drop(pin);
+        assert_eq!(store.images().unwrap().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["app:latest", "app:v1", "held:1"]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `pin_existing`, `BlobWriter::finish_pinned`, and `find_pinned` hold
+    /// blobs atomically across concurrent `put_image` tag overwrites so no
+    /// in-flight pull, build mirror, or container create sees ENOENT.
+    #[test]
+    fn concurrent_pin_existing_and_finish_pinned_survive_put_image_overwrites() {
+        let root = scratch("concurrent-pins");
+        let _ = fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+
+        let shared_bytes = b"shared base layer bytes".to_vec();
+        let shared_digest = sha256_digest(&shared_bytes);
+        let shared_size = shared_bytes.len() as u64;
+        let cfg1_bytes = br#"{"architecture":"amd64","os":"linux","config":{"Cmd":["v1"]}}"#.to_vec();
+        let cfg1_digest = sha256_digest(&cfg1_bytes);
+        let cfg1_size = cfg1_bytes.len() as u64;
+        let cfg2_bytes = br#"{"architecture":"amd64","os":"linux","config":{"Cmd":["v2"]}}"#.to_vec();
+        let cfg2_digest = sha256_digest(&cfg2_bytes);
+        let layer2_bytes = b"version two unique layer".to_vec();
+        let layer2_digest = sha256_digest(&layer2_bytes);
+        let layer2_size = layer2_bytes.len() as u64;
+
+        let write_pinned = |digest: &str, bytes: &[u8]| -> Pin {
+            let mut w = store.blob_writer(digest).unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish_pinned().unwrap()
+        };
+
+        // 1. Deterministic checks: pin_existing misses when absent or wrong size,
+        // hits when matching, and protects against put_image overwrite;
+        // BlobWriter::finish_pinned rejects mismatched digests and pins on success.
+        assert!(store.pin_existing(&shared_digest, shared_size).is_none());
+        let mut bad = store.blob_writer(&shared_digest).unwrap();
+        bad.write_all(b"wrong bytes").unwrap();
+        assert!(bad.finish_pinned().is_err());
+        assert!(store.pin_existing(&shared_digest, shared_size).is_none());
+
+        let p_shared = write_pinned(&shared_digest, &shared_bytes);
+        let p_cfg1 = write_pinned(&cfg1_digest, &cfg1_bytes);
+        assert!(store.pin_existing(&shared_digest, shared_size + 1).is_none(), "wrong size is not a hit");
+        let existing_pin = store.pin_existing(&shared_digest, shared_size).expect("blob present");
+
+        let make_img = |name: &str, cfg_digest: &str, layer_digest: &str, layer_size: u64| Image {
+            name: name.into(),
+            digest: cfg_digest.into(),
+            index_digest: None,
+            config_digest: cfg_digest.into(),
+            layers: vec![Layer { digest: layer_digest.into(), size: layer_size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }],
+            size: layer_size,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: RunConfig::default(),
+            mirror: None,
+        };
+
+        let img1 = make_img("race:latest", &cfg1_digest, &shared_digest, shared_size);
+        let img2 = make_img("race:latest", &cfg2_digest, &layer2_digest, layer2_size);
+        store.put_image(img1.clone()).unwrap();
+        drop((p_shared, p_cfg1));
+
+        // Overwrite race:latest with img2 while existing_pin holds shared_digest.
+        let p_cfg2 = write_pinned(&cfg2_digest, &cfg2_bytes);
+        let p_l2 = write_pinned(&layer2_digest, &layer2_bytes);
+        store.put_image(img2.clone()).unwrap();
+        drop((p_cfg2, p_l2));
+        assert!(store.has_blob(&shared_digest, shared_size), "pin_existing protects blob across put_image");
+        assert!(!store.has_blob(&cfg1_digest, cfg1_size), "unpinned cfg1 was freed");
+        drop(existing_pin);
+
+        // 2. Multi-threaded stress: overwrite race:latest back and forth between
+        // img1 and img2 while concurrent readers use pin_existing,
+        // BlobWriter::finish_pinned, and find_pinned.
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            // Writer thread: repeatedly swaps race:latest between img1 and img2.
+            s.spawn(|| {
+                for round in 0..150 {
+                    if round % 2 == 0 {
+                        let p1 = write_pinned(&cfg1_digest, &cfg1_bytes);
+                        let p2 = write_pinned(&shared_digest, &shared_bytes);
+                        store.put_image(img1.clone()).unwrap();
+                        drop((p1, p2));
+                    } else {
+                        let p1 = write_pinned(&cfg2_digest, &cfg2_bytes);
+                        let p2 = write_pinned(&layer2_digest, &layer2_bytes);
+                        store.put_image(img2.clone()).unwrap();
+                        drop((p1, p2));
+                    }
+                }
+                done.store(true, Ordering::Release);
+            });
+
+            // Pull-like thread: alternates pin_existing and BlobWriter::finish_pinned
+            // on shared_digest and verifies the bytes remain readable while pinned.
+            s.spawn(|| {
+                let mut hits = 0usize;
+                let mut writes = 0usize;
+                while !done.load(Ordering::Acquire) {
+                    if let Some(pin) = store.pin_existing(&shared_digest, shared_size) {
+                        let got = fs::read(store.blob_path(&shared_digest).unwrap()).expect("blob vanished while pin_existing held");
+                        assert_eq!(got, shared_bytes);
+                        drop(pin);
+                        hits += 1;
+                    } else {
+                        let pin = write_pinned(&shared_digest, &shared_bytes);
+                        let got = fs::read(store.blob_path(&shared_digest).unwrap()).expect("blob vanished while finish_pinned held");
+                        assert_eq!(got, shared_bytes);
+                        drop(pin);
+                        writes += 1;
+                    }
+                }
+                assert!(hits + writes > 0);
+            });
+
+            // Reader thread (create/mirror-like): atomically looks up and pins
+            // race:latest via find_pinned and reads both its config and layer.
+            s.spawn(|| {
+                let mut reads = 0usize;
+                while !done.load(Ordering::Acquire) {
+                    if let Some((img, pins)) = store.find_pinned("race:latest").unwrap() {
+                        let cfg = store.read_config(&img.config_digest).expect("config vanished while find_pinned held");
+                        let layer = fs::read(store.blob_path(&img.layers[0].digest).unwrap()).expect("layer vanished while find_pinned held");
+                        if img.config_digest == cfg1_digest {
+                            assert_eq!(cfg, cfg1_bytes);
+                            assert_eq!(layer, shared_bytes);
+                        } else {
+                            assert_eq!(cfg, cfg2_bytes);
+                            assert_eq!(layer, layer2_bytes);
+                        }
+                        drop(pins);
+                        reads += 1;
+                    }
+                }
+                assert!(reads > 0);
+            });
+        });
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

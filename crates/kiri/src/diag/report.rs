@@ -62,11 +62,17 @@ const CRASHES: usize = 5;
 /// Log lines a crash upload carries: its part's last ones before it.
 const CRASH_LOG_LINES: usize = 200;
 const CRASH_BUDGET: usize = 48 << 10;
+#[cfg(any(target_os = "macos", test))]
 const MAC_REPORTS: usize = 3;
+#[cfg(any(target_os = "macos", test))]
 const MAC_REPORT_BUDGET: usize = 24 << 10;
 
 pub fn run(args: &[String]) -> io::Result<()> {
     match args.first().map(String::as_str) {
+        Some("-h" | "--help" | "help") => {
+            println!("{USAGE}");
+            Ok(())
+        }
         Some("logs") => logs_cli(&args[1..]),
         Some("report") => report_cli(&args[1..]),
         _ => Err(io::Error::other(USAGE)),
@@ -173,6 +179,10 @@ pub fn render(v: &Value, utc: bool, color: bool) -> String {
 }
 
 fn logs_cli(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let (mut parts, mut follow, mut errors, mut n, mut op) = (Vec::new(), false, false, 50usize, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -253,23 +263,62 @@ pub struct Facts {
     pub created: SystemTime,
     /// The container list, when the person ticked it in the window.
     pub containers: Option<String>,
+    /// VM uplink / DHCP status and (on macOS) bridge & UDP port 67 summary.
+    pub vm_network: Option<String>,
+    /// Read-only / `emergency_ro` storage warning when detected (#768).
+    pub storage_warning: Option<String>,
 }
 
-/// The engine as the report describes it, asked without waking the VM.
-fn engine_line() -> String {
+/// The engine as the report describes it (plus its `/info` payload), asked
+/// without waking the VM.
+fn engine_facts() -> (String, Option<Value>) {
     if !crate::client::alive() {
-        return "not running".into();
+        return ("not running".into(), None);
     }
     let version = crate::client::get_background("/version").unwrap_or_default();
     let info = crate::client::get_background("/info").unwrap_or_default();
-    format!(
+    let line = format!(
         "running (engine {}, VM {}, {} of {} containers running, {} images)",
         crate::client::kiri_version(&version).unwrap_or("?"),
         if info["KiriVmAwake"] == true { "awake" } else { "asleep" },
         info["ContainersRunning"].as_u64().unwrap_or(0),
         info["Containers"].as_u64().unwrap_or(0),
         info["Images"].as_u64().unwrap_or(0),
-    )
+    );
+    (line, Some(info))
+}
+
+/// Formats the VM uplink / DHCP fallback and host UDP port 67 lines for the
+/// report. Returns `None` when there is nothing to report (e.g. Linux host).
+pub fn vm_network_summary(info: Option<&Value>, bridge: Option<&crate::daemon::vmnet::Bridge>, udp67: Option<&str>) -> Option<String> {
+    let (mut lines, mut dhcp_failed, mut recorded_udp67) = (Vec::new(), false, None);
+    if let Some(u) = info.and_then(|i| i.get("KiriVmUplink")).filter(|v| v.is_object()) {
+        recorded_udp67 = u["udp67"].as_str();
+        let (ip, gw) = (u["ip"].as_str().unwrap_or("?"), u["gateway"].as_str().unwrap_or("?"));
+        match u["mode"].as_str().unwrap_or("") {
+            "dhcp" => lines.push(format!("VM uplink: DHCP ({ip} via {gw})")),
+            "host-egress" => lines.push("VM uplink: host egress over vsock (shared NAT disabled)".into()),
+            "static-fallback" => {
+                dhcp_failed = true;
+                let (br, dns) = (u["bridge"].as_str().unwrap_or("bridge100"), u["dns"].as_str().unwrap_or("?"));
+                lines.push(format!("VM uplink: static fallback on {br} ({ip} via {gw}, dns {dns}) — DHCP did not answer"));
+            }
+            "fallback-failed" => {
+                dhcp_failed = true;
+                lines.push(format!("VM uplink: no uplink — DHCP did not answer and fallback failed ({})", u["reason"].as_str().unwrap_or("unknown")));
+            }
+            _ => {}
+        }
+    }
+    if let Some(b) = bridge {
+        lines.push(format!("Host vmnet bridge: {} ({}/{})", b.name, std::net::Ipv4Addr::from(b.gateway), b.prefix));
+    }
+    if let Some(holder) = udp67.or(recorded_udp67) {
+        lines.push(format!("Host UDP port 67: {holder}"));
+    } else if dhcp_failed {
+        lines.push("Host UDP port 67: none visible".into());
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The engine's containers, one a line: name, image and status. Nothing
@@ -352,16 +401,50 @@ fn crash_name(name: &str) -> Option<(u64, Part)> {
     Some((secs, part))
 }
 
-/// The report's text, redacted. `home` holds `Library/Logs/DiagnosticReports`;
-/// `state` is `~/.kiri`.
+#[cfg(any(target_os = "macos", test))]
+fn append_macos_crash_reports(s: &mut String, home: &Path) {
+    // What macOS wrote down itself: crashes our hook can't see (a signal, a
+    // hang the system killed, an abort inside a framework).
+    let reports = home.join("Library/Logs/DiagnosticReports");
+    let month = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    let ips: Vec<_> = newest(&reports, |n| n.to_ascii_lowercase().starts_with("kiri") && n.ends_with(".ips")).into_iter().filter(|(_, t)| *t >= month).collect();
+    let _ = writeln!(s, "\n==== macOS crash reports ({}, last 30 days: {}) ====", reports.display(), ips.len());
+    for (path, _) in ips.iter().take(MAC_REPORTS) {
+        let text = String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned();
+        let _ = writeln!(s, "--- {} ---", path.file_name().unwrap_or_default().to_string_lossy());
+        s.push_str(&first_bytes(&text, MAC_REPORT_BUDGET));
+        s.push('\n');
+    }
+}
+
+/// The report's text, redacted. `home` holds `Library/Logs/DiagnosticReports`
+/// on macOS; `state` is `~/.kiri`.
 pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -> String {
+    #[cfg(target_os = "macos")]
+    return assemble_inner(home, state, facts, redactor, true);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        assemble_inner(home, state, facts, redactor, false)
+    }
+}
+
+fn assemble_inner(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor, include_macos_reports: bool) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "Kiri diagnostics report");
     let _ = writeln!(s, "Created:  {}", time::rfc3339(facts.created));
     let _ = writeln!(s, "App:      {} {} ({}), made by the {}", crate::flavor::APP, env!("CARGO_PKG_VERSION"), crate::flavor::CONTEXT, super::part().name());
     let _ = writeln!(s, "System:   {}", super::system().line());
     let _ = writeln!(s, "Engine:   {}", facts.engine);
+    if let Some(ro) = &facts.storage_warning {
+        let _ = writeln!(s, "Storage:  {ro}");
+    }
     let _ = writeln!(s, "Crash reports: {}", if facts.crash_reports { "sent automatically" } else { "not sent automatically" });
+    if let Some(net) = &facts.vm_network {
+        for line in net.lines() {
+            let _ = writeln!(s, "{line}");
+        }
+    }
 
     for (part, title) in [(Part::Daemon, "engine"), (Part::Ui, "window"), (Part::Cli, "command line")] {
         let path = log_file(state, part);
@@ -374,15 +457,20 @@ pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -
         }
     }
 
-    // The engine's own stderr, as launchd (or the window) keeps it.
-    let raw = state.join("daemon.log");
-    let _ = writeln!(s, "\n==== Engine output ({}) ====", raw.display());
-    let text = tail(&raw, LOG_BUDGET as u64);
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() {
-        let _ = writeln!(s, "(empty)");
-    } else {
-        let _ = writeln!(s, "{}", lines[lines.len().saturating_sub(200)..].join("\n"));
+    // The engine's own stderr, as launchd (or the window) keeps it, and the
+    // VM's console log (kiri-init messages, kernel boot, DHCP fallback).
+    for (title, path, always) in [("Engine output", state.join("daemon.log"), true), ("Guest console", state.join("logs/guest-console.log"), false)] {
+        if !always && !path.is_file() {
+            continue;
+        }
+        let _ = writeln!(s, "\n==== {title} ({}) ====", path.display());
+        let text = tail(&path, LOG_BUDGET as u64);
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            let _ = writeln!(s, "(empty)");
+        } else {
+            let _ = writeln!(s, "{}", lines[lines.len().saturating_sub(200)..].join("\n"));
+        }
     }
 
     if let Some(list) = &facts.containers {
@@ -399,18 +487,12 @@ pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -
         s.push_str(&first_bytes(&text, CRASH_BUDGET));
     }
 
-    // What macOS wrote down itself: crashes our hook can't see (a signal, a
-    // hang the system killed, an abort inside a framework).
-    let reports = home.join("Library/Logs/DiagnosticReports");
-    let month = SystemTime::now() - Duration::from_secs(30 * 86_400);
-    let ips: Vec<_> = newest(&reports, |n| n.to_ascii_lowercase().starts_with("kiri") && n.ends_with(".ips")).into_iter().filter(|(_, t)| *t >= month).collect();
-    let _ = writeln!(s, "\n==== macOS crash reports ({}, last 30 days: {}) ====", reports.display(), ips.len());
-    for (path, _) in ips.iter().take(MAC_REPORTS) {
-        let text = String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned();
-        let _ = writeln!(s, "--- {} ---", path.file_name().unwrap_or_default().to_string_lossy());
-        s.push_str(&first_bytes(&text, MAC_REPORT_BUDGET));
-        s.push('\n');
+    #[cfg(any(target_os = "macos", test))]
+    if include_macos_reports {
+        append_macos_crash_reports(&mut s, home);
     }
+    #[cfg(not(any(target_os = "macos", test)))]
+    let _ = (home, include_macos_reports);
     redactor.apply(&s)
 }
 
@@ -419,7 +501,22 @@ pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -
 pub fn report_text(containers: bool) -> io::Result<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::other("HOME is not set"))?;
     let state = home.join(crate::flavor::STATE.get());
-    let facts = Facts { engine: engine_line(), crash_reports: crash_reports_on(), created: SystemTime::now(), containers: containers.then(container_lines) };
+    let (engine, info) = engine_facts();
+    let bridge = crate::daemon::vmnet::current_bridge();
+    let udp67 = crate::daemon::vmnet::udp67_holder();
+    let vm_network = vm_network_summary(info.as_ref(), bridge.as_ref(), udp67.as_deref());
+    let storage_warning = info
+        .as_ref()
+        .and_then(|i| i["KiriStorageReadOnly"].as_str().map(str::to_owned))
+        .or_else(|| crate::daemon::rofs::check_daemon_storage(None));
+    let facts = Facts {
+        engine,
+        crash_reports: crash_reports_on(),
+        created: SystemTime::now(),
+        containers: containers.then(container_lines),
+        vm_network,
+        storage_warning,
+    };
     Ok(assemble(&home, &state, &facts, &Redactor::for_user()))
 }
 
@@ -432,12 +529,28 @@ fn default_out() -> io::Result<PathBuf> {
     Ok(if desktop.is_dir() { desktop } else { home }.join(format!("kiri-report-{stamp}.txt")))
 }
 
+/// Resolves an explicit `--out` path (translating a Windows drive path like
+/// `C:\Temp\report.txt` to `/mnt/c/Temp/report.txt` when running inside WSL 2)
+/// or falls back to `default_out()`.
+fn resolve_out_path(out: Option<PathBuf>, wsl: Option<&crate::daemon::binds::Wsl>) -> io::Result<PathBuf> {
+    let Some(p) = out else {
+        return default_out();
+    };
+    if let (Some(w), Some(s)) = (wsl, p.to_str())
+        && (s.contains('\\') || s.as_bytes().get(1) == Some(&b':'))
+        && let Ok(mapped) = crate::daemon::binds::source(s, w)
+    {
+        return Ok(PathBuf::from(mapped));
+    }
+    Ok(p)
+}
+
 /// Writes the report, readable only by this user. Returns where.
 pub fn save_report(text: &str, out: Option<PathBuf>) -> io::Result<PathBuf> {
-    let path = match out {
-        Some(p) => p,
-        None => default_out()?,
-    };
+    let path = resolve_out_path(out, crate::daemon::binds::wsl())?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
     f.write_all(text.as_bytes())?;
     Ok(path)
@@ -451,6 +564,10 @@ pub fn reveal(path: &Path) {
 }
 
 fn report_cli(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let (mut out, mut send_it) = (None, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -882,8 +999,9 @@ mod tests {
         std::fs::write(state.join("crashes/1792700000-ui.sent.txt"), "Kiri crash report\nMessage:  older\n").unwrap();
         std::fs::write(reports.join("kiri-2026-10-28-094107.ips"), format!("{{\"app_name\":\"kiri\",\"crashReporterKey\":\"ABCD-1234\"}}\n{{\"procPath\":\"{h}/Applications/Kiri.app\"}}")).unwrap();
         std::fs::write(reports.join("Safari-2026-10-28-094107.ips"), "not ours").unwrap();
-        let facts = Facts { engine: "not running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: Some("web  nginx:alpine  Up 2 hours\n".into()) };
-        let text = assemble(&home, &state, &facts, &Redactor::new(Some(h.clone()), Vec::new()));
+        let facts = Facts { engine: "not running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: Some("web  nginx:alpine  Up 2 hours\n".into()), vm_network: None, storage_warning: None };
+        let redactor = Redactor::new(Some(h.clone()), Vec::new());
+        let text = assemble(&home, &state, &facts, &redactor);
 
         assert!(text.starts_with("Kiri diagnostics report\nCreated:  2026-10-24T00:00:00"), "{text}");
         assert!(text.contains("Engine:   not running") && text.contains("Crash reports: not sent automatically"));
@@ -895,7 +1013,16 @@ mod tests {
         assert!(text.contains("==== Containers (names, images and status only) ====\nweb  nginx:alpine  Up 2 hours\n"));
         assert!(text.contains("2 in all") && text.contains("--- 1792800000-daemon.txt ---") && text.contains("boom with Bearer [redacted]"));
         assert!(text.find("1792800000-daemon").unwrap() < text.find("1792700000-ui").unwrap(), "newest crash first");
-        assert!(text.contains("--- kiri-2026-10-28-094107.ips ---") && text.contains("~/Applications/Kiri.app") && !text.contains("Safari"));
+        let mac_text = assemble_inner(&home, &state, &facts, &redactor, true);
+        assert!(mac_text.contains("--- kiri-2026-10-28-094107.ips ---") && mac_text.contains("~/Applications/Kiri.app") && !mac_text.contains("Safari"));
+        assert!(!mac_text.contains("ABCD-1234") && !mac_text.contains(&h), "{mac_text}");
+        let non_mac_text = assemble_inner(&home, &state, &facts, &redactor, false);
+        assert!(!non_mac_text.contains("macOS crash reports") && !non_mac_text.contains("DiagnosticReports") && !non_mac_text.contains(".ips"), "{non_mac_text}");
+        if cfg!(target_os = "macos") {
+            assert!(text.contains("==== macOS crash reports") && text.contains("--- kiri-2026-10-28-094107.ips ---"), "{text}");
+        } else {
+            assert!(!text.contains("macOS crash reports") && !text.contains("DiagnosticReports") && !text.contains(".ips"), "{text}");
+        }
         assert!(!text.contains("ABCD-1234") && !text.contains(&h), "{text}");
         assert!(text.len() < MAX_BODY);
         let _ = std::fs::remove_dir_all(&home);
@@ -965,5 +1092,52 @@ mod tests {
         assert_eq!(pending(&home, 1_792_800_000), ["1792800000-daemon.txt"]);
         assert!(pending(&home, 1_792_800_001).is_empty());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn report_includes_vm_uplink_dhcp_fallback_udp67_and_guest_console() {
+        let bridge = crate::daemon::vmnet::Bridge { name: "bridge100".into(), gateway: [192, 168, 64, 1], prefix: 24 };
+        let fallback_info = json!({"KiriVmUplink": {"mode": "static-fallback", "bridge": "bridge100", "ip": "192.168.64.2/24", "gateway": "192.168.64.1", "dns": "192.168.64.1", "udp67": "kavd (pid 412)"}});
+        let summary = vm_network_summary(Some(&fallback_info), Some(&bridge), Some("kavd (pid 412)")).unwrap();
+        assert!(summary.contains("VM uplink: static fallback on bridge100 (192.168.64.2/24 via 192.168.64.1, dns 192.168.64.1) — DHCP did not answer"), "{summary}");
+        assert!(summary.contains("Host vmnet bridge: bridge100 (192.168.64.1/24)") && summary.contains("Host UDP port 67: kavd (pid 412)"), "{summary}");
+
+        let ok = vm_network_summary(Some(&json!({"KiriVmUplink": {"mode": "dhcp", "ip": "192.168.64.28", "gateway": "192.168.64.1"}})), Some(&bridge), None).unwrap();
+        assert!(ok.contains("VM uplink: DHCP (192.168.64.28 via 192.168.64.1)") && !ok.contains("UDP port 67"), "{ok}");
+
+        let host_egress = vm_network_summary(Some(&json!({"KiriVmUplink": {"mode": "host-egress"}})), None, None).unwrap();
+        assert!(host_egress.contains("VM uplink: host egress over vsock (shared NAT disabled)") && !host_egress.contains("UDP port 67"), "{host_egress}");
+
+        let fail = vm_network_summary(Some(&json!({"KiriVmUplink": {"mode": "fallback-failed", "reason": "no bridge100"}})), None, None).unwrap();
+        assert!(fail.contains("DHCP did not answer and fallback failed (no bridge100)") && fail.contains("Host UDP port 67: none visible"), "{fail}");
+        assert_eq!(vm_network_summary(None, None, None), None);
+
+        let home = temp_home("vm-net");
+        let state = home.join(".kiri");
+        std::fs::create_dir_all(state.join("logs")).unwrap();
+        std::fs::write(state.join("logs/guest-console.log"), "kiri-init: DHCP did not answer; configured eth0 statically as 192.168.64.2/24 via 192.168.64.1 from host\n").unwrap();
+        let facts = Facts { engine: "running".into(), crash_reports: false, created: UNIX_EPOCH + Duration::from_secs(1_792_800_000), containers: None, vm_network: Some(summary), storage_warning: Some("Kiri's WSL2 disk (ext4.vhdx) was remounted read-only by Linux (emergency_ro)".into()) };
+        let text = assemble(&home, &state, &facts, &Redactor::new(Some(home.display().to_string()), Vec::new()));
+        assert!(text.contains("Storage:  Kiri's WSL2 disk (ext4.vhdx) was remounted read-only by Linux (emergency_ro)"), "{text}");
+        assert!(text.contains("VM uplink: static fallback on bridge100") && text.contains("Host UDP port 67: kavd (pid 412)"), "{text}");
+        assert!(text.contains("==== Guest console (~/.kiri/logs/guest-console.log) ====") && text.contains("configured eth0 statically as 192.168.64.2/24"), "{text}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolves_windows_out_path_in_wsl() {
+        let wsl = crate::daemon::binds::Wsl { root: "/mnt/".into(), distro: Some("kiri".into()) };
+        assert_eq!(
+            resolve_out_path(Some(PathBuf::from(r"C:\Temp\kiri-test-report.txt")), Some(&wsl)).unwrap(),
+            PathBuf::from("/mnt/c/Temp/kiri-test-report.txt")
+        );
+        assert_eq!(
+            resolve_out_path(Some(PathBuf::from("D:/reports/out.txt")), Some(&wsl)).unwrap(),
+            PathBuf::from("/mnt/d/reports/out.txt")
+        );
+        assert_eq!(
+            resolve_out_path(Some(PathBuf::from("/tmp/kiri-report.txt")), Some(&wsl)).unwrap(),
+            PathBuf::from("/tmp/kiri-report.txt")
+        );
     }
 }

@@ -6,6 +6,10 @@
 //! `IPAM.Config` (`--subnet`, `--gateway`, `--ip-range`, `--aux-address`)
 //! picks them instead, and containers may then ask for fixed addresses.
 //!
+//! On a Linux host the pool keeps clear of the host's own networks, and of
+//! the ones Docker Engine there brings back when it starts; a network whose
+//! subnet one of them takes later moves, or is refused (`Network::settle`).
+//!
 //! `--ipv6` (Compose `enable_ipv6`) adds an IPv6 subnet beside the IPv4 one:
 //! an IPv6 `IPAM.Config` entry, or a /64 from Kiri's own ULA pool (a /48
 //! under fd00::/8 per engine), as Docker's default address pools hand out.
@@ -93,7 +97,12 @@ pub fn parse_ip6(s: &str) -> Option<[u8; 16]> {
 }
 
 fn mask6(prefix: u8) -> u128 {
-    if prefix == 0 { 0 } else { u128::MAX << (128 - prefix as u32) }
+    match prefix {
+        // Not parsed this way (and never serialized), but `networks.json`
+        // holds plain bytes and a bad one must not panic the shifts.
+        0 | 129.. => 0,
+        p => u128::MAX << (128 - p as u32),
+    }
 }
 
 pub fn in_subnet6(ip: [u8; 16], subnet: [u8; 16], prefix: u8) -> bool {
@@ -135,8 +144,13 @@ impl V6 {
         let base = u128::from_be_bytes(self.subnet);
         let (first, last) = match self.ip_range {
             Some((r, p)) => {
-                let start = u128::from_be_bytes(r) - base;
-                (start.max(1), (start + !mask6(p)).min(self.last()))
+                // `wrapping_sub` and `saturating_add` because `networks.json`
+                // holds plain bytes: an ip-range outside the subnet, or a span
+                // past the top of the address space, must not panic or wrap
+                // into a wrong range (the request path checks both; an old or
+                // hand-edited file may not).
+                let start = u128::from_be_bytes(r).wrapping_sub(base);
+                (start.max(1), start.saturating_add(!mask6(p)).min(self.last()))
             }
             None => (1, self.last()),
         };
@@ -146,7 +160,7 @@ impl V6 {
             if h > last {
                 return None;
             }
-            let ip = (base + h).to_be_bytes();
+            let ip = base.checked_add(h)?.to_be_bytes();
             if !self.used.contains(&h) && !self.reserved(ip) && !avoid.contains(&ip) {
                 self.used.insert(h);
                 return Some(ip);
@@ -189,18 +203,30 @@ impl Network {
     /// The next free address, skipping the network, broadcast, gateway and
     /// auxiliary addresses and `avoid`; only from `--ip-range` when one is set.
     fn allocate_avoiding(&mut self, avoid: &[[u8; 4]]) -> Option<[u8; 4]> {
-        let base = u32::from_be_bytes(self.subnet);
-        let size = 1u32 << (32 - self.prefix as u32);
+        let base = u32::from_be_bytes(self.subnet) as u64;
+        // In `u64`, with the size clamped, because `networks.json` holds plain
+        // bytes: a prefix past /32 (or the /0 the request path refuses) must
+        // not panic the shift, and a subnet too small for host parts must run
+        // out of addresses, not underflow. The request path already checks
+        // both (`parse_ipam`, /8..=/30).
+        let size = 1u64 << (32 - self.prefix.min(32) as u32);
+        let max_host = size.saturating_sub(2).min((u32::MAX as u64).saturating_sub(base));
         let (first, last) = match self.ip_range {
             Some((r, p)) => {
-                let start = u32::from_be_bytes(r) - base;
-                (start.max(1), (start + (1u32 << (32 - p as u32)) - 1).min(size - 2))
+                let start = (u32::from_be_bytes(r).wrapping_sub(base as u32)) as u64;
+                (start.max(1), (start + (1u64 << (32 - p.min(32) as u32)) - 1).min(max_host))
             }
-            None => (1, size - 2),
+            None => (1, max_host),
         };
-        let host = (first..=last).find(|h| !self.used.contains(h) && !self.reserved((base + h).to_be_bytes()) && !avoid.contains(&(base + h).to_be_bytes()))?;
+        let host = (first..=last).find(|h| {
+            // An address past the end of the space (`base + h` over u32) is no
+            // address to hand out.
+            let Ok(ip) = u32::try_from(base + h).map(|a| a.to_be_bytes()) else { return false };
+            !self.used.contains(&(*h as u32)) && !self.reserved(ip) && !avoid.contains(&ip)
+        })?;
+        let host = u32::try_from(host).ok()?;
         self.used.insert(host);
-        Some((base + host).to_be_bytes())
+        u32::try_from(base + host as u64).ok().map(|a| a.to_be_bytes())
     }
 
     /// Whether a container may ask for `ip` here (`--ip`, Compose
@@ -216,8 +242,8 @@ impl Network {
         if !self.user_subnet {
             return Err("user specified IP address is supported only when connecting to networks with user configured subnets".into());
         }
-        let size = 1u32 << (32 - self.prefix as u32);
-        let host = u32::from_be_bytes(ip).wrapping_sub(u32::from_be_bytes(self.subnet));
+        let size = 1u64 << (32 - self.prefix.min(32) as u32);
+        let host = u32::from_be_bytes(ip).wrapping_sub(u32::from_be_bytes(self.subnet)) as u64;
         if !self.contains(ip) || host == 0 || host == size - 1 {
             return Err(format!("no configured subnet or ip-range contain the IP address {}", ip_str(ip)));
         }
@@ -257,7 +283,7 @@ impl Network {
     /// Takes `ip` for a container that asked for it.
     fn reserve(&mut self, ip: [u8; 4]) -> Result<(), String> {
         self.check_static(ip)?;
-        let host = u32::from_be_bytes(ip) - u32::from_be_bytes(self.subnet);
+        let host = u32::from_be_bytes(ip).wrapping_sub(u32::from_be_bytes(self.subnet));
         if self.reserved(ip) || !self.used.insert(host) {
             return Err(format!("Address already in use: {}", ip_str(ip)));
         }
@@ -414,7 +440,9 @@ pub struct Ipam {
 }
 
 pub fn in_subnet(ip: [u8; 4], subnet: [u8; 4], prefix: u8) -> bool {
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix as u32) };
+    // `min(32)` because `networks.json` holds plain bytes; a prefix past /32
+    // must not panic the shift (the request path already refuses one).
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix.min(32) as u32) };
     u32::from_be_bytes(ip) & mask == u32::from_be_bytes(subnet)
 }
 
@@ -523,10 +551,11 @@ pub fn parse_ipam_both(v: &serde_json::Value) -> Result<(Option<Ipam>, Option<Ip
         let field = |k: &str| c[k].as_str().unwrap_or("").to_owned();
         let subnet = field("Subnet");
         if subnet.contains(':') {
+            let parsed = parse_ipam6(c, &subnet)?;
             if out6.is_some() {
                 return Err("Kiri supports one IPv6 subnet per network".into());
             }
-            out6 = Some(parse_ipam6(c, &subnet)?);
+            out6 = Some(parsed);
             continue;
         }
         if subnet.is_empty() {
@@ -535,10 +564,10 @@ pub fn parse_ipam_both(v: &serde_json::Value) -> Result<(Option<Ipam>, Option<Ip
             }
             return Err("invalid network config: an IP range or gateway needs a subnet".into());
         }
+        let (net, prefix) = parse_cidr(&subnet, "subnet")?;
         if out.is_some() {
             return Err("Kiri supports one IPv4 subnet per network".into());
         }
-        let (net, prefix) = parse_cidr(&subnet, "subnet")?;
         if prefix > 30 || prefix < 8 {
             return Err(format!("invalid subnet {subnet}: Kiri supports prefixes from /8 to /30"));
         }
@@ -583,11 +612,32 @@ impl Networks {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e),
         };
-        // 172.17.0.0/16 as Docker uses, unless the host already routes it
-        // (Kiri on a Linux host inside another engine's container) or a
-        // saved network has it.
+        // A saved network whose subnet the host has taken since (Docker
+        // started while Kiri was stopped), or Docker will take back when it
+        // starts, moves off it; one whose subnet the user gave is refused at
+        // its next container if the host holds it (#489).
+        let host = host_networks();
+        let mut saved = saved;
+        let mut moved = false;
+        for i in 0..saved.len() {
+            let taken: Vec<([u8; 4], u8)> = saved.iter().enumerate().filter(|(j, n)| *j != i && !n.bridge.is_empty()).map(|(_, n)| (n.subnet, n.prefix)).collect();
+            let n = &mut saved[i];
+            match n.settle(&taken, &host) {
+                Ok(Some(was)) => {
+                    crate::diag::warn!("network moved off a subnet the host has taken", network = n.name, from = was, to = n.subnet_str());
+                    moved = true;
+                }
+                Ok(None) => {}
+                Err(e) => crate::diag::warn!("network's subnet is taken on the host", error = e),
+            }
+        }
+        // 172.17.0.0/16 as Docker uses, unless the host is already on it
+        // (Kiri on a Linux host inside another engine's container), Docker
+        // here will take it back when it starts, or a saved network has it.
+        // Chosen afresh at each start: never saved, as Docker's own default
+        // bridge is not.
         let taken: Vec<([u8; 4], u8)> = saved.iter().map(|n| (n.subnet, n.prefix)).collect();
-        let (subnet, prefix) = free_subnet(&taken, true).unwrap_or(([172, 17, 0, 0], 16));
+        let (subnet, prefix) = default_bridge_subnet(&taken, &host)?;
         let mut bridge = builtin("bridge", "bridge", "kiri0", subnet, [subnet[0], subnet[1], subnet[2], 1]);
         bridge.prefix = prefix;
         // `KIRI_BRIDGE_IPV6=1`, as Docker's daemon.json `"ipv6": true`: the
@@ -602,7 +652,42 @@ impl Networks {
         }
         let mut list = vec![bridge, builtin("host", "host", "", [0; 4], [0; 4]), builtin("none", "null", "", [0; 4], [0; 4])];
         list.extend(saved);
-        Ok(Networks { list, path, ula })
+        let networks = Networks { list, path, ula };
+        if moved {
+            networks.save();
+        }
+        Ok(networks)
+    }
+
+    /// Before a network's first container: its subnet checked against the
+    /// host's once more (`Network::settle`), as the host may have taken it
+    /// since it was chosen. Bridges are made at a network's first container,
+    /// so Docker started after Kiri, or at boot before Kiri's containers
+    /// came back, may hold it by then. Nothing to do while containers are
+    /// on it (their bridge, and its route, came first), off a Linux host
+    /// (Kiri's VM has its own network), or for host and none.
+    pub fn settle(&mut self, key: &str) -> Result<(), String> {
+        if self.find(key).is_none_or(|n| n.bridge.is_empty() || !n.used.is_empty()) {
+            return Ok(());
+        }
+        self.settle_with(key, &host_networks())
+    }
+
+    fn settle_with(&mut self, key: &str, host: &[HostNet]) -> Result<(), String> {
+        let Some(n) = self.find(key) else { return Ok(()) };
+        if n.bridge.is_empty() || !n.used.is_empty() || host.is_empty() {
+            return Ok(());
+        }
+        let name = n.name.clone();
+        let taken: Vec<([u8; 4], u8)> = self.list.iter().filter(|o| !o.bridge.is_empty() && o.name != name).map(|o| (o.subnet, o.prefix)).collect();
+        let Some(n) = self.find_mut(&name) else { return Ok(()) };
+        let Some(was) = n.settle(&taken, host)? else { return Ok(()) };
+        crate::diag::warn!("network moved off a subnet the host has taken", network = name, from = was, to = n.subnet_str());
+        let saved = !n.builtin();
+        if saved {
+            self.save();
+        }
+        Ok(())
     }
 
     fn save(&self) {
@@ -628,7 +713,7 @@ impl Networks {
             .or_else(|| self.list.iter().find(|n| key.len() >= 6 && n.id.starts_with(key)))
     }
 
-    fn find_mut(&mut self, name: &str) -> Option<&mut Network> {
+    pub(super) fn find_mut(&mut self, name: &str) -> Option<&mut Network> {
         self.list.iter_mut().find(|n| n.name == name)
     }
 
@@ -688,9 +773,7 @@ impl Networks {
                 used: BTreeSet::new(),
             })
         } else {
-            if s.ipam6.is_some() {
-                return Err("invalid network config: an IPv6 subnet needs IPv6 enabled (--ipv6, Compose enable_ipv6: true)".into());
-            }
+            // An IPv6 IPAM entry without --ipv6 is ignored, as Docker does (#433).
             None
         };
         let index = (1..).find(|i| !self.list.iter().any(|n| n.bridge == format!("kiri{i}"))).expect("unbounded");
@@ -778,19 +861,267 @@ impl Networks {
     }
 }
 
+/// The default bridge's subnet, or an error when the whole pool is taken:
+/// falling back to 172.17.0.0/16 anyway would hand out a subnet the host
+/// already routes (#489), so the daemon fails to start loudly instead.
+fn default_bridge_subnet(taken: &[([u8; 4], u8)], host: &[HostNet]) -> io::Result<([u8; 4], u8)> {
+    free_subnet_with(taken, true, host).ok_or_else(|| io::Error::other(NO_FREE_SUBNET))
+}
+
+const NO_FREE_SUBNET: &str = "no free subnet for the default bridge: 172.17.0.0/16 … 172.31.0.0/16 and 10.89.0.0/24 … 10.89.255.0/24 are all routed on this host or used by another network";
+
 /// The first free subnet: 172.17.0.0/16 (only for the default bridge), then
 /// 172.18.0.0/16 … 172.31.0.0/16, then 10.89.N.0/24, skipping ones Kiri
-/// already uses and ones on the host's own links.
+/// already uses and ones on the host's own links and interfaces.
 fn free_subnet(taken: &[([u8; 4], u8)], default_bridge: bool) -> Option<([u8; 4], u8)> {
-    let routes = host_routes();
+    free_subnet_with(taken, default_bridge, &host_networks())
+}
+
+/// The first free subnet against `host`'s networks, as `free_subnet` does
+/// against the live host's. Split out so tests can feed it a host.
+fn free_subnet_with(taken: &[([u8; 4], u8)], default_bridge: bool, host: &[HostNet]) -> Option<([u8; 4], u8)> {
     let first = if default_bridge { 17 } else { 18 };
     (first..=31u8)
         .map(|b| ([172, b, 0, 0], 16u8))
         .chain((0..=255u8).map(|c| ([10, 89, c, 0], 24u8)))
-        .find(|(s, p)| {
-            let (net, mask) = (u32::from_be_bytes(*s), u32::MAX << (32 - p));
-            !taken.iter().any(|t| overlaps(*t, (*s, *p))) && !routes.iter().any(|(rn, rm)| (net & rm) == *rn || (rn & mask) == net)
-        })
+        .find(|(s, p)| !taken.iter().any(|t| overlaps(*t, (*s, *p))) && !host.iter().any(|h| h.overlaps(*s, *p)))
+}
+
+/// A subnet the host itself is on, outside Kiri's bridges: an on-link route
+/// or an interface's address, and the interface it is on. Or one Docker
+/// will take back when it starts (`docker_saved`): not on the host now.
+#[derive(Debug, Clone, Eq)]
+struct HostNet {
+    net: u32,
+    mask: u32,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    addr: [u8; 4],
+    dev: String,
+    saved: bool,
+}
+
+impl PartialEq for HostNet {
+    fn eq(&self, other: &Self) -> bool {
+        (self.net, self.mask, &self.dev, self.saved) == (other.net, other.mask, &other.dev, other.saved)
+    }
+}
+
+fn mask4(prefix: u8) -> u32 {
+    if prefix == 0 { 0 } else { u32::MAX << (32 - prefix.min(32) as u32) }
+}
+
+impl HostNet {
+    fn new(dev: &str, addr: [u8; 4], mask: u32) -> HostNet {
+        HostNet { net: u32::from_be_bytes(addr) & mask, mask, addr, dev: dev.to_owned(), saved: false }
+    }
+
+    /// Shares any address with `subnet`: a new subnet keeps clear of it.
+    fn overlaps(&self, subnet: [u8; 4], prefix: u8) -> bool {
+        let net = u32::from_be_bytes(subnet);
+        (net & self.mask) == self.net || (self.net & mask4(prefix)) == net
+    }
+
+    /// Lies inside `subnet` (or is it), so the host routes that part of it,
+    /// `gateway` included when it is in it, to `dev` and not to Kiri's
+    /// bridge: the kernel picks the more specific route, and of two equal
+    /// ones the older. A host network around Kiri's leaves it working.
+    fn inside(&self, subnet: [u8; 4], prefix: u8) -> bool {
+        self.mask >= mask4(prefix) && (self.net & mask4(prefix)) == u32::from_be_bytes(subnet)
+    }
+
+    fn contains(&self, ip: [u8; 4]) -> bool {
+        u32::from_be_bytes(ip) & self.mask == self.net
+    }
+
+    fn cidr(&self) -> String {
+        format!("{}/{}", ip_str(self.net.to_be_bytes()), self.mask.count_ones())
+    }
+}
+
+impl Network {
+    /// A subnet a host network has taken since it was chosen (#489): Docker
+    /// started while Kiri was stopped, or before this network's first
+    /// container, and its docker0 or br-… holds it now. A subnet from the
+    /// pool (the default bridge's, or one made without `--subnet`) moves to
+    /// a free one: no container can have asked for an address on it, and
+    /// each gets a new one when it starts, as its address is handed out
+    /// then. A subnet the user gave stays (as Docker keeps it), unless the
+    /// host's network takes its gateway's part: then nothing on it would
+    /// work, and its containers are refused with the reason. Returns what
+    /// moved, for the log.
+    fn settle(&mut self, taken: &[([u8; 4], u8)], host: &[HostNet]) -> Result<Option<String>, String> {
+        if self.bridge.is_empty() || self.no_ipv4 {
+            return Ok(None);
+        }
+        let inside: Vec<&HostNet> = host.iter().filter(|h| h.inside(self.subnet, self.prefix)).collect();
+        let Some(h) = inside.first() else { return Ok(None) };
+        // Only a network on the host now breaks this one now; one Docker
+        // saved is reason to move a pool subnet before it does, not to
+        // refuse the user's.
+        let shadowed = inside.iter().find(|h| !h.saved && h.contains(self.gateway));
+        let refuse = |h: &HostNet| {
+            format!(
+                "network {}'s subnet {} is also on this host's interface {} ({}), another engine's network (Docker's docker0 or br-…, say), so its containers could not reach their gateway {}. Remove that network, or make {} again with another --subnet",
+                self.name,
+                self.subnet_str(),
+                h.dev,
+                h.cidr(),
+                ip_str(self.gateway),
+                self.name
+            )
+        };
+        if self.user_subnet {
+            return match shadowed {
+                Some(h) => Err(refuse(h)),
+                None => Ok(None),
+            };
+        }
+        let Some((s, p)) = free_subnet_with(taken, self.name == "bridge", host) else {
+            return match shadowed {
+                Some(h) => Err(refuse(h)),
+                None => Ok(None),
+            };
+        };
+        let was = format!("{} ({} {} as {})", self.subnet_str(), if h.saved { "Docker keeps" } else { "on" }, h.dev, h.cidr());
+        self.subnet = s;
+        self.prefix = p;
+        self.gateway = [s[0], s[1], s[2], 1];
+        Ok(Some(was))
+    }
+}
+
+/// The host's own networks: its on-link routes plus the subnets its
+/// interfaces have addresses on, outside Kiri's bridges. Only a Linux host
+/// shares its routing table and interfaces with Kiri.
+#[cfg(target_os = "linux")]
+fn host_networks() -> Vec<HostNet> {
+    let mut out = on_link_routes(&std::fs::read_to_string("/proc/net/route").unwrap_or_default());
+    out.extend(host_addrs());
+    out.extend(docker_saved());
+    out
+}
+
+/// The bridges Docker Engine on this host will bring back when it starts
+/// (docker0 and its networks), as its store keeps them: dockerd restores
+/// each with its saved address and never looks at what else is on the host
+/// then (moby daemon/libnetwork/drivers/bridge/bridge_store.go,
+/// populateNetworks; for docker0, daemon/daemon_unix.go, selectBIP, takes
+/// the address docker0 has). A Kiri network on one of them while Docker is
+/// stopped would break Docker's, or Kiri's, when Docker starts. Only its
+/// very first start picks a subnet around what the host has.
+#[cfg(target_os = "linux")]
+fn docker_saved() -> Vec<HostNet> {
+    // daemon.json's data-root, else /var/lib/docker; the snap's own.
+    let root = std::fs::read("/etc/docker/daemon.json")
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["data-root"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "/var/lib/docker".into());
+    let mut out = Vec::new();
+    for dir in [root.as_str(), "/var/snap/docker/common/var-lib-docker"] {
+        let path = std::path::Path::new(dir).join("network/files/local-kv.db");
+        match std::fs::File::open(&path) {
+            Ok(f) => {
+                use std::io::Read;
+                let mut b = Vec::new();
+                // A few dozen KiB for a few networks.
+                if f.take(16 << 20).read_to_end(&mut b).is_ok() {
+                    out.extend(docker_bridges(&b));
+                }
+            }
+            // A store Kiri can't read (not root): Docker's default.
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => out.push(HostNet { saved: true, ..HostNet::new("docker0", [172, 17, 0, 1], mask4(16)) }),
+            Err(_) => {}
+        }
+    }
+    out
+}
+
+/// Docker's saved bridges in its store's bytes. The store is a bbolt file;
+/// each bridge network's configuration is a JSON object in it, written by
+/// moby's networkConfiguration.MarshalJSON with sorted keys, so its
+/// `"AddressIPv4":"172.17.0.1/16"` comes just before its `"BridgeName"`.
+/// A copy bbolt has not reused yet may still be there after the network
+/// went: a subnet more to keep clear of, and nothing worse.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn docker_bridges(b: &[u8]) -> Vec<HostNet> {
+    const ADDR: &[u8] = b"\"AddressIPv4\":\"";
+    const NAME: &[u8] = b"\"BridgeName\":\"";
+    let quoted = |at: usize| b.get(at..).and_then(|r| r.iter().position(|c| *c == b'"').map(|end| String::from_utf8_lossy(&r[..end]).into_owned()));
+    let mut out: Vec<HostNet> = Vec::new();
+    let mut i = 0;
+    while let Some(off) = b.get(i..).and_then(|r| r.windows(ADDR.len()).position(|w| w == ADDR)) {
+        i += off + ADDR.len();
+        let Some(cidr) = quoted(i) else { break };
+        let parsed = cidr.split_once('/').and_then(|(a, p)| Some((parse_ip(a)?, p.parse::<u8>().ok().filter(|p| (8..=32).contains(p))?)));
+        let Some((ip, prefix)) = parsed else { continue };
+        let window = &b[i..(i + 512).min(b.len())];
+        let dev = window.windows(NAME.len()).position(|w| w == NAME).and_then(|o| quoted(i + o + NAME.len())).filter(|n| !n.is_empty()).unwrap_or_else(|| "a Docker bridge".into());
+        let h = HostNet { saved: true, ..HostNet::new(&dev, ip, mask4(prefix)) };
+        if !out.contains(&h) {
+            out.push(h);
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_networks() -> Vec<HostNet> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn host_interface_ipv4() -> Vec<(String, std::net::Ipv4Addr)> {
+    host_addrs().into_iter().map(|h| (h.dev, std::net::Ipv4Addr::from(h.addr))).collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn host_interface_ipv4() -> Vec<(String, std::net::Ipv4Addr)> {
+    Vec::new()
+}
+
+/// The subnets this machine's interfaces have addresses on, outside Kiri's
+/// bridges and loopback. An address stays on an interface whose route is
+/// gone (a `noprefixroute` one) or not yet there, so this catches what the
+/// routing table misses.
+#[cfg(target_os = "linux")]
+fn host_addrs() -> Vec<HostNet> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `list`, freed below; entries are read only while it lives.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    let mut p = list;
+    while !p.is_null() {
+        // SAFETY: `p` is non-null and an entry of the list getifaddrs returned.
+        let Some(ifa) = (unsafe { p.as_ref() }) else { break };
+        // SAFETY: ifa_addr is checked non-null before its family is read.
+        if !ifa.ifa_addr.is_null() && !ifa.ifa_netmask.is_null() && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET {
+            // SAFETY: an AF_INET address and netmask are sockaddr_in.
+            let a = unsafe { (*(ifa.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr }.to_ne_bytes();
+            let m = unsafe { (*(ifa.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr }.to_ne_bytes();
+            // SAFETY: the interface name is NUL-terminated by getifaddrs.
+            let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
+            entries.push((name, a, m));
+        }
+        p = ifa.ifa_next;
+    }
+    // SAFETY: the list getifaddrs returned, freed once.
+    unsafe { libc::freeifaddrs(list) };
+    interface_networks(entries)
+}
+
+/// The network of each interface address, skipping Kiri's own bridges and
+/// loopback: a bridge Kiri made earlier is its own business, and
+/// 127.0.0.0/8 never overlaps the pool.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn interface_networks(entries: Vec<(String, [u8; 4], [u8; 4])>) -> Vec<HostNet> {
+    entries
+        .into_iter()
+        .filter(|(name, a, _)| !name.starts_with("kiri") && name != "lo" && a[0] != 127)
+        .map(|(name, a, m)| HostNet::new(&name, a, u32::from_be_bytes(m)))
+        .collect()
 }
 
 /// The host's own IPv6 routes, outside Kiri's bridges, the default route
@@ -819,19 +1150,14 @@ fn host_routes6() -> Vec<([u8; 16], u8)> {
     Vec::new()
 }
 
-/// The host's on-link routes as (network, mask), outside Kiri's bridges.
-/// Only a Linux host shares its routing table with Kiri.
-#[cfg(target_os = "linux")]
-fn host_routes() -> Vec<(u32, u32)> {
-    on_link_routes(&std::fs::read_to_string("/proc/net/route").unwrap_or_default())
-}
-
 /// The routes in `/proc/net/route`'s text that put the host on a subnet, as
 /// Docker reserves them since 23.0 (moby#42598): not one through a gateway
 /// (OpenVPN's 0.0.0.0/1 and 128.0.0.0/1), an unreachable or prohibit one, or
-/// one to 0.0.0.0 (the default route, a WireGuard 0.0.0.0/1).
+/// one to 0.0.0.0 (the default route, a WireGuard 0.0.0.0/1). Kiri's own
+/// bridges' routes are left out. A bridge with no carrier (Docker's docker0
+/// with no containers) keeps its route, marked linkdown: it is here too.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn on_link_routes(text: &str) -> Vec<(u32, u32)> {
+fn on_link_routes(text: &str) -> Vec<HostNet> {
     const RTF_GATEWAY: u32 = 0x2;
     text.lines()
         .skip(1)
@@ -844,14 +1170,9 @@ fn on_link_routes(text: &str) -> Vec<(u32, u32)> {
             // Little-endian hex, as the kernel prints them.
             let dest = u32::from_str_radix(f[1], 16).ok()?.swap_bytes();
             let mask = u32::from_str_radix(f[7], 16).ok()?.swap_bytes();
-            (dest != 0).then_some((dest & mask, mask))
+            (dest != 0).then(|| HostNet::new(f[0], dest.to_be_bytes(), mask))
         })
         .collect()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn host_routes() -> Vec<(u32, u32)> {
-    Vec::new()
 }
 
 #[cfg(test)]
@@ -890,6 +1211,106 @@ mod tests {
         assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "IPRange": "10.5.0.0/16"})).contains("ip-range"));
         assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "AuxiliaryAddresses": {"a": "10.9.0.1"}})).contains("auxiliary address a"));
         assert!(parse_ipam(&serde_json::json!({"Driver": "other"})).is_err());
+        // A subnet too small for the arithmetic (a /0 could panic the size
+        // shift; a /31 or /32 has no room for a gateway and a container) and
+        // an ip-range outside the subnet are refused, as Docker does.
+        assert_eq!(bad(serde_json::json!({"Subnet": "0.0.0.0/0"})), "invalid subnet 0.0.0.0/0: Kiri supports prefixes from /8 to /30");
+        assert_eq!(bad(serde_json::json!({"Subnet": "10.5.0.0/31"})), "invalid subnet 10.5.0.0/31: Kiri supports prefixes from /8 to /30");
+        assert_eq!(bad(serde_json::json!({"Subnet": "10.5.0.0/32"})), "invalid subnet 10.5.0.0/32: Kiri supports prefixes from /8 to /30");
+        assert!(bad(serde_json::json!({"Subnet": "10.5.0.0/24", "IPRange": "10.6.0.0/24"})).contains("parent subnet 10.5.0.0/24 does not contain ip-range"));
+    }
+
+    /// A /30, the smallest user subnet the request path takes, still creates
+    /// and hands out its one container address; its `--ip-range` picks it.
+    #[test]
+    fn the_smallest_allowed_subnet_still_creates_and_allocates() {
+        let (mut n, dir) = nets();
+        let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": "10.6.0.0/30", "IPRange": "10.6.0.2/32"}]})).unwrap().unwrap();
+        let net = n.create("tiny", Settings { ipam: Some(ipam), ..Default::default() }).unwrap();
+        assert_eq!((net.subnet, net.prefix), ([10, 6, 0, 0], 30));
+        assert!(net.check_static([10, 6, 0, 2]).is_ok());
+        assert!(net.check_static([10, 6, 0, 0]).is_err());
+        assert!(net.check_static([10, 6, 0, 3]).is_err());
+        assert_eq!(n.allocate_avoiding("tiny", &[]), Some([10, 6, 0, 2]));
+        assert_eq!(n.allocate_avoiding("tiny", &[]), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Malformed or hand-edited `networks.json` records (prefixes at 0 or past
+    /// /32 and /128, out-of-subnet `ip_range`s, or unaligned subnets near
+    /// `u32::MAX` / `u128::MAX`) never panic shifts or wrap into bad addresses.
+    #[test]
+    fn malformed_saved_network_fields_do_not_panic_or_hand_out_bad_ips() {
+        assert_eq!(mask6(0), 0);
+        assert_eq!(mask6(64), u128::MAX << 64);
+        assert_eq!(mask6(128), u128::MAX);
+        assert_eq!(mask6(129), 0);
+        assert_eq!(mask6(255), 0);
+        assert!(!in_subnet6([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], [0xfd, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 200));
+
+        assert!(in_subnet([10, 5, 0, 1], [10, 5, 0, 1], 33));
+        assert!(!in_subnet([10, 5, 0, 2], [10, 5, 0, 1], 200));
+        assert_eq!(mask4(200), u32::MAX);
+
+        // IPv4: prefixes /31, /32, /33, /255 never underflow `size - 2` or panic shifts.
+        for bad_prefix in [31u8, 32, 33, 255] {
+            let mut n = net(Some(Ipam { subnet: [10, 5, 0, 0], prefix: 24, gateway: None, ip_range: None, aux: BTreeMap::new() }));
+            n.prefix = bad_prefix;
+            assert_eq!(n.allocate_avoiding(&[]), None, "prefix /{bad_prefix}");
+            assert!(n.check_static([10, 5, 0, 0]).is_err(), "prefix /{bad_prefix}");
+            assert!(n.check_static([10, 5, 0, 1]).is_err(), "prefix /{bad_prefix}");
+        }
+
+        // IPv4: /0 and unaligned subnet near `u32::MAX` never panic, wrap, or spin.
+        let mut slash0 = net(Some(Ipam { subnet: [0, 0, 0, 0], prefix: 24, gateway: Some([0, 0, 0, 1]), ip_range: None, aux: BTreeMap::new() }));
+        slash0.subnet = [0, 0, 0, 0];
+        slash0.prefix = 0;
+        assert_eq!(slash0.allocate_avoiding(&[]), Some([0, 0, 0, 2]));
+        assert!(slash0.check_static([0, 0, 0, 0]).is_err());
+        assert!(slash0.check_static([255, 255, 255, 255]).is_err());
+        assert!(slash0.check_static([0, 0, 0, 2]).is_ok());
+
+        let mut high4 = net(Some(Ipam { subnet: [10, 5, 0, 0], prefix: 24, gateway: None, ip_range: None, aux: BTreeMap::new() }));
+        high4.subnet = [255, 255, 255, 253];
+        high4.gateway = [255, 255, 255, 254];
+        high4.prefix = 0;
+        assert_eq!(high4.allocate_avoiding(&[]), Some([255, 255, 255, 255]));
+        assert_eq!(high4.allocate_avoiding(&[]), None, "stops at u32::MAX without wrapping or spinning");
+
+        // IPv4: `ip_range` below or above `subnet`, or with prefix > 32.
+        for range in [([10, 4, 0, 0], 24), ([10, 6, 0, 0], 24)] {
+            let mut n = net(Some(Ipam { subnet: [10, 5, 0, 0], prefix: 24, gateway: None, ip_range: Some(range), aux: BTreeMap::new() }));
+            assert_eq!(n.allocate_avoiding(&[]), None, "{range:?}");
+        }
+        let mut bad_rp = net(Some(Ipam { subnet: [10, 5, 0, 0], prefix: 24, gateway: None, ip_range: Some(([10, 5, 0, 9], 200)), aux: BTreeMap::new() }));
+        assert_eq!(bad_rp.allocate_avoiding(&[]), Some([10, 5, 0, 9]));
+        assert_eq!(bad_rp.allocate_avoiding(&[]), None);
+
+        // IPv6: `ip_range` outside `subnet` (below and above, including /0 and /200)
+        // and unaligned `subnet` near `u128::MAX` (`base.checked_add(h)` guard).
+        let mk_v6 = |subnet: [u8; 16], prefix: u8, gateway: [u8; 16], ip_range: Option<([u8; 16], u8)>| V6 {
+            subnet,
+            prefix,
+            gateway,
+            user_subnet: true,
+            ip_range,
+            aux: BTreeMap::new(),
+            used: BTreeSet::new(),
+        };
+        let s5 = parse_ip6("fd00:5::").unwrap();
+        let g5 = parse_ip6("fd00:5::1").unwrap();
+        let s4 = parse_ip6("fd00:4::").unwrap();
+        let s6 = parse_ip6("fd00:6::").unwrap();
+        assert_eq!(mk_v6(s5, 128, g5, None).allocate_avoiding(&[]), None);
+        assert_eq!(mk_v6(s5, 64, g5, Some((s4, 64))).allocate_avoiding(&[]), None);
+        assert_eq!(mk_v6(s5, 0, g5, Some((s4, 64))).allocate_avoiding(&[]), None);
+        assert_eq!(mk_v6(s5, 200, g5, Some((s4, 200))).allocate_avoiding(&[]), None);
+        assert_eq!(mk_v6(s5, 64, g5, Some((s6, 64))).allocate_avoiding(&[]), None);
+
+        let mut near_max = mk_v6((u128::MAX - 2).to_be_bytes(), 64, (u128::MAX - 1).to_be_bytes(), None);
+        assert_eq!(near_max.allocate_avoiding(&[]), Some(u128::MAX.to_be_bytes()));
+        assert_eq!(near_max.allocate_avoiding(&[]), None, "checked_add stops past u128::MAX");
+        assert_eq!(mk_v6([0xff; 16], 64, [0; 16], None).allocate_avoiding(&[]), None);
     }
 
     #[test]
@@ -1004,9 +1425,9 @@ mod tests {
         assert_eq!(kv.subnet_str(), "fc00:f853:ccd:e793::/64");
         assert_eq!(ip6_str(kv.gateway), "fc00:f853:ccd:e793::1");
         assert!(n.create("again", v6(ipam("fc00:f853:ccd:e793::/80"))).unwrap_err().contains("Pool overlaps"));
-        // A subnet without --ipv6 is refused, not dropped.
-        let no = Settings { ipam6: ipam("fd00:9::/64"), ..Default::default() };
-        assert!(n.create("no", no).unwrap_err().contains("IPv6 enabled"));
+        // A subnet without --ipv6 is ignored, not refused (#433).
+        let no = n.create("no", Settings { ipam6: ipam("fd00:9::/64"), ..Default::default() }).unwrap();
+        assert!(no.v6.is_none());
         // Fixed addresses: in the subnet, free, not the gateway.
         let want = parse_ip6("fc00:f853:ccd:e793::10");
         assert_eq!(n.allocate6("kind", want, &[]), Ok(want));
@@ -1028,6 +1449,192 @@ mod tests {
         let got: Vec<String> = (0..4).filter_map(|_| n.allocate6("ranged", None, &[]).unwrap()).map(ip6_str).collect();
         assert_eq!(got, ["fd00:7::40", "fd00:7::41", "fd00:7::42", "fd00:7::43"]);
         assert!(n.allocate6("ranged", None, &[]).unwrap_err().contains("no free IPv6 address"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ipv6_ipam_subnet_is_ignored_when_ipv6_disabled() {
+        let (mut n, dir) = nets();
+        // 1. mailcow-dockerized shape: EnableIPv6=false with IPv4 + IPv6 subnets.
+        let (ipam, ipam6) = parse_ipam_both(&serde_json::json!({
+            "Driver": "default",
+            "Config": [
+                {"Subnet": "172.22.1.0/24"},
+                {"Subnet": "fd4d:6169:6c63:6f77::/64"},
+            ]
+        }))
+        .unwrap();
+        let mailcow = n.create("mailcow", Settings { ipam, ipam6, ipv6: false, ..Default::default() }).unwrap();
+        assert_eq!(mailcow.subnet_str(), "172.22.1.0/24");
+        assert_eq!(ip_str(mailcow.gateway), "172.22.1.1");
+        assert!(mailcow.user_subnet);
+        assert!(mailcow.v6.is_none());
+
+        // 2. EnableIPv6=false with ONLY an IPv6 subnet: auto-allocates IPv4 from pool.
+        let (ipam, ipam6) = parse_ipam_both(&serde_json::json!({
+            "Config": [{"Subnet": "fd4d:6169:6c63:6f77::/64"}]
+        }))
+        .unwrap();
+        assert!(ipam.is_none() && ipam6.is_some());
+        let auto = n.create("v6only-config-off", Settings { ipam, ipam6, ipv6: false, ..Default::default() }).unwrap();
+        assert!(auto.v6.is_none());
+        assert!(!auto.user_subnet);
+        assert_ne!(auto.subnet, [0; 4]);
+        assert!(auto.contains(auto.gateway));
+        assert!(!overlaps((auto.subnet, auto.prefix), (mailcow.subnet, mailcow.prefix)));
+
+        // 3. Malformed IPv6/non-IP subnet strings are still rejected as invalid CIDRs.
+        for cfg in [
+            serde_json::json!({"Config": [{"Subnet": "fd4d::not-a-cidr"}]}),
+            serde_json::json!({"Config": [{"Subnet": "172.22.1.0/24"}, {"Subnet": "fd4d::not-a-cidr"}]}),
+            serde_json::json!({"Config": [{"Subnet": "not-an-ip/64"}]}),
+            serde_json::json!({"Config": [{"Subnet": "172.22.1.0/24"}, {"Subnet": "not-an-ip/64"}]}),
+        ] {
+            let err = parse_ipam_both(&cfg).unwrap_err();
+            assert!(err.contains("invalid CIDR block notation"), "{cfg} -> {err}");
+        }
+
+        // 4. EnableIPv6=true with the same IPv6 subnet still works (was not claimed above).
+        let (ipam, ipam6) = parse_ipam_both(&serde_json::json!({
+            "Config": [
+                {"Subnet": "172.22.2.0/24"},
+                {"Subnet": "fd4d:6169:6c63:6f77::/64"},
+            ]
+        }))
+        .unwrap();
+        let enabled = n.create("mailcow-v6", Settings { ipam, ipam6, ipv6: true, ..Default::default() }).unwrap();
+        assert_eq!(enabled.subnet_str(), "172.22.2.0/24");
+        let kv = enabled.v6.unwrap();
+        assert_eq!(kv.subnet_str(), "fd4d:6169:6c63:6f77::/64");
+        assert_eq!(ip6_str(kv.gateway), "fd4d:6169:6c63:6f77::1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn host(dev: &str, addr: [u8; 4], prefix: u8) -> HostNet {
+        HostNet::new(dev, addr, mask4(prefix))
+    }
+
+    #[test]
+    fn default_bridge_skips_a_subnet_an_interface_address_uses() {
+        // docker0 with 172.17.0.1/16 and no carrier, as in #489: its route
+        // is linkdown, but the address is still configured.
+        let host = interface_networks(vec![
+            ("docker0".into(), [172, 17, 0, 1], [255, 255, 0, 0]),
+            ("lo".into(), [127, 0, 0, 1], [255, 0, 0, 0]),
+            ("lo".into(), [10, 255, 255, 254], [255, 255, 255, 255]),
+            ("kiri0".into(), [172, 18, 0, 1], [255, 255, 0, 0]),
+        ]);
+        assert_eq!(host, [self::host("docker0", [172, 17, 0, 0], 16)]);
+        assert_eq!(default_bridge_subnet(&[], &host).unwrap(), ([172, 18, 0, 0], 16));
+        // Nothing on the host: 172.17.0.0/16, as Docker uses.
+        assert_eq!(default_bridge_subnet(&[], &[]).unwrap(), ([172, 17, 0, 0], 16));
+    }
+
+    /// Docker's store as bbolt keeps it: each bridge network's settings a
+    /// JSON object among binary pages, stale copies included.
+    #[test]
+    fn dockers_saved_bridges_are_read_from_its_store() {
+        let cfg = |addr: &str, name: &str| format!(r#"{{"AddressIPv4":"{addr}","BridgeIfaceCreator":1,"BridgeName":"{name}","DefaultBridge":false}}"#);
+        let mut store = vec![0u8, 1, 2, 0xff];
+        for (a, n) in [("172.17.0.1/16", "docker0"), ("172.18.0.1/16", "br-0123456789ab"), ("172.17.0.1/16", "docker0"), ("nonsense", "x")] {
+            store.extend(cfg(a, n).bytes());
+            store.extend([0u8; 7]);
+        }
+        store.extend(br#"{"AddressIPv4":"10.5.0.1/24"}"#);
+        let saved = docker_bridges(&store);
+        let want = |dev: &str, a: [u8; 4], p: u8| HostNet { saved: true, ..host(dev, a, p) };
+        assert_eq!(saved, [want("docker0", [172, 17, 0, 0], 16), want("br-0123456789ab", [172, 18, 0, 0], 16), want("a Docker bridge", [10, 5, 0, 0], 24)]);
+        assert!(docker_bridges(b"").is_empty() && docker_bridges(br#""AddressIPv4":"172.17"#).is_empty());
+        // The default bridge keeps clear of them, as of a live docker0.
+        assert_eq!(default_bridge_subnet(&[], &saved).unwrap(), ([172, 19, 0, 0], 16));
+    }
+
+    /// Docker stopped with docker0 and a network saved: a pool network on
+    /// one moves before Docker takes it back, but a subnet the user gave
+    /// is not refused for what is not on the host yet.
+    #[test]
+    fn a_subnet_docker_will_take_back_moves_but_is_not_refused() {
+        let (mut n, dir) = nets();
+        let pool = n.create("pool", Settings::default()).unwrap();
+        let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": "172.30.0.0/16"}]})).unwrap();
+        n.create("mine", Settings { ipam, ..Default::default() }).unwrap();
+        let saved = |a: [u8; 4]| HostNet { saved: true, ..host("br-0123456789ab", a, 16) };
+        n.settle_with("mine", &[saved([172, 30, 0, 1])]).unwrap();
+        assert_eq!(n.find("mine").unwrap().subnet_str(), "172.30.0.0/16");
+        n.settle_with("pool", &[saved(pool.gateway)]).unwrap();
+        assert_ne!(n.find("pool").unwrap().subnet, pool.subnet);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_bridge_errors_when_the_pool_is_full() {
+        // Every candidate blocked: 172.17-31 by one /12 route, the 10.89
+        // /24s by one /16. No silent fallback to 172.17.0.0/16 (#489).
+        let host = [host("eth1", [172, 16, 0, 0], 12), host("eth2", [10, 89, 0, 0], 16)];
+        assert!(default_bridge_subnet(&[], &host).is_err());
+    }
+
+    /// Docker started after the default bridge was chosen (while Kiri was
+    /// stopped, or before its first container) and its docker0 holds
+    /// 172.17.0.0/16 now: the default bridge moves before its first
+    /// container, and stays while containers are on it (#489).
+    #[test]
+    fn the_default_bridge_moves_off_a_subnet_the_host_took() {
+        // Subnets as this machine's routes left them at load: compared,
+        // not assumed (a Linux test host may have Docker's networks).
+        let (mut n, dir) = nets();
+        let was = n.find("bridge").unwrap().clone();
+        let docker0 = [host("docker0", was.gateway, was.prefix)];
+        n.settle_with("bridge", &docker0).unwrap();
+        let b = n.find("bridge").unwrap().clone();
+        assert!(!overlaps((b.subnet, b.prefix), (was.subnet, was.prefix)), "{} moved off {}", b.subnet_str(), was.subnet_str());
+        assert_eq!(b.gateway, [b.subnet[0], b.subnet[1], b.subnet[2], 1]);
+        let ip = n.allocate_avoiding("bridge", &[]).unwrap();
+        assert!(b.contains(ip) && ip != b.gateway, "containers get addresses in the new subnet");
+        // With a container on it, its bridge (and route) came first: kept.
+        n.settle_with("default", &[host("docker0", b.gateway, b.prefix)]).unwrap();
+        assert_eq!(n.find("bridge").unwrap().subnet, b.subnet);
+        // Not saved: chosen afresh at each start, as Docker's.
+        assert!(!std::fs::read_to_string(dir.join("networks.json")).unwrap_or_default().contains("kiri0"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A network made without --subnet moves off a subnet the host took
+    /// since, and the move is saved; one with a --subnet the user gave is
+    /// kept, as Docker keeps it, unless the host's network takes its
+    /// gateway's part: then its containers are refused, saying why.
+    #[test]
+    fn saved_networks_move_or_refuse_when_the_host_took_their_subnet() {
+        let (mut n, dir) = nets();
+        let pool = n.create("pool", Settings::default()).unwrap();
+        let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": "172.30.0.0/16"}]})).unwrap();
+        n.create("mine", Settings { ipam, ..Default::default() }).unwrap();
+        let br = host("br-0123456789ab", pool.gateway, pool.prefix);
+        n.settle_with("pool", std::slice::from_ref(&br)).unwrap();
+        let moved = n.find("pool").unwrap().clone();
+        assert!(!br.overlaps(moved.subnet, moved.prefix) && moved.subnet != [172, 17, 0, 0], "{}", moved.subnet_str());
+        assert!(!overlaps((moved.subnet, moved.prefix), (n.find("bridge").unwrap().subnet, 16)) && !overlaps((moved.subnet, moved.prefix), ([172, 30, 0, 0], 16)));
+        // Saved as it is (a load would check it against this machine again).
+        let on_disk: Vec<Network> = serde_json::from_slice(&std::fs::read(dir.join("networks.json")).unwrap()).unwrap();
+        assert_eq!(on_disk.iter().find(|n| n.name == "pool").map(|n| n.subnet), Some(moved.subnet), "saved");
+        // The user's subnet: an equal one on the host takes the gateway.
+        let e = n.settle_with("mine", &[host("br-feedfacecafe", [172, 30, 0, 1], 16)]).unwrap_err();
+        assert!(e.starts_with("network mine's subnet 172.30.0.0/16 is also on this host's interface br-feedfacecafe (172.30.0.0/16)"), "{e}");
+        assert!(e.contains("another --subnet"), "{e}");
+        assert_eq!(n.find("mine").unwrap().subnet_str(), "172.30.0.0/16", "never moved");
+        // A part of it away from the gateway, or a host network around it,
+        // leaves it working: kept, as is a pool network inside a wider one.
+        n.settle_with("mine", &[host("eth1", [172, 30, 9, 1], 24)]).unwrap();
+        let wide = [host("eth1", [moved.subnet[0], 0, 0, 0], 8)];
+        n.settle_with("mine", &wide).unwrap();
+        n.settle_with("pool", &wide).unwrap();
+        assert_eq!((n.find("mine").unwrap().subnet_str(), n.find("pool").unwrap().subnet), ("172.30.0.0/16".to_owned(), moved.subnet));
+        // Nowhere to move to and the gateway taken: refused, not clashing.
+        let full = [host("eth1", moved.gateway, moved.prefix), host("eth2", [172, 16, 0, 0], 12), host("eth3", [10, 89, 0, 0], 16)];
+        let e = n.settle_with("pool", &full).unwrap_err();
+        assert!(e.contains(&format!("could not reach their gateway {}", ip_str(moved.gateway))), "{e}");
+        // host and none have no subnet.
+        n.settle_with("host", &full).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1055,8 +1662,7 @@ mod tests {
             *\t000010AC\t00000000\t0001\t0\t0\t0\t0000F0FF\t0\t0\t0\n\
             eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n\
             kiri1\t000012AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
-        let lan = |a: [u8; 4]| (u32::from_be_bytes(a), u32::MAX << 8);
-        assert_eq!(on_link_routes(text), [lan([10, 8, 0, 0]), lan([192, 168, 1, 0])]);
+        assert_eq!(on_link_routes(text), [host("tun0", [10, 8, 0, 0], 24), host("eth0", [192, 168, 1, 0], 24)]);
     }
 
     #[test]

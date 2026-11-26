@@ -120,14 +120,13 @@ pub const NO_FILE: &str = "Kiri can't find this project's compose file";
 /// `\\server\share\x` (as the `dunce` crate does); any other is as it is.
 pub fn plain_path(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        return PathBuf::from(format!(r"\\{rest}"));
-    }
-    if let Some(rest) = s.strip_prefix(r"\\?\")
-        && rest.as_bytes().get(1) == Some(&b':')
-        && rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
-    {
-        return PathBuf::from(rest);
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case(r"UNC\") {
+            return PathBuf::from(format!(r"\\{}", &rest[4..]));
+        }
+        if rest.as_bytes().get(1) == Some(&b':') && rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
+            return PathBuf::from(rest);
+        }
     }
     p
 }
@@ -144,9 +143,252 @@ pub fn valid_file(f: &str) -> Option<PathBuf> {
     valid_file_from(f, false)
 }
 
+/// Whether `name` is a single valid WSL distro path segment.
+pub fn valid_wsl_distro(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.ends_with(['.', ' '])
+        && !name.contains(['/', '\\', '\0', ':', '*', '?', '"', '<', '>', '|', '@'])
+        && !name.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+}
+
+/// Parses a local WSL Plan9 loopback share (`\\wsl.localhost\<distro>\…`,
+/// `\\wsl$\<distro>\…`, or `\\?\UNC\wsl.localhost\<distro>\…`, with `\` or `/`)
+/// into `(distro, lexical_linux_path)` when `<distro>` is a single valid
+/// distro segment and `..` never climbs above `<distro>`.
+pub fn wsl_unc(f: &str) -> Option<(String, String)> {
+    if f.bytes().any(|b| b.is_ascii_control()) {
+        return None;
+    }
+    let rest = if let Some(after_q) = f.strip_prefix(r"\\?\") {
+        if f.contains('/') || after_q.len() < 4 || !after_q[..4].eq_ignore_ascii_case(r"UNC\") {
+            return None;
+        }
+        after_q[4..].to_owned()
+    } else {
+        let s = f.replace('/', "\\");
+        if s.starts_with(r"\\?\") || s.starts_with(r"\\.\") {
+            return None;
+        }
+        s.strip_prefix(r"\\")?.to_owned()
+    };
+    let (host, after_host) = rest.split_once('\\')?;
+    if !(host.eq_ignore_ascii_case("wsl.localhost") || host.eq_ignore_ascii_case("wsl$")) {
+        return None;
+    }
+    let (distro, inner) = after_host.split_once('\\').unwrap_or((after_host, ""));
+    if !valid_wsl_distro(distro) {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in inner.split('\\') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            seg if seg.contains(':') => return None,
+            seg => parts.push(seg),
+        }
+    }
+    let rel = if parts.is_empty() { "/".to_owned() } else { format!("/{}", parts.join("/")) };
+    Some((distro.to_owned(), rel))
+}
+
+/// Whether two resolved file paths name the same file, including local WSL
+/// UNC spellings (`\\wsl.localhost\Ubuntu\…` and `\\wsl$\ubuntu\…`).
+pub fn same_file_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Some((da, ia)), Some((db, ib))) = (wsl_unc(&a.to_string_lossy()), wsl_unc(&b.to_string_lossy())) {
+        return da.eq_ignore_ascii_case(&db) && ia == ib;
+    }
+    false
+}
+
+/// `[automount] root` from `/etc/wsl.conf` text, normalized to start and end with `/`.
+#[cfg(any(windows, test))]
+pub fn wsl_automount_root(conf: &str) -> String {
+    let mut section = String::new();
+    let mut root = None;
+    for line in conf.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(s) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = s.trim().to_ascii_lowercase();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        if section == "automount" && key.trim().eq_ignore_ascii_case("root") {
+            let value = value.trim().trim_matches(['"', '\'']).trim();
+            if value.starts_with('/') && !value.contains(['\\', ':', '\0']) && !value.bytes().any(|b| b.is_ascii_control()) {
+                root = Some(lexical(value));
+            }
+        }
+    }
+    let mut root = root.unwrap_or_else(|| "/mnt/".to_owned());
+    if !root.ends_with('/') {
+        root.push('/');
+    }
+    root
+}
+
+/// Translates an absolute Linux path from a container's Compose labels inside
+/// WSL `distro` to the Windows path that reaches the same file or folder:
+/// - `<automount_root><drive>[/…]` -> `<DRIVE>:\[…]`
+/// - `/mnt/wsl/kiri/roots/<D>[/…]` -> `\\wsl.localhost\<D>\[…]`
+/// - any other `/…` -> `\\wsl.localhost\<distro>\[…]`
+#[cfg(any(windows, test))]
+pub fn wsl_to_windows(path: &str, distro: &str, automount_root: &str) -> Option<String> {
+    if !path.starts_with('/') || path.starts_with("//") {
+        return None;
+    }
+    if path.contains(['\\', ':', '\0']) || path.bytes().any(|b| b.is_ascii_control()) {
+        return None;
+    }
+    let clean = lexical(path);
+    if clean == "/mnt/wsl/kiri" || clean.starts_with("/mnt/wsl/kiri/") {
+        let rest = clean.strip_prefix("/mnt/wsl/kiri/roots/")?;
+        let (d, inner) = rest.split_once('/').unwrap_or((rest, ""));
+        if !valid_wsl_distro(d) {
+            return None;
+        }
+        return if inner.is_empty() {
+            Some(format!(r"\\wsl.localhost\{d}\"))
+        } else {
+            Some(format!(r"\\wsl.localhost\{d}\{}", inner.replace('/', "\\")))
+        };
+    }
+    let mut root = if automount_root.starts_with('/') { automount_root.to_owned() } else { "/mnt/".to_owned() };
+    if !root.ends_with('/') {
+        root.push('/');
+    }
+    if let Some(after) = clean.strip_prefix(&root) {
+        let b = after.as_bytes();
+        if b.len() == 1 && b[0].is_ascii_alphabetic() {
+            return Some(format!("{}:\\", (b[0] as char).to_ascii_uppercase()));
+        }
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b'/' {
+            let rest = &after[2..];
+            let drive = (b[0] as char).to_ascii_uppercase();
+            return if rest.is_empty() {
+                Some(format!("{drive}:\\"))
+            } else {
+                Some(format!("{drive}:\\{}", rest.replace('/', "\\")))
+            };
+        }
+    }
+    if !valid_wsl_distro(distro) {
+        return None;
+    }
+    if clean == "/" {
+        Some(format!(r"\\wsl.localhost\{distro}\"))
+    } else {
+        Some(format!(r"\\wsl.localhost\{distro}{}", clean.replace('/', "\\")))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn distro_from_mounts(c: &Value) -> Option<String> {
+    for m in c["Mounts"].as_array().into_iter().flatten() {
+        let Some(src) = m["Source"].as_str() else { continue };
+        if let Some(rest) = src.strip_prefix("/mnt/wsl/kiri/roots/") {
+            let d = rest.split('/').next().unwrap_or(rest);
+            if valid_wsl_distro(d) {
+                return Some(d.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// [`projects`], translating Linux Compose label paths on Windows to the
+/// owning WSL distro (`\\wsl.localhost\<distro>\…`) or Windows drive (`C:\…`).
+#[cfg(any(windows, test))]
+pub fn wsl_projects(
+    containers: &Value,
+    distros: &[String],
+    automount: impl Fn(&str) -> String,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<Project> {
+    let has_linux = |s: &str| s.starts_with('/') && !s.starts_with("//");
+    let mut by_linux_label: HashMap<String, (i64, String)> = HashMap::new();
+    let mut by_any: HashMap<String, (i64, String)> = HashMap::new();
+    for c in containers.as_array().into_iter().flatten() {
+        let label = |k: &str| c["Labels"][k].as_str().unwrap_or_default();
+        let name = label(PROJECT);
+        if name.is_empty() {
+            continue;
+        }
+        let Some(d) = c["KiriWslDistro"].as_str().filter(|d| valid_wsl_distro(d)).map(str::to_owned).or_else(|| distro_from_mounts(c)) else {
+            continue;
+        };
+        let created = c["Created"].as_i64().unwrap_or_default();
+        if by_any.get(name).is_none_or(|(t, _)| created >= *t) {
+            by_any.insert(name.to_owned(), (created, d.clone()));
+        }
+        let linux_labelled = has_linux(label(WORKDIR))
+            || label(FILES).split(',').map(str::trim).any(has_linux)
+            || label(ENV_FILES).split(',').map(str::trim).any(has_linux);
+        if linux_labelled && by_linux_label.get(name).is_none_or(|(t, _)| created >= *t) {
+            by_linux_label.insert(name.to_owned(), (created, d));
+        }
+    }
+    let candidates: Vec<&str> = distros.iter().map(String::as_str).filter(|d| valid_wsl_distro(d)).collect();
+    let mut list = projects(containers);
+    for p in &mut list {
+        if !has_linux(&p.dir) && !p.files.iter().any(|f| has_linux(f)) && !p.env_files.iter().any(|e| has_linux(e)) {
+            continue;
+        }
+        let chosen = by_linux_label
+            .get(&p.name)
+            .or_else(|| by_any.get(&p.name))
+            .map(|(_, d)| d.clone())
+            .or_else(|| match candidates.as_slice() {
+                [] => None,
+                [only] => Some((*only).to_owned()),
+                many => {
+                    let probe = p.files.iter().find(|f| has_linux(f)).map(String::as_str).or_else(|| has_linux(&p.dir).then_some(p.dir.as_str()));
+                    probe
+                        .and_then(|lp| {
+                            many.iter().copied().find(|d| {
+                                let mnt = automount(d);
+                                wsl_to_windows(lp, d, &mnt).is_some_and(|w| exists(&w))
+                            })
+                        })
+                        .or(Some(many[0]))
+                        .map(str::to_owned)
+                }
+            });
+        let Some(distro) = chosen else { continue };
+        let mnt = automount(&distro);
+        if has_linux(&p.dir)
+            && let Some(w) = wsl_to_windows(&p.dir, &distro, &mnt)
+        {
+            p.dir = w;
+        }
+        for f in &mut p.files {
+            if has_linux(f)
+                && let Some(w) = wsl_to_windows(f, &distro, &mnt)
+            {
+                *f = w;
+            }
+        }
+        for e in &mut p.env_files {
+            if has_linux(e)
+                && let Some(w) = wsl_to_windows(e, &distro, &mnt)
+            {
+                *e = w;
+            }
+        }
+    }
+    list
+}
+
 /// A network path (`\\host\share\x`, `//host/share/x`, `\\?\UNC\…`, a
 /// `\\.\` device, the Mac's `/net/<host>/…`): reading one makes the system
-/// contact another host.
+/// contact another host. Local WSL Plan9 loopback shares
+/// (`\\wsl.localhost\<distro>\…`, `\\wsl$\<distro>\…`) stay on this machine.
 pub fn remote_path(f: &str) -> bool {
     // macOS mounts another host's exports under /net/<host>/ on first look:
     // checked on the path with `.` and `..` resolved as written (never by
@@ -155,12 +397,14 @@ pub fn remote_path(f: &str) -> bool {
     if n.starts_with("/net/") || n == "/net" {
         return true;
     }
-    let f = f.replace('/', "\\");
+    if wsl_unc(f).is_some() {
+        return false;
+    }
     if let Some(rest) = f.strip_prefix(r"\\?\") {
         let b = rest.as_bytes();
-        return !(b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':');
+        return !(b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || b[2] == b'\\'));
     }
-    f.starts_with(r"\\")
+    f.replace('/', "\\").starts_with(r"\\")
 }
 
 /// An absolute `/` path with `.`, `..` and repeated `/` resolved by its
@@ -495,7 +739,7 @@ static BEFORE: LazyLock<Mutex<Before>> = LazyLock::new(|| Mutex::new(HashMap::ne
 fn remember_before(name: &str, path: &str, disk: Vec<u8>, wrote: &str) {
     let mut before = BEFORE.lock().unwrap_or_else(|e| e.into_inner());
     match before.get_mut(name) {
-        Some((f, _, w)) if f == path && *w == file_hash(&disk) => *w = wrote.to_owned(),
+        Some((f, _, w)) if same_file_path(Path::new(f), Path::new(path)) && *w == file_hash(&disk) => *w = wrote.to_owned(),
         _ => {
             before.insert(name.to_owned(), (path.to_owned(), disk, wrote.to_owned()));
         }
@@ -1904,7 +2148,7 @@ fn run_ran(mut cmd: Command, input: Option<&str>, secs: u64) -> Ran {
 
 /// Kills `child` and every process it started (its own process group; on
 /// Windows, its tree).
-fn kill_tree(child: &mut std::process::Child) {
+fn kill_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(child.id()) {
         // SAFETY: a plain signal to the group this child leads (`process_group(0)`).
@@ -1918,6 +2162,10 @@ fn kill_tree(child: &mut std::process::Child) {
         let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &child.id().to_string()]).creation_flags(0x0800_0000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
     let _ = child.kill();
+}
+
+fn kill_tree(child: &mut std::process::Child) {
+    kill_group(child);
     let _ = child.wait();
 }
 
@@ -1948,8 +2196,61 @@ pub fn merge(mut ran: Vec<Project>, opened: Vec<Project>) -> Vec<Project> {
     ran
 }
 
+#[cfg(windows)]
+fn host_wsl_distros() -> Vec<String> {
+    static DEFAULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let engine = super::distro().filter(|d| valid_wsl_distro(d)).or_else(|| {
+        if let Some(d) = DEFAULT.get() {
+            return Some(d.clone());
+        }
+        let d = crate::setup::distros()?.into_iter().find(|d| valid_wsl_distro(d))?;
+        let _ = DEFAULT.set(d.clone());
+        Some(d)
+    });
+    let mut out = Vec::new();
+    if let Some(d) = engine.as_deref().filter(|d| !d.eq_ignore_ascii_case("kiri")) {
+        out.push(d.to_owned());
+    }
+    for d in crate::wslconfig::enabled_distros() {
+        if valid_wsl_distro(&d) && !out.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
+            out.push(d);
+        }
+    }
+    if let Some(d) = engine.filter(|d| !out.iter().any(|x| x.eq_ignore_ascii_case(d))) {
+        out.push(d);
+    }
+    out
+}
+
+#[cfg(windows)]
+fn host_wsl_automount(distro: &str) -> String {
+    static ROOTS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    let key = distro.to_ascii_lowercase();
+    if let Some(r) = ROOTS.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return r.clone();
+    }
+    let etc = format!(r"\\wsl.localhost\{distro}\etc");
+    match std::fs::read_to_string(format!(r"{etc}\wsl.conf")) {
+        Ok(conf) => {
+            let root = wsl_automount_root(&conf);
+            ROOTS.lock().unwrap_or_else(|e| e.into_inner()).insert(key, root.clone());
+            root
+        }
+        Err(_) if Path::new(&etc).is_dir() => {
+            let root = "/mnt/".to_owned();
+            ROOTS.lock().unwrap_or_else(|e| e.into_inner()).insert(key, root.clone());
+            root
+        }
+        Err(_) => "/mnt/".to_owned(),
+    }
+}
+
 fn all_projects(containers: &Value, store: Store) -> Vec<Project> {
-    merge(projects(containers), opened(store))
+    #[cfg(windows)]
+    let ran = wsl_projects(containers, &host_wsl_distros(), host_wsl_automount, |p| Path::new(p).exists());
+    #[cfg(not(windows))]
+    let ran = projects(containers);
+    merge(ran, opened(store))
 }
 
 /// Saves the opened list: `keep` decides what stays of what was there.
@@ -2008,7 +2309,7 @@ pub fn open_file(cli: Cli, store: Store, path: &Path) -> String {
         if let Some(dir) = clash(&p, &all_projects(&containers, store)) {
             return Err(format!("A project named {} already runs from {dir}", p.name));
         }
-        save_opened(store, |n, f| n != p.name && f != file, Some((&p.name, &file))).map_err(|e| e.to_string())?;
+        save_opened(store, |n, f| n != p.name && !same_file_path(Path::new(f), Path::new(&file)), Some((&p.name, &file))).map_err(|e| e.to_string())?;
         Ok(p.name)
     })();
     match r {
@@ -2107,7 +2408,7 @@ fn flow_keys(text: &str) -> Vec<String> {
 /// from), when it isn't this file's: two files are never shown as one.
 pub fn clash(p: &Project, known: &[Project]) -> Option<String> {
     let k = known.iter().find(|k| k.name == p.name)?;
-    let same = |f: &String| p.files.iter().any(|g| valid_file(f).zip(valid_file(g)).is_some_and(|(a, b)| a == b));
+    let same = |f: &String| p.files.iter().any(|g| valid_file(f).zip(valid_file(g)).is_some_and(|(a, b)| same_file_path(&a, &b)));
     let file_gone = k.members.is_empty() && valid_file(&k.files[0]).is_none();
     (!k.files.iter().any(same) && !file_gone).then(|| if k.dir.is_empty() { k.files.first().cloned().unwrap_or_default() } else { k.dir.clone() })
 }
@@ -2311,7 +2612,12 @@ impl std::fmt::Display for CfgErr {
 /// [`YamlAt`] of Compose's error `e`, from its shape only.
 fn yaml_at(e: &str, p: &Project, full: bool) -> Option<YamlAt> {
     let (path, n) = yaml_place(e)?;
-    let top = |f: &str| p.files.first().is_some_and(|t| Path::new(t) == Path::new(f) || std::fs::canonicalize(t).ok().is_some_and(|c| std::fs::canonicalize(f).ok() == Some(c)));
+    let top = |f: &str| {
+        p.files.first().is_some_and(|t| {
+            same_file_path(Path::new(t), Path::new(f))
+                || std::fs::canonicalize(t).ok().zip(std::fs::canonicalize(f).ok()).is_some_and(|(a, b)| same_file_path(&plain_path(a), &plain_path(b)))
+        })
+    };
     match path {
         None | Some("-") => Some(YamlAt::Top(n)),
         Some(f) if top(f) => Some(YamlAt::Top(n)),
@@ -2321,7 +2627,8 @@ fn yaml_at(e: &str, p: &Project, full: bool) -> Option<YamlAt> {
 
 /// `path` relative to `dir` (`../x/compose.yaml` outside it).
 fn relative(dir: &Path, path: &Path) -> String {
-    let (d, f) = (std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned()), std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()));
+    // Plain on both sides: on Windows a canonical path is `\\?\C:\…`, one that isn't there stays `C:\…`.
+    let (d, f) = (real_path(dir).unwrap_or_else(|_| dir.to_owned()), real_path(path).unwrap_or_else(|_| path.to_owned()));
     let (a, b): (Vec<_>, Vec<_>) = (d.components().collect(), f.components().collect());
     let same = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
     let mut out = PathBuf::new();
@@ -3458,7 +3765,7 @@ fn member_view(m: &Member) -> Value {
 /// whether this reading is the one that found it put back so.
 fn still_before(name: &str, path: &str, hash: &str) -> (bool, bool) {
     let mut before = BEFORE.lock().unwrap_or_else(|e| e.into_inner());
-    let back = before.get(name).is_some_and(|(f, b, _)| f == path && file_hash(b) == hash);
+    let back = before.get(name).is_some_and(|(f, b, _)| same_file_path(Path::new(f), Path::new(path)) && file_hash(b) == hash);
     if back {
         before.remove(name);
     }
@@ -3527,7 +3834,7 @@ pub fn plan_event(cli: Cli, store: Store, name: &str, draft: &str, seq: &Value) 
         // A project that has never run: every service is new. After an Apply
         // that saved the file but failed, what runs came from the file before
         // it, so what changed is told against that one.
-        let before = BEFORE.lock().unwrap_or_else(|e| e.into_inner()).get(name).filter(|(f, _, _)| *f == p.files[0]).map(|(_, b, _)| String::from_utf8_lossy(b).into_owned());
+        let before = BEFORE.lock().unwrap_or_else(|e| e.into_inner()).get(name).filter(|(f, _, _)| same_file_path(Path::new(f), Path::new(&p.files[0]))).map(|(_, b, _)| String::from_utf8_lossy(b).into_owned());
         let old = if p.members.is_empty() {
             json!({})
         } else if let Some(b) = before {
@@ -3844,9 +4151,10 @@ static UPS: LazyLock<Mutex<HashMap<String, Up>>> = LazyLock::new(|| Mutex::new(H
 pub fn cancel(name: &str) -> bool {
     let mut ups = UPS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(up) = ups.get_mut(name) else { return false };
-    up.cancelled = true;
-    if let Some(c) = up.child.as_mut() {
-        let _ = c.kill();
+    if !std::mem::replace(&mut up.cancelled, true)
+        && let Some(c) = up.child.as_mut()
+    {
+        kill_group(c);
     }
     true
 }
@@ -3891,8 +4199,7 @@ struct Applying(String);
 impl Drop for Applying {
     fn drop(&mut self) {
         if let Some(mut c) = UPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0).and_then(|u| u.child) {
-            let _ = c.kill();
-            let _ = c.wait();
+            kill_tree(&mut c);
         }
     }
 }
@@ -3902,12 +4209,29 @@ impl Drop for Applying {
 pub fn restore(name: &str, store: Store) -> Result<(), String> {
     let p = find_checked(name, store)?;
     let (file, bytes, wrote) = BEFORE.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned().ok_or("Kiri has nothing to put back")?;
-    if file != p.files[0] {
+    if !same_file_path(Path::new(&file), Path::new(&p.files[0])) {
         return Err(NO_FILE.into());
     }
     write_over(Path::new(&file), &bytes, &wrote).map_err(|e| if changed(&e) { "The file changed outside Kiri since Apply saved it".to_owned() } else { e.to_string() })?;
     BEFORE.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
     Ok(())
+}
+
+fn spawn_up(mut cmd: Command, name: &str) -> io::Result<(Option<std::process::ChildStdout>, Option<std::process::ChildStderr>)> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn()?;
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+    let mut ups = UPS.lock().unwrap_or_else(|e| e.into_inner());
+    let up = ups.entry(name.to_owned()).or_default();
+    // Cancel came while the file was being saved: `up` stops at once.
+    if up.cancelled {
+        kill_group(&mut child);
+    }
+    up.child = Some(child);
+    Ok((out, err))
 }
 
 /// Apply: checks the draft, saves it, and runs `docker compose up -d
@@ -4008,22 +4332,11 @@ pub fn apply(cli: Cli, store: Store, name: &str, draft: &str, base: Option<&str>
         Ok(c) => c,
         Err(e) => return done(false, own(&e.to_string()), true, &hidden, Some(&hash)),
     };
-    cmd.args(project_args(&p, None)).args(profile_args(&profs)).args(["--progress", "plain", "up", "-d", "--remove-orphans"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+    cmd.args(project_args(&p, None)).args(profile_args(&profs)).args(["--progress", "plain", "up", "-d", "--remove-orphans"]);
+    let (out, err) = match spawn_up(cmd, name) {
+        Ok(pipes) => pipes,
         Err(e) => return done(false, own(&format!("couldn't run docker compose: {e}")), true, &hidden, Some(&hash)),
     };
-    let out = child.stdout.take();
-    let err = child.stderr.take();
-    {
-        let mut ups = UPS.lock().unwrap_or_else(|e| e.into_inner());
-        let up = ups.entry(name.to_owned()).or_default();
-        // Cancel came while the file was being saved: `up` stops at once.
-        if up.cancelled {
-            let _ = child.kill();
-        }
-        up.child = Some(child);
-    }
     let reader = std::thread::spawn(move || {
         let mut s = String::new();
         if let Some(mut o) = out {
@@ -5563,12 +5876,24 @@ mod tests {
     /// The docker CLI with no engine to reach (`config --environment` needs
     /// none) and an environment of its own, so a test sees only its `.env`.
     fn dcli() -> io::Result<Command> {
-        let mut c = Command::new(client::docker_cli().expect("a docker CLI"));
+        Ok(bare(Command::new(client::docker_cli().expect("a docker CLI"))))
+    }
+
+    /// `c` with only what the docker CLI needs of this environment, and no
+    /// engine to reach.
+    fn bare(mut c: Command) -> Command {
         c.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default()).env("HOME", std::env::var_os("HOME").unwrap_or_default()).env("DOCKER_HOST", "unix:///nonexistent/kiri-test.sock");
-        if let Some(d) = std::env::var_os("DOCKER_CONFIG") {
-            c.env("DOCKER_CONFIG", d);
+        // On Windows the CLI finds its plugins (compose) under USERPROFILE, and
+        // its network needs SystemRoot; HOME is not set there.
+        for k in ["DOCKER_CONFIG", "USERPROFILE", "SystemRoot"] {
+            if let Some(v) = std::env::var_os(k) {
+                c.env(k, v);
+            }
         }
-        Ok(c)
+        // As the app's own CLI: no console window for each of the tests' many runs.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000);
+        c
     }
 
     fn dproj(d: &Path) -> Project {
@@ -5832,7 +6157,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("kiri-compose-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::canonicalize(&d).unwrap()
+        real_path(&d).unwrap()
     }
 
     #[test]
@@ -5976,7 +6301,7 @@ mod tests {
         fn outside(p: &Path) {
             std::fs::write(p, "services: {}\n# theirs\n").unwrap();
         }
-        *BETWEEN.lock().unwrap() = Some((std::fs::canonicalize(&f).unwrap(), outside));
+        *BETWEEN.lock().unwrap() = Some((real_path(&f).unwrap(), outside));
         let r = save(&f, "services:\n  a: {}\n", &base);
         *BETWEEN.lock().unwrap() = None;
         assert!(r.as_ref().is_err_and(changed), "{r:?}");
@@ -6029,6 +6354,77 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_apply_stops_the_compose_plugin_tree() {
+        if let Ok(addr) = std::env::var("KIRI_T_PLUGIN_GATE") {
+            let mut conn = std::net::TcpStream::connect(addr).unwrap();
+            let _ = writeln!(io::stderr(), " Container celtree-web-1 Creating ");
+            let _ = io::stderr().flush();
+            let mut b = [0u8; 1];
+            if io::Read::read_exact(&mut conn, &mut b).is_ok() && b[0] == b'P' {
+                let _ = conn.write_all(b"A");
+                let _ = conn.flush();
+                let _ = io::Read::read(&mut conn, &mut b);
+            }
+            std::process::exit(1);
+        }
+        let wrapper = |gate: &str| {
+            let exe = std::env::current_exe().unwrap();
+            #[cfg(unix)]
+            let mut c = {
+                let mut c = Command::new("sh");
+                c.args(["-c", "\"$KIRI_T_EXE\" cancelling_apply_stops_the_compose_plugin_tree --nocapture; exit $?", "sh"]);
+                c
+            };
+            #[cfg(windows)]
+            let mut c = {
+                use std::os::windows::process::CommandExt as _;
+                let mut c = Command::new("cmd");
+                c.args(["/d", "/c"]).raw_arg("\"%KIRI_T_EXE%\" cancelling_apply_stops_the_compose_plugin_tree --nocapture");
+                c
+            };
+            c.env("KIRI_T_EXE", exe).env("KIRI_T_PLUGIN_GATE", gate);
+            c
+        };
+
+        // 1. Cancel during `up`: kills wrapper and plugin child, closing inherited pipes immediately.
+        let gate = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = gate.local_addr().unwrap().to_string();
+        UPS.lock().unwrap().insert("celtree".into(), Up::default());
+        let applying = Applying("celtree".into());
+        let (out, err) = spawn_up(wrapper(&addr), "celtree").unwrap();
+        let (mut conn, _) = gate.accept().unwrap();
+        let mut lines = io::BufReader::new(err.unwrap()).lines();
+        assert_eq!(lines.next().unwrap().unwrap(), " Container celtree-web-1 Creating ");
+        assert!(cancel("celtree"));
+        assert!(cancel("celtree"));
+        let _ = conn.write_all(b"P");
+        let _ = conn.flush();
+        let mut ack = [0u8; 1];
+        assert!(!(io::Read::read_exact(&mut conn, &mut ack).is_ok() && ack[0] == b'A'), "compose plugin survived cancel");
+        drop(conn);
+        assert!(lines.next().is_none(), "stderr pipe closed once plugin tree stopped");
+        let mut stdout_rest = String::new();
+        let _ = io::Read::read_to_string(&mut out.unwrap(), &mut stdout_rest);
+        let child = UPS.lock().unwrap().get_mut("celtree").and_then(|u| u.child.take());
+        assert!(child.unwrap().wait().is_ok());
+        drop(applying);
+        assert!(!cancel("celtree"));
+
+        // 2. Cancel arrived while saving (before `spawn_up` registers `child`): stops tree at once.
+        let gate2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = gate2.local_addr().unwrap().to_string();
+        UPS.lock().unwrap().insert("celtree2".into(), Up { child: None, cancelled: true });
+        let applying2 = Applying("celtree2".into());
+        let (out2, err2) = spawn_up(wrapper(&addr2), "celtree2").unwrap();
+        let mut rest_err = String::new();
+        let mut rest_out = String::new();
+        let _ = io::Read::read_to_string(&mut err2.unwrap(), &mut rest_err);
+        let _ = io::Read::read_to_string(&mut out2.unwrap(), &mut rest_out);
+        drop(applying2);
+        assert!(!cancel("celtree2"));
+    }
+
+    #[test]
     fn project_actions_go_by_name_in_composes_order_and_remove_its_network() {
         assert_eq!(action_args("shop", "start").unwrap(), ["compose", "--ansi", "never", "-p", "shop", "start"]);
         assert_eq!(action_args("shop", "remove").unwrap(), ["compose", "--ansi", "never", "-p", "shop", "down", "--remove-orphans"]);
@@ -6059,6 +6455,17 @@ mod tests {
         assert_eq!(plain_path(PathBuf::from("/w/shop/compose.yaml")), PathBuf::from("/w/shop/compose.yaml"));
         let a = project_args(&Project { name: "shop".into(), dir: plain_path(PathBuf::from(r"\\?\C:\w")).to_string_lossy().into(), files: vec![plain_path(PathBuf::from(r"\\?\C:\w\compose.yaml")).to_string_lossy().into()], members: vec![], env_files: Vec::new() }, None);
         assert!(!a.iter().any(|x| x.starts_with(r"\\?\")), "{a:?}");
+    }
+
+    #[test]
+    fn relative_names_a_file_inside_or_outside_an_existing_folder() {
+        let d = tdir("rel");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/compose.yaml"), "services: {}\n").unwrap();
+        assert_eq!(relative(&d, &d.join("sub/compose.yaml")), "sub/compose.yaml");
+        assert_eq!(relative(&d, &d.join("../up.yaml")), "../up.yaml");
+        assert_eq!(relative(&d, &d.parent().unwrap().join("up.yaml")), "../up.yaml");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -6868,7 +7275,7 @@ mod tests {
         let m = config(dcli, &p, Some(draft), &[]).unwrap();
         let v = service_view("x", &m["services"]["x"]);
         assert_eq!(v["ports"], json!(["8080:80"]));
-        assert!(v["volumes"][0].as_str().unwrap().ends_with("certs/server.key:/k"), "{v}");
+        assert!(v["volumes"][0].as_str().unwrap().replace('\\', "/").ends_with("certs/server.key:/k"), "{v}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -7228,7 +7635,8 @@ mod tests {
         assert_eq!(m["services"]["inc"]["image"], "reg/app:${DB_PASSWORD}");
         assert_eq!(m["services"]["deep"]["image"], "reg/deep:${DEEP_TOKEN}");
         assert_eq!(m["services"]["long"]["image"], "reg/long:${API_SECRET}");
-        assert!(text.contains("/sub/data/${DB_PASSWORD}"), "{text}");
+        // On Windows a JSON string's `\` is `\\`.
+        assert!(text.replace(r"\\", "/").contains("/sub/data/${DB_PASSWORD}"), "{text}");
         // An error that quotes the value names the variable.
         std::fs::write(d.join("sub/compose.yaml"), "services:\n  inc:\n    image: alpine\n    ports: [\"${DB_PASSWORD}:80\"]\n").unwrap();
         let e = config(dcli, &p, None, &[]).unwrap_err();
@@ -8055,8 +8463,8 @@ mod tests {
         fn hangs() -> io::Result<Command> {
             let docker = client::docker_cli().expect("a docker CLI");
             let script = format!("case \"$*\" in *'config --quiet'*) sleep 5; exit 1;; esac; exec '{}' \"$@\"", std::path::Path::new(&docker).display());
-            let mut c = Command::new("sh");
-            c.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default()).env("HOME", std::env::var_os("HOME").unwrap_or_default()).env("DOCKER_HOST", "unix:///nonexistent/kiri-test.sock").args(["-c", &script, "sh"]);
+            let mut c = bare(Command::new("sh"));
+            c.args(["-c", &script, "sh"]);
             Ok(c)
         }
         let d = tdir("realslow");
@@ -8311,8 +8719,8 @@ mod tests {
         let docker = client::docker_cli().expect("a docker CLI");
         let log = std::env::temp_dir().join(format!("kiri-compose-count-{}", std::process::id()));
         let script = format!("echo \"$*\" >> '{}'; exec '{}' \"$@\"", log.display(), std::path::Path::new(&docker).display());
-        let mut c = Command::new("sh");
-        c.env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default()).env("HOME", std::env::var_os("HOME").unwrap_or_default()).env("DOCKER_HOST", "unix:///nonexistent/kiri-test.sock").args(["-c", &script, "sh"]);
+        let mut c = bare(Command::new("sh"));
+        c.args(["-c", &script, "sh"]);
         Ok(c)
     }
 
@@ -8515,5 +8923,183 @@ mod tests {
         std::fs::write(d.join("sub/compose.yaml"), "services:\n  db:\n    image: postgres:17\n").unwrap();
         assert_ne!(stamp(&p), before);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn local_wsl_shares_are_accepted_while_remote_unc_paths_stay_refused() {
+        for bad in [
+            r"\\evil.com\share\compose.yaml",
+            "//evil.com/share/compose.yaml",
+            r"\\10.0.0.1\share\compose.yaml",
+            "//10.0.0.1/share/compose.yaml",
+            r"\\?\UNC\evil.com\share\compose.yaml",
+            r"\\?\unc\10.0.0.1\share\compose.yaml",
+            "//?/UNC/wsl.localhost/Ubuntu/compose.yaml",
+            "//?/C:/w/compose.yaml",
+            r"\\.\pipe\docker_engine",
+            r"\\.\UNC\wsl.localhost\Ubuntu\compose.yaml",
+            r"\\wsl.localhost.evil.com\Ubuntu\compose.yaml",
+            r"\\wsl.localhost@SSL\Ubuntu\compose.yaml",
+            r"\\wsl.localhost",
+            r"\\wsl.localhost\",
+            r"\\wsl$\",
+            r"\\wsl.localhost\.\compose.yaml",
+            r"\\wsl.localhost\..\compose.yaml",
+            r"\\wsl.localhost\...\compose.yaml",
+            r"\\wsl.localhost\.hidden\compose.yaml",
+            r"\\wsl.localhost\Ubuntu.\compose.yaml",
+            r"\\wsl.localhost\Ubuntu \compose.yaml",
+            r"\\wsl.localhost\my distro\compose.yaml",
+            r"\\wsl.localhost\\Ubuntu\compose.yaml",
+            r"\\wsl.localhost\Ubuntu\..\..\Debian\compose.yaml",
+            r"\\wsl.localhost\Ubuntu@SSL\compose.yaml",
+            r"\\wsl.localhost\Ubuntu:stream\compose.yaml",
+            r"\\wsl.localhost\Ubuntu\compose.yaml:Zone.Identifier",
+        ] {
+            assert_eq!(wsl_unc(bad), None, "{bad} must not parse as local WSL UNC");
+            assert!(remote_path(bad), "{bad} must be rejected by remote_path");
+            assert_eq!(valid_file(bad), None, "{bad} must not pass valid_file");
+        }
+
+        for (ok, distro, inner) in [
+            (r"\\wsl.localhost\Ubuntu\home\simone\services\docker-compose.yml", "Ubuntu", "/home/simone/services/docker-compose.yml"),
+            (r"\\wsl$\Ubuntu-24.04\home\simone\services\docker-compose.yml", "Ubuntu-24.04", "/home/simone/services/docker-compose.yml"),
+            ("//wsl.localhost/Debian/srv/app/compose.yaml", "Debian", "/srv/app/compose.yaml"),
+            (r"\\?\UNC\wsl.localhost\Ubuntu\home\simone\services\docker-compose.yml", "Ubuntu", "/home/simone/services/docker-compose.yml"),
+            (r"\\?\unc\wsl$\NixOS\etc\compose\compose.yaml", "NixOS", "/etc/compose/compose.yaml"),
+            (r"\\wsl.localhost\Ubuntu\home\simone\a\..\services\.\docker-compose.yml", "Ubuntu", "/home/simone/services/docker-compose.yml"),
+            (r"\\wsl.localhost\Ubuntu", "Ubuntu", "/"),
+            (r"\\wsl.localhost\Ubuntu\", "Ubuntu", "/"),
+        ] {
+            assert_eq!(wsl_unc(ok), Some((distro.to_owned(), inner.to_owned())), "{ok}");
+            assert!(!remote_path(ok), "{ok} stays on this machine");
+        }
+
+        assert_eq!(
+            plain_path(PathBuf::from(r"\\?\UNC\wsl.localhost\Ubuntu\home\simone\compose.yaml")),
+            PathBuf::from(r"\\wsl.localhost\Ubuntu\home\simone\compose.yaml")
+        );
+        assert_eq!(
+            plain_path(PathBuf::from(r"\\?\unc\wsl$\Ubuntu\home\simone\compose.yaml")),
+            PathBuf::from(r"\\wsl$\Ubuntu\home\simone\compose.yaml")
+        );
+
+        assert!(same_file_path(
+            Path::new(r"\\wsl.localhost\Ubuntu\home\simone\services\docker-compose.yml"),
+            Path::new(r"\\wsl$\ubuntu\home\simone\services\docker-compose.yml")
+        ));
+        assert!(same_file_path(
+            Path::new(r"\\?\UNC\wsl.localhost\UBUNTU\home\simone\services\docker-compose.yml"),
+            Path::new(r"\\wsl.localhost\Ubuntu\home\simone\services\docker-compose.yml")
+        ));
+        assert!(!same_file_path(
+            Path::new(r"\\wsl.localhost\Ubuntu\home\simone\services\docker-compose.yml"),
+            Path::new(r"\\wsl.localhost\Debian\home\simone\services\docker-compose.yml")
+        ));
+        assert!(!same_file_path(
+            Path::new(r"\\wsl.localhost\Ubuntu\home\Simone\services\docker-compose.yml"),
+            Path::new(r"\\wsl.localhost\Ubuntu\home\simone\services\docker-compose.yml")
+        ));
+    }
+
+    #[test]
+    fn wsl_compose_labels_map_to_windows_paths_across_legacy_integrated_and_mounted_drives() {
+        assert_eq!(wsl_automount_root(""), "/mnt/");
+        assert_eq!(wsl_automount_root("[automount]\nroot = /windows # custom\n"), "/windows/");
+        assert_eq!(wsl_automount_root("[Automount]\nroot = \"/\"\n"), "/");
+        assert_eq!(wsl_automount_root("[network]\nroot = /bad\n"), "/mnt/");
+
+        assert_eq!(
+            wsl_to_windows("/home/simone/services/docker-compose.yml", "Ubuntu", "/mnt/"),
+            Some(r"\\wsl.localhost\Ubuntu\home\simone\services\docker-compose.yml".into())
+        );
+        assert_eq!(wsl_to_windows("/home/simone/services", "Ubuntu", "/mnt/"), Some(r"\\wsl.localhost\Ubuntu\home\simone\services".into()));
+        assert_eq!(wsl_to_windows("/", "Ubuntu", "/mnt/"), Some(r"\\wsl.localhost\Ubuntu\".into()));
+        assert_eq!(wsl_to_windows("/mnt/c/Users/simone/app/compose.yaml", "Ubuntu", "/mnt/"), Some(r"C:\Users\simone\app\compose.yaml".into()));
+        assert_eq!(wsl_to_windows("/mnt/c", "Ubuntu", "/mnt/"), Some(r"C:\".into()));
+        assert_eq!(wsl_to_windows("/c/Users/simone/app/compose.yaml", "Ubuntu", "/"), Some(r"C:\Users\simone\app\compose.yaml".into()));
+        assert_eq!(
+            wsl_to_windows("/mnt/wsl/kiri/roots/Debian/home/dev/compose.yaml", "kiri", "/mnt/"),
+            Some(r"\\wsl.localhost\Debian\home\dev\compose.yaml".into())
+        );
+        for bad in ["compose.yaml", "//evil/share/compose.yaml", "/home/a:b/compose.yaml", "/home/a\\b/compose.yaml", "/mnt/wsl/kiri/sockets/Ubuntu/docker.sock"] {
+            assert_eq!(wsl_to_windows(bad, "Ubuntu", "/mnt/"), None, "{bad}");
+        }
+        assert_eq!(wsl_to_windows("/home/simone/compose.yaml", "../evil", "/mnt/"), None);
+
+        // 1. Pre-existing 0.2.1/0.2.2 container (no KiriWslDistro, no bind mounts) in engine distro Ubuntu.
+        let legacy_ubuntu = json!([{
+            "Id": "mongo1", "Names": ["/services-mongo-1"], "Image": "mongo:7", "State": "running", "Status": "Up", "Created": 10,
+            "Labels": {
+                PROJECT: "services", SERVICE: "mongo",
+                WORKDIR: "/home/simone/services",
+                FILES: "/home/simone/services/docker-compose.yml",
+                ENV_FILES: "/home/simone/services/prod.env",
+            },
+            "Mounts": [{"Type": "volume", "Name": "services_data", "Destination": "/data/db"}],
+        }]);
+        let got = wsl_projects(&legacy_ubuntu, &["Ubuntu".into()], |_| "/mnt/".into(), |_| false);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].dir, r"\\wsl.localhost\Ubuntu\home\simone\services");
+        assert_eq!(got[0].files, [r"\\wsl.localhost\Ubuntu\home\simone\services\docker-compose.yml"]);
+        assert_eq!(got[0].env_files, [r"\\wsl.localhost\Ubuntu\home\simone\services\prod.env"]);
+
+        // 2. Pre-existing 0.2.2 containers across multiple distros: inferred from bind mount or probed on disk.
+        let legacy_multi = json!([
+            {
+                "Id": "wp1", "Names": ["/wp-db-1"], "Image": "mysql:8", "State": "running", "Status": "Up", "Created": 10,
+                "Labels": {PROJECT: "wordpress", SERVICE: "db", WORKDIR: "/home/simone/wordpress", FILES: "/home/simone/wordpress/docker-compose.yml"},
+                "Mounts": [{"Type": "bind", "Source": "/mnt/wsl/kiri/roots/Ubuntu-24.04/home/simone/wordpress/html", "Destination": "/var/www/html"}],
+            },
+            {
+                "Id": "api1", "Names": ["/api-web-1"], "Image": "node:22", "State": "running", "Status": "Up", "Created": 12,
+                "Labels": {PROJECT: "api", SERVICE: "web", WORKDIR: "/home/dev/api", FILES: "/home/dev/api/compose.yaml"},
+                "Mounts": [],
+            }
+        ]);
+        let got = wsl_projects(
+            &legacy_multi,
+            &["Ubuntu-24.04".into(), "Debian".into()],
+            |_| "/mnt/".into(),
+            |p| p == r"\\wsl.localhost\Debian\home\dev\api\compose.yaml",
+        );
+        let by = |n: &str| got.iter().find(|p| p.name == n).unwrap().clone();
+        assert_eq!(by("wordpress").files, [r"\\wsl.localhost\Ubuntu-24.04\home\simone\wordpress\docker-compose.yml"]);
+        assert_eq!(by("api").files, [r"\\wsl.localhost\Debian\home\dev\api\compose.yaml"]);
+
+        // 3. Integrated WSL distro (`KiriWslDistro`), `/mnt/c/...` mount path, and post-Apply Windows UNC container.
+        let mixed = json!([
+            {
+                "Id": "deb1", "Names": ["/deb-app-1"], "Image": "alpine", "State": "running", "Status": "Up", "Created": 20,
+                "KiriWslDistro": "Debian",
+                "Labels": {PROJECT: "debproj", SERVICE: "app", WORKDIR: "/srv/debproj", FILES: "/srv/debproj/compose.yaml"},
+            },
+            {
+                "Id": "drv1", "Names": ["/shop-web-1"], "Image": "nginx", "State": "running", "Status": "Up", "Created": 25,
+                "KiriWslDistro": "Ubuntu",
+                "Labels": {PROJECT: "shop", SERVICE: "web", WORKDIR: "/mnt/c/Users/simone/shop", FILES: "/mnt/c/Users/simone/shop/compose.yaml"},
+            },
+            {
+                "Id": "old1", "Names": ["/svc-db-1"], "Image": "postgres:16", "State": "running", "Status": "Up", "Created": 30,
+                "KiriWslDistro": "Ubuntu",
+                "Labels": {PROJECT: "svc", SERVICE: "db", WORKDIR: "/home/simone/svc", FILES: "/home/simone/svc/compose.yaml"},
+            },
+            {
+                "Id": "new1", "Names": ["/svc-web-1"], "Image": "nginx", "State": "running", "Status": "Up", "Created": 40,
+                "KiriWslDistro": "Ubuntu",
+                "Labels": {
+                    PROJECT: "svc", SERVICE: "web",
+                    WORKDIR: r"\\wsl.localhost\Ubuntu\home\simone\svc",
+                    FILES: r"\\wsl.localhost\Ubuntu\home\simone\svc\compose.yaml",
+                },
+            }
+        ]);
+        let got = wsl_projects(&mixed, &["kiri".into()], |_| "/mnt/".into(), |_| false);
+        let by = |n: &str| got.iter().find(|p| p.name == n).unwrap().clone();
+        assert_eq!(by("debproj").files, [r"\\wsl.localhost\Debian\srv\debproj\compose.yaml"]);
+        assert_eq!(by("shop").dir, r"C:\Users\simone\shop");
+        assert_eq!(by("shop").files, [r"C:\Users\simone\shop\compose.yaml"]);
+        assert_eq!(by("svc").dir, r"\\wsl.localhost\Ubuntu\home\simone\svc");
+        assert_eq!(by("svc").files, [r"\\wsl.localhost\Ubuntu\home\simone\svc\compose.yaml"]);
     }
 }

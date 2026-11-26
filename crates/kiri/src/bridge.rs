@@ -13,7 +13,11 @@
 //! says it does this with an ACK for connection 0 when it starts, and
 //! kiri-win asks for it per connection by sending 1 with OPEN; a kiri-win
 //! from before this ignores the first and never sends the second, and its
-//! connections get the old bounded queue.
+//! connections get the old bounded queue. The hello's data, 1, says this
+//! bridge answers a PING on connection 0 with one: how kiri-win tells a
+//! wsl.exe that runs and relays nothing (as after Windows wakes) from a
+//! bridge with nothing to say. An older kiri-win ignores the data and
+//! never sends one.
 //!
 //! A daemon that is not there (its socket missing or refusing: WSL
 //! restarted and nothing started it, or it crashed) is started here, by
@@ -21,8 +25,9 @@
 //! connections that come meanwhile (see `Starter`). A connection it still
 //! cannot reach is closed with the reason as the CLOSE's data, which
 //! kiri-win tells the docker client; a kiri-win from before this ignores
-//! CLOSE's data. A stopped engine still runs and answers ("Kiri is
-//! stopped"), so it is never started here.
+//! CLOSE's data. Each start and how it went is also told to kiri-win
+//! (NOTE) for its own log. A stopped engine still runs and answers ("Kiri
+//! is stopped"), so it is never started here.
 
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -47,6 +52,13 @@ const CLOSE: u8 = 4;
 /// Credit back: the data is how many bytes of this connection the sender
 /// of the ACK has handed on (u32 BE). For connection 0, the bridge's hello.
 const ACK: u8 = 5;
+/// From the bridge, on connection 0: a line of what it did to reach the
+/// engine (a start and how it went), in UTF-8, for kiri-win's own log, so
+/// a wake shows in kiri-win.log and not only in /var/log/kiri.log. A
+/// kiri-win from before this drops it: it has no connection 0.
+const NOTE: u8 = 6;
+/// On connection 0, from kiri-win: answered with the same, at once.
+const PING: u8 = 7;
 
 /// The largest frame either side accepts. Both send at most 64 KiB of
 /// data per frame; without a bound, a length of up to 4 GiB was allocated
@@ -69,6 +81,11 @@ const LIMIT: usize = 2 * WINDOW;
 /// socket), or about as long waiting on its lock behind another; 5 s more
 /// so one that would just make it is not killed.
 const START_LIMIT: Duration = Duration::from_secs(25);
+/// How long a socket that refuses connections is retried after a start
+/// returns before concluding the daemon created it and exited. A healthy
+/// daemon takes milliseconds between bind and listen (or to remove a stale
+/// socket under systemd), never the full START_LIMIT.
+const REFUSED_LIMIT: Duration = Duration::from_secs(1);
 /// After a start failed, connections within this get its reason at once,
 /// rather than each starting the engine again. Doubled after each failed
 /// start in a row, up to RETRY_MOST: an engine that exits as it starts
@@ -86,14 +103,48 @@ const LOG: &str = "/var/log/kiri.log";
 
 type Out = Arc<Mutex<dyn Write + Send>>;
 
+const USAGE: &str = "usage: kiri bridge [--socket PATH]";
+
 pub fn run(args: &[String]) -> io::Result<()> {
-    let socket = match args.iter().position(|a| a == "--socket").and_then(|i| args.get(i + 1)) {
-        Some(s) => PathBuf::from(s),
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let mut socket_opt = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--socket" => {
+                socket_opt = Some(
+                    it.next()
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, USAGE))?,
+                );
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE)),
+        }
+    }
+    let socket = match socket_opt {
+        Some(s) => s,
         None => crate::daemon::socket_path()?,
     };
     let out: Out = Arc::new(Mutex::new(BufWriter::with_capacity(64 * 1024, io::stdout())));
-    let starter = Arc::new(Starter::new(socket, Box::new(start_engine), PathBuf::from(LOG)));
+    let mut starter = Starter::new(socket, Box::new(start_engine), PathBuf::from(LOG));
+    starter.tell = Some(teller(out.clone()));
+    let starter = Arc::new(starter);
     serve(BufReader::with_capacity(64 * 1024, io::stdin()), &out, &starter)
+}
+
+/// Tells kiri-win a line for its log (NOTE). Best effort: a kiri-win that
+/// has gone has nobody to tell.
+fn teller(out: Out) -> Box<dyn Fn(&str) + Send + Sync> {
+    Box::new(move |msg: &str| {
+        let msg = msg.as_bytes();
+        let _ = send(&out, NOTE, 0, &msg[..msg.len().min(4096)]);
+    })
 }
 
 /// One connection, as the frame reader sees it.
@@ -109,8 +160,8 @@ struct Conn {
 /// Relays the frames on `input` until it ends (kiri-win has gone; its
 /// connections go too).
 fn serve(mut input: impl Read, out: &Out, starter: &Arc<Starter>) -> io::Result<()> {
-    // Hello: this bridge does flow control.
-    send(out, ACK, 0, &[])?;
+    // Hello: this bridge does flow control, and (1) answers PING.
+    send(out, ACK, 0, &[1])?;
     let mut conns: HashMap<u32, Conn> = HashMap::new();
     while let Some((kind, id, data)) = read_frame(&mut input)? {
         match kind {
@@ -126,6 +177,7 @@ fn serve(mut input: impl Read, out: &Out, starter: &Arc<Starter>) -> io::Result<
                 let (out, starter) = (out.clone(), starter.clone());
                 std::thread::Builder::new().name("kiri-bridge-w".into()).spawn(move || writer(id, &starter, &rx, &queued, &out, credit, window))?;
             }
+            PING => send(out, PING, 0, &[])?,
             ACK => {
                 if let (Some(w), Some(n)) = (conns.get(&id).and_then(|c| c.window.as_ref()), ack_count(&data)) {
                     w.ack(n);
@@ -275,8 +327,12 @@ struct Starter {
     start: Box<dyn Fn(Instant) -> Result<(), String> + Send + Sync>,
     /// Where starts and their outcomes are logged.
     log: PathBuf,
+    /// Also told each of those lines: kiri-win, over NOTE frames.
+    tell: Option<Box<dyn Fn(&str) + Send + Sync>>,
     /// The most one start takes (START_LIMIT).
     limit: Duration,
+    /// The most a socket refusing connections is retried after a start (REFUSED_LIMIT).
+    refused_limit: Duration,
     state: Mutex<StartState>,
     cv: Condvar,
 }
@@ -298,7 +354,16 @@ struct StartState {
 
 impl Starter {
     fn new(socket: PathBuf, start: Box<dyn Fn(Instant) -> Result<(), String> + Send + Sync>, log: PathBuf) -> Starter {
-        Starter { socket, start, log, limit: START_LIMIT, state: Mutex::new(StartState { backoff: RETRY_AFTER, ..StartState::default() }), cv: Condvar::new() }
+        Starter {
+            socket,
+            start,
+            log,
+            tell: None,
+            limit: START_LIMIT,
+            refused_limit: REFUSED_LIMIT,
+            state: Mutex::new(StartState { backoff: RETRY_AFTER, ..StartState::default() }),
+            cv: Condvar::new(),
+        }
     }
 
     /// A connection to the daemon, or why there is none.
@@ -314,13 +379,15 @@ impl Starter {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st = self.cv.wait_while(st, |s| s.running).unwrap_or_else(|e| e.into_inner());
         // A start ended since the try above (this one waited for it, or it
-        // ended just after): its outcome is this connection's too.
+        // ended just after): try the socket first in case a daemon came up
+        // externally while a failed start ran, else use its outcome.
         if st.ended != ended {
-            if let Some((_, why)) = st.failed.as_ref().filter(|_| !st.connected) {
-                return Err(why.clone());
-            }
+            let why = st.failed.as_ref().filter(|_| !st.connected).map(|(_, w)| w.clone());
             drop(st);
-            return UnixStream::connect(&self.socket).map_err(|e| format!("it started, then did not answer ({e})"));
+            return match UnixStream::connect(&self.socket) {
+                Ok(s) => Ok(s),
+                Err(e) => Err(why.unwrap_or_else(|| format!("it started, then did not answer ({e})"))),
+            };
         }
         if let Some((at, why)) = &st.failed
             && at.elapsed() < st.backoff
@@ -362,6 +429,7 @@ impl Starter {
         if let Err(why) = (self.start)(until) {
             return failed(why);
         }
+        let mut refused_since: Option<Instant> = None;
         loop {
             match UnixStream::connect(&self.socket) {
                 Ok(s) => {
@@ -371,7 +439,17 @@ impl Starter {
                     return Ok(s);
                 }
                 Err(e) if Instant::now() >= until => return failed(format!("it did not answer within {} s ({e}); see {LOG}", self.limit.as_secs())),
-                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    let since = *refused_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= self.refused_limit {
+                        return failed(format!("its socket refused connections ({e}); see {LOG}"));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => {
+                    refused_since = None;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     }
@@ -384,12 +462,16 @@ impl Starter {
         st.backoff = RETRY_AFTER;
     }
 
-    /// One line in the log, as the daemon's are stamped (UTC, to the ms).
+    /// One line in the log, as the daemon's are stamped (UTC, to the ms),
+    /// and the same told to kiri-win for kiri-win.log.
     fn note(&self, msg: &str) {
         let t = crate::daemon::time::rfc3339(SystemTime::now());
         let line = format!("{}Z kiri bridge: {msg}\n", t.get(..23).unwrap_or(&t));
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.log) {
             let _ = f.write_all(line.as_bytes());
+        }
+        if let Some(tell) = &self.tell {
+            tell(msg);
         }
     }
 }
@@ -631,7 +713,7 @@ mod tests {
         while done.len() < n {
             let (kind, id, data) = read_frame(from_bridge).unwrap().expect("the bridge ended");
             match kind {
-                ACK => {}
+                ACK | NOTE => {}
                 DATA => got.entry(id).or_default().extend_from_slice(&data),
                 EOF => {
                     done.insert(id, Ok(got.remove(&id).unwrap_or_default()));
@@ -689,6 +771,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Each start and how it went is told to kiri-win too, as NOTE frames
+    /// on connection 0, for kiri-win.log (#93: a wake left no trace there).
+    #[test]
+    fn starts_are_told_to_kiri_win() {
+        let dir = temp("tell");
+        let sock = dir.join("d.sock");
+        let s = sock.clone();
+        let mut starter = Starter::new(
+            sock,
+            Box::new(move |_| {
+                echo_daemon(&s);
+                Ok(())
+            }),
+            dir.join("log"),
+        );
+        let (output, mut from_bridge) = UnixStream::pair().unwrap();
+        starter.tell = Some(teller(Arc::new(Mutex::new(output))));
+        assert!(starter.connect().is_ok());
+        let mut notes = Vec::new();
+        for _ in 0..2 {
+            let (kind, id, data) = read_frame(&mut from_bridge).unwrap().unwrap();
+            assert_eq!((kind, id), (NOTE, 0));
+            notes.push(String::from_utf8(data).unwrap());
+        }
+        assert_eq!(notes, ["engine not answering on its socket; starting it", "engine started"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hello says this bridge answers PING, and it does, while a
+    /// connection waits on a daemon that says nothing.
+    #[test]
+    fn a_ping_is_answered() {
+        let (mut to_bridge, mut from_bridge, dir) = bridge("ping", |s| {
+            std::thread::sleep(Duration::from_secs(2));
+            drop(s);
+        });
+        assert_eq!(read_frame(&mut from_bridge).unwrap(), Some((ACK, 0, vec![1])));
+        frame(&mut to_bridge, OPEN, 1, &[1]);
+        frame(&mut to_bridge, DATA, 1, b"GET /events HTTP/1.1\r\n\r\n");
+        frame(&mut to_bridge, PING, 0, &[]);
+        assert_eq!(read_frame(&mut from_bridge).unwrap(), Some((PING, 0, vec![])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A start that fails: the connection is closed with why, and those
     /// within RETRY_AFTER get that at once, without another start.
     #[test]
@@ -735,6 +861,105 @@ mod tests {
         let why = starter.connect().unwrap_err();
         assert!(why.starts_with("it did not answer within 1 s"), "{why}");
         assert!(began.elapsed() >= starter.limit && began.elapsed() < starter.limit + Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A daemon that creates its socket and then exits leaves a socket that
+    /// refuses connections: the bridge fails quickly instead of waiting out
+    /// the full start limit, and back-off still applies.
+    #[test]
+    fn a_refusing_socket_does_not_wait_the_full_start_limit() {
+        let dir = temp("refused");
+        let sock = dir.join("d.sock");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (s, n) = (sock.clone(), starts.clone());
+        let mut starter = Starter::new(
+            sock,
+            Box::new(move |_| {
+                n.fetch_add(1, Ordering::SeqCst);
+                let _ = std::fs::remove_file(&s);
+                // Bound, then dropped: the socket file stays and refuses connections.
+                drop(UnixListener::bind(&s).unwrap());
+                Ok(())
+            }),
+            dir.join("log"),
+        );
+        starter.limit = Duration::from_secs(10);
+        let began = Instant::now();
+        let why = starter.connect().unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(3), "waited {:?} ({why})", began.elapsed());
+        assert!(why.contains("refused") && why.contains(LOG), "{why}");
+        // Back-off still applies: the next connect gets the reason without another start.
+        assert_eq!(starter.connect().unwrap_err(), why);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale socket that briefly refuses connections while the new daemon
+    /// replaces it (for example under systemd) still connects within REFUSED_LIMIT.
+    #[test]
+    fn a_transiently_refusing_socket_still_connects() {
+        let dir = temp("transient-refused");
+        let sock = dir.join("d.sock");
+        // Stale socket present before and right after start returns.
+        drop(UnixListener::bind(&sock).unwrap());
+        let s = sock.clone();
+        let starter = Starter::new(
+            sock,
+            Box::new(move |_| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let _ = std::fs::remove_file(&s);
+                    echo_daemon(&s);
+                });
+                Ok(())
+            }),
+            dir.join("log"),
+        );
+        let mut conn = starter.connect().expect("daemon replaced stale socket within REFUSED_LIMIT");
+        conn.write_all(b"hi").unwrap();
+        conn.shutdown(Shutdown::Write).unwrap();
+        let mut reply = Vec::new();
+        conn.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply, b"hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A connection waiting behind a start that fails still connects if the
+    /// daemon came up externally meanwhile, instead of returning the stale error.
+    #[test]
+    fn a_waiter_connects_if_the_daemon_comes_up_while_a_start_fails() {
+        let dir = temp("waiter-recovers");
+        let sock = dir.join("d.sock");
+        let (started_tx, started_rx) = channel();
+        let (finish_tx, finish_rx) = channel();
+        let finish_rx = Mutex::new(finish_rx);
+        let starter = Arc::new(Starter::new(
+            sock.clone(),
+            Box::new(move |_| {
+                let _ = started_tx.send(());
+                let _ = finish_rx.lock().unwrap().recv();
+                Err("kiri-start failed".to_owned())
+            }),
+            dir.join("log"),
+        ));
+        let s1 = starter.clone();
+        let first = std::thread::spawn(move || s1.connect());
+        started_rx.recv().unwrap();
+        let s2 = starter.clone();
+        let second = std::thread::spawn(move || s2.connect());
+        std::thread::sleep(Duration::from_millis(100));
+        // The daemon comes up externally while the first start is failing.
+        echo_daemon(&sock);
+        let _ = finish_tx.send(());
+        assert_eq!(first.join().unwrap().unwrap_err(), "kiri-start failed");
+        let mut conn = second.join().unwrap().expect("waiter should connect once daemon is up");
+        conn.write_all(b"ok").unwrap();
+        conn.shutdown(Shutdown::Write).unwrap();
+        let mut reply = Vec::new();
+        conn.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply, b"ok");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

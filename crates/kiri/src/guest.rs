@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use kiri_proto::{HEADER, Hello, LayerBegin, Msg, Stream};
 use kiri_vmm::{Config, Event, Vm};
 
+pub mod disk;
+
 /// The virtiofs tag the guest mounts the Mac's folders under: `/mnt/mac`.
 pub const MAC_TAG: &str = "kiri-mac";
 
@@ -68,6 +70,15 @@ pub struct BootOptions {
     pub memory_mib: Option<u64>,
     /// The VM's CPUs; 2 if not set.
     pub cpus: Option<usize>,
+    /// The VM's persistent data disk size in GiB (`vm.json`'s `disk_gb`);
+    /// `KIRI_DISK_GB` overrides this when set.
+    pub disk_gb: Option<u64>,
+    /// Whether to attach `VZNATNetworkDeviceAttachment` (`InternetSharing`) on
+    /// macOS (`None` reads `KIRI_SHARED_NAT` / `vm.json`'s `shared_nat`).
+    pub shared_nat: Option<bool>,
+    /// The swap file the guest keeps on the data disk, in MiB; 0 removes
+    /// it, and `None` leaves it as it is.
+    pub swap_mib: Option<u64>,
 }
 
 fn console_output(opts: &BootOptions) -> io::Result<Option<OwnedFd>> {
@@ -150,7 +161,7 @@ impl Guest {
             cmdline: String::new(),
             console: console_output(opts)?,
             agent_port: kiri_proto::HOST_PORT,
-            disk: None,
+            disk: if opts.data_disk { linux_agent_data()? } else { None },
             share: None,
             rosetta_tag: None,
             nat_mac: None,
@@ -173,6 +184,11 @@ impl Guest {
             // Keep warnings and oopses even in release builds.
             cmdline.push_str(" quiet loglevel=4");
         }
+        // How much swap the agent keeps on the data disk (#326).
+        if let Some(mib) = opts.swap_mib.filter(|_| opts.data_disk) {
+            cmdline.push_str(&format!(" kiri.swap={mib}"));
+        }
+        let shared_nat = opts.shared_nat.unwrap_or_else(crate::daemon::engine::shared_nat);
         let cfg = Config {
             cpus: opts.cpus.unwrap_or(2),
             memory_mib: opts.memory_mib.unwrap_or(1024),
@@ -181,8 +197,8 @@ impl Guest {
             cmdline,
             console: console_output(opts)?,
             agent_port: kiri_proto::HOST_PORT,
-            disk: if opts.data_disk { Some(data_disk(&dir)?) } else { None },
-            nat_mac: if opts.data_disk { Some(mac_address()?) } else { None },
+            disk: if opts.data_disk { Some(data_disk(&dir, opts.disk_gb)?) } else { None },
+            nat_mac: if opts.data_disk && shared_nat { Some(mac_address()?) } else { None },
             // The Mac's folders a bind mount may name: /mnt/mac in the guest.
             share: opts.data_disk.then(mac_share),
             rosetta_tag: opts.data_disk.then(|| "rosetta".to_owned()),
@@ -376,6 +392,19 @@ fn unexpected(wanted: &str, got: &Msg<'_>) -> io::Error {
     io::Error::other(format!("expected {wanted}, got {got:?}"))
 }
 
+/// The agent's data folder on a Linux host when Settings → Storage moved it
+/// off the default location: `<root>/agent`, which `kiri-init` bind-mounts
+/// onto `/var/lib/kiri`. None when using the default folder or `KIRI_DATA_DIR`.
+#[cfg(target_os = "linux")]
+fn linux_agent_data() -> io::Result<Option<PathBuf>> {
+    if std::env::var_os("KIRI_DATA_DIR").is_some() {
+        return Ok(None);
+    }
+    let root = kiri_image::Store::default_root()?;
+    let default = kiri_image::Store::os_default_root()?;
+    Ok((root != default).then(|| root.join("agent")))
+}
+
 /// The agent on a Linux host: `KIRI_AGENT`, else `kiri-init` beside `kiri`.
 #[cfg(target_os = "linux")]
 fn agent_binary() -> PathBuf {
@@ -388,7 +417,8 @@ fn agent_binary() -> PathBuf {
 #[cfg(target_os = "macos")]
 /// The guest's data disk, copied from the empty template on first use. On
 /// APFS the copy is a clone: instant, and it takes no space until written.
-fn data_disk(guest_dir: &std::path::Path) -> io::Result<PathBuf> {
+fn data_disk(guest_dir: &std::path::Path, configured_gb: Option<u64>) -> io::Result<PathBuf> {
+    let requested = disk::requested_size(configured_gb)?;
     let vm = kiri_image::Store::default_root()?.join("vm");
     std::fs::create_dir_all(&vm)?;
     let disk = vm.join("data.img");
@@ -416,6 +446,7 @@ fn data_disk(guest_dir: &std::path::Path) -> io::Result<PathBuf> {
         }
         std::fs::rename(tmp, &disk)?;
     }
+    disk::grow(&disk, requested)?;
     Ok(disk)
 }
 

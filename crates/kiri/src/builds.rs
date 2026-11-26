@@ -17,13 +17,34 @@ use crate::flavor::{CONTEXT, Name};
 /// Kiri's BuildKit builder, a docker-container one on Kiri's context.
 pub const BUILDER: Name = Name("kiri-build", "kiri-dev-build");
 
-fn buildx(args: &[&str]) -> io::Result<(String, String)> {
+#[cfg(unix)]
+fn kiri_host() -> io::Result<String> {
+    Ok(format!("unix://{}", crate::client::socket()?.display()))
+}
+
+#[cfg(windows)]
+fn kiri_host() -> io::Result<String> {
+    Ok(format!("npipe://{}", crate::client::pipe().replace('\\', "/")))
+}
+
+fn buildx_command(args: &[&str]) -> io::Result<Command> {
     let docker = crate::client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found (Kiri.app bundles one)"))?;
+    let host = kiri_host()?;
     let mut cmd = Command::new(docker);
     // No console window flashing up from Kiri's window on Windows.
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-    let out = cmd.args(["--context", CONTEXT.get(), "buildx"]).args(args).stdin(Stdio::null()).output()?;
+    // Clear DOCKER_CONTEXT and point DOCKER_HOST at Kiri's socket/pipe so the
+    // implicit "default" builder (used by `docker compose build`) resolves to
+    // Kiri's engine while named builders on Kiri's context still work.
+    cmd.env_remove("DOCKER_CONTEXT").env("DOCKER_HOST", host).arg("buildx").args(args).stdin(Stdio::null());
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    Ok(cmd)
+}
+
+fn buildx(args: &[&str]) -> io::Result<(String, String)> {
+    let out = buildx_command(args)?.output()?;
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
     if !out.status.success() {
         let msg = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("buildx failed").trim_start_matches("ERROR: ").to_owned();
@@ -32,12 +53,102 @@ fn buildx(args: &[&str]) -> io::Result<(String, String)> {
     Ok((stdout, stderr))
 }
 
+/// What `buildx` prints to stderr within `limit`, then the command and the
+/// plugin it started are stopped. `history logs` on a running build follows
+/// it until it ends: waiting for that left the steps unshown and, with the
+/// window asking again every 2 s, a reader piling up per ask (#923).
+fn buildx_stderr_for(args: &[&str], limit: std::time::Duration) -> io::Result<String> {
+    stderr_for(buildx_command(args)?, limit)
+}
+
+fn stderr_for(mut cmd: Command, limit: std::time::Duration) -> io::Result<String> {
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn()?;
+    let mut err = child.stderr.take().ok_or_else(|| io::Error::other("no stderr"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = io::Read::read_to_end(&mut err, &mut b);
+        let _ = tx.send(b);
+    });
+    let until = std::time::Instant::now() + limit;
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() >= until {
+            kill_tree(&mut child);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // The tree is gone, so the pipe closes; the wait only covers a straggler.
+    let b = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or_default();
+    Ok(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Kills `child` and what it started: docker runs buildx as a child of its
+/// own. As ui/compose.rs's, which the Windows build of this file can't reach.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: a plain signal to the group this child leads (`process_group(0)`).
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &child.id().to_string()]).creation_flags(0x0800_0000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Every JSON value in `s`, whether one per line or run together.
 fn values(s: &str) -> Vec<Value> {
     serde_json::Deserializer::from_str(s).into_iter::<Value>().map_while(Result::ok).collect()
 }
 
-/// The docker-container builders on Kiri's context whose BuildKit container exists.
+fn endpoint_is_kiri(endpoint: Option<&str>, kiri_context: &str, kiri_host: &str) -> bool {
+    let Some(ep) = endpoint.filter(|s| !s.is_empty()) else { return false };
+    if ep == kiri_context || ep == "default" || ep == kiri_host {
+        return true;
+    }
+    if kiri_host.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("npipe://")) && ep.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("npipe://")) {
+        return ep.replace('\\', "/").eq_ignore_ascii_case(&kiri_host.replace('\\', "/"));
+    }
+    false
+}
+
+fn builders_from(buildx_ls: &[Value], containers: &Value, kiri_context: &str, kiri_host: &str) -> Vec<String> {
+    let have: Vec<String> = containers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|c| c["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(|n| n.trim_start_matches('/').to_owned())))
+        .collect();
+    let mut found = Vec::new();
+    for b in buildx_ls {
+        if b["Driver"] != "docker-container" {
+            continue;
+        }
+        let on_kiri = b["Nodes"].as_array().into_iter().flatten().any(|n| {
+            endpoint_is_kiri(n["Endpoint"].as_str(), kiri_context, kiri_host)
+                && n["Name"].as_str().is_some_and(|name| have.iter().any(|c| *c == format!("buildx_buildkit_{name}")))
+        });
+        if on_kiri
+            && let Some(name) = b["Name"].as_str()
+            && !name.is_empty()
+            && !found.iter().any(|existing| existing == name)
+        {
+            found.push(name.to_owned());
+        }
+    }
+    found
+}
+
+/// The docker-container builders on Kiri's engine whose BuildKit container exists.
 /// No buildx plugin (a distribution's plain docker CLI) means no builds yet, not an error.
 fn builders() -> io::Result<Vec<String>> {
     // Without the plugin, docker reads `buildx` as an unknown command or flag.
@@ -45,22 +156,8 @@ fn builders() -> io::Result<Vec<String>> {
         return Ok(Vec::new());
     }
     let (out, _) = buildx(&["ls", "--format", "json"])?;
-    let have: Vec<String> = crate::client::get_background("/containers/json?all=1")?
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|c| c["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(|n| n.trim_start_matches('/').to_owned())))
-        .collect();
-    Ok(values(&out)
-        .into_iter()
-        .filter(|b| b["Driver"] == "docker-container")
-        .filter(|b| {
-            b["Nodes"].as_array().into_iter().flatten().any(|n| {
-                n["Endpoint"] == CONTEXT.get() && n["Name"].as_str().is_some_and(|name| have.iter().any(|c| *c == format!("buildx_buildkit_{name}")))
-            })
-        })
-        .filter_map(|b| b["Name"].as_str().map(str::to_owned))
-        .collect())
+    let containers = crate::client::get_background("/containers/json?all=1")?;
+    Ok(builders_from(&values(&out), &containers, CONTEXT.get(), &kiri_host()?))
 }
 
 /// The newest builds first, from every builder: {builder, id, name, status,
@@ -83,16 +180,26 @@ pub fn list() -> io::Result<Vec<Value>> {
     Ok(all)
 }
 
+fn valid_build_ref(builder: &str, id: &str) -> bool {
+    !builder.is_empty() && !builder.starts_with('-') && !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// One build: the record, its steps in the order they ran (each with its
 /// start, end, cached, error and output) and its warnings.
 pub fn detail(builder: &str, id: &str) -> io::Result<Value> {
-    if !id.bytes().all(|b| b.is_ascii_alphanumeric()) || builder.starts_with('-') {
+    if !valid_build_ref(builder, id) {
         return Err(io::Error::other("not a build"));
     }
     let (info, _) = buildx(&["history", "inspect", "--builder", builder, id, "--format", "json"])?;
     let info: Value = serde_json::from_str(&info).map_err(io::Error::other)?;
-    // The raw progress stream goes to stderr.
-    let (_, raw) = buildx(&["history", "logs", "--builder", builder, "--progress", "rawjson", id]).unwrap_or_default();
+    // The raw progress stream goes to stderr. A running build's is what it
+    // has printed so far: the window asks again for the rest.
+    let logs_args = ["history", "logs", "--builder", builder, "--progress", "rawjson", id];
+    let raw = if info["Status"] == "Running" {
+        buildx_stderr_for(&logs_args, std::time::Duration::from_secs(2)).unwrap_or_default()
+    } else {
+        buildx(&logs_args).map(|(_, e)| e).unwrap_or_default()
+    };
 
     let mut order: Vec<String> = Vec::new();
     let mut steps: HashMap<String, Value> = HashMap::new();
@@ -172,7 +279,7 @@ pub fn detail(builder: &str, id: &str) -> io::Result<Value> {
 /// config, read from the manifest and config BuildKit keeps with the record.
 /// Builds that made no image (cache only, or failed) have none.
 pub fn layers(builder: &str, id: &str) -> io::Result<Value> {
-    if !id.bytes().all(|b| b.is_ascii_alphanumeric()) || builder.starts_with('-') {
+    if !valid_build_ref(builder, id) {
         return Err(io::Error::other("not a build"));
     }
     let (info, _) = buildx(&["history", "inspect", "--builder", builder, id, "--format", "json"])?;
@@ -212,18 +319,31 @@ pub fn image_layers(name: &str) -> io::Result<Value> {
 /// and its config.
 #[cfg(not(windows))]
 pub(crate) fn stored(store: &kiri_image::Store, name: &str) -> io::Result<(kiri_image::Image, Value, Value)> {
-    let found = match store.find(name)? {
-        Some(i) => Some(i),
-        // An untagged image goes by its ID, whole or the window's short form.
-        None => {
-            let id = name.trim_start_matches("sha256:");
-            store.images()?.into_iter().find(|i| !id.is_empty() && i.config_digest.trim_start_matches("sha256:").starts_with(id))
-        }
-    };
-    let i = found.ok_or_else(|| io::Error::other(format!("no image {name} in Kiri")))?;
+    let (i, manifest, config, _pins) = stored_pinned(store, name)?;
+    Ok((i, manifest, config))
+}
+
+/// As [`stored`], keeping every blob the image references pinned until the
+/// returned pins are dropped.
+#[cfg(not(windows))]
+pub(crate) fn stored_pinned(store: &kiri_image::Store, name: &str) -> io::Result<(kiri_image::Image, Value, Value, Vec<kiri_image::store::Pin>)> {
+    let r = kiri_image::Reference::parse(name).ok();
+    let id = name.trim_start_matches("sha256:");
+    let (i, pins) = store
+        .with_images(|images| {
+            let found = images
+                .iter()
+                .find(|i| i.name == name || i.digest == name || r.as_ref().is_some_and(|r| i.matches(r)))
+                // An untagged image goes by its ID, whole or the window's short form.
+                .or_else(|| images.iter().find(|i| !id.is_empty() && i.config_digest.trim_start_matches("sha256:").starts_with(id)))
+                .cloned()?;
+            let pins = store.hold_image(&found);
+            Some((found, pins))
+        })?
+        .ok_or_else(|| io::Error::other(format!("no image {name} in Kiri")))?;
     let manifest = json!({"config": {"digest": i.config_digest}, "layers": i.layers.iter().map(|l| json!({"size": l.size, "digest": l.digest})).collect::<Vec<_>>()});
     let config: Value = serde_json::from_slice(&store.read_config(&i.config_digest)?).map_err(io::Error::other)?;
-    Ok((i, manifest, config))
+    Ok((i, manifest, config, pins))
 }
 
 /// One platform's image: the config's history lines paired with the
@@ -271,7 +391,7 @@ pub(crate) fn image(manifest: &Value, config: &Value, platform: Option<&str>) ->
 
 /// Removes a build from the history.
 pub fn remove(builder: &str, id: &str) -> io::Result<()> {
-    if !id.bytes().all(|b| b.is_ascii_alphanumeric()) || builder.starts_with('-') {
+    if !valid_build_ref(builder, id) {
         return Err(io::Error::other("not a build"));
     }
     already_gone(buildx(&["history", "rm", "--builder", builder, id]).map(|_| ()), id, || listed(builder, id))
@@ -342,25 +462,32 @@ pub fn builder() -> io::Result<bool> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     let quiet = || std::process::Stdio::null();
-    if !Command::new(&docker).args(["buildx", "version"]).stdout(quiet()).stderr(quiet()).status()?.success() {
+    let new_docker = || {
+        #[allow(unused_mut)]
+        let mut cmd = Command::new(&docker);
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+        cmd
+    };
+    if !new_docker().args(["buildx", "version"]).stdout(quiet()).stderr(quiet()).status()?.success() {
         println!("docker build: no buildx plugin here, so docker builds with Kiri's classic builder API (the same BuildKit, run by the daemon)");
         return Ok(false);
     }
-    let inspect = Command::new(&docker).args(["buildx", "inspect", BUILDER.get()]).stderr(quiet()).output()?;
+    let inspect = new_docker().args(["buildx", "inspect", BUILDER.get()]).stderr(quiet()).output()?;
     let mut exists = inspect.status.success();
     // Without default-load a docker-container builder keeps what it builds
     // to itself: `docker build -t x .` builds and `docker run x` finds
     // nothing. One made without it is made again; --keep-state keeps its
     // cache volume, which the daemon's builder container reuses.
     if exists && !String::from_utf8_lossy(&inspect.stdout).contains("default-load") {
-        exists = !Command::new(&docker).args(["buildx", "rm", "--keep-state", BUILDER.get()]).stdout(quiet()).stderr(quiet()).status()?.success();
+        exists = !new_docker().args(["buildx", "rm", "--keep-state", BUILDER.get()]).stdout(quiet()).stderr(quiet()).status()?.success();
     }
     if !exists {
         // buildx create takes the Kiri context's name; without that context
         // (Linux makes it only in the optional "docker uses Kiri" step) buildx
         // reads the name as a host and fails on tcp://kiri:2375.
         ensure_context(&docker)?;
-        let made = Command::new(&docker)
+        let made = new_docker()
             .args(["buildx", "create", "--name", BUILDER.get(), "--driver", "docker-container", "--driver-opt", "default-load=true", CONTEXT.get()])
             .stdout(quiet())
             .output()?;
@@ -376,13 +503,24 @@ pub fn builder() -> io::Result<bool> {
     Ok(true)
 }
 
-/// The docker context named CONTEXT, pointing at Kiri's socket, made when
-/// missing. It is only made, never made current: which engine plain docker
-/// uses stays the user's choice.
-/// On Windows, setup (kiri.ps1) makes the context, on the pipe.
-#[cfg(not(unix))]
-fn ensure_context(_docker: impl AsRef<std::ffi::OsStr>) -> io::Result<()> {
-    Ok(())
+/// The docker context named CONTEXT, pointing at Kiri's socket or Windows
+/// named pipe, made when missing. It is only made, never made current: which
+/// engine plain docker uses stays the user's choice.
+#[cfg(windows)]
+fn ensure_context(docker: impl AsRef<std::ffi::OsStr>) -> io::Result<()> {
+    let docker = docker.as_ref();
+    let quiet = || std::process::Stdio::null();
+    let new_cmd = || {
+        let mut cmd = Command::new(docker);
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+        cmd
+    };
+    if new_cmd().args(["context", "inspect", CONTEXT.get()]).stdout(quiet()).stderr(quiet()).status()?.success() {
+        return Ok(());
+    }
+    let host = format!("host=npipe://{}", crate::client::pipe().replace('\\', "/"));
+    let out = new_cmd().args(["context", "create", CONTEXT.get(), "--description", "Kiri (WSL2)", "--docker", &host]).stdout(quiet()).output()?;
+    if out.status.success() { Ok(()) } else { Err(io::Error::other(failure("docker context create failed", &out.stderr))) }
 }
 
 #[cfg(unix)]
@@ -409,6 +547,22 @@ fn failure(what: &str, stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A follower that never exits (a running build's `history logs`, its
+    /// plugin a child of docker) gives what it printed and is gone (#923).
+    #[cfg(unix)]
+    #[test]
+    fn a_follower_gives_what_it_printed_and_is_stopped_with_its_children() {
+        let marker = format!("kiri-builds-follow-{}", std::process::id());
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &format!("echo '{{\"a\":1}}' >&2; sh -c 'exec sleep 30 {marker}' 2>/dev/null & sleep 30; wait")]);
+        let started = std::time::Instant::now();
+        let out = stderr_for(cmd, std::time::Duration::from_millis(500)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!(values(&out), vec![json!({"a": 1})]);
+        let left = Command::new("pgrep").args(["-f", &marker]).output().unwrap();
+        assert!(left.stdout.is_empty(), "left running: {}", String::from_utf8_lossy(&left.stdout));
+    }
 
     /// A build already removed (a second click, or several removed at once)
     /// is removed: BuildKit's "lease not found" isn't an error to show. But
@@ -469,6 +623,62 @@ mod tests {
     fn reads_values_run_together_or_by_line() {
         assert_eq!(values("{\"a\":1}\n{\"a\":2}").len(), 2);
         assert_eq!(values("{\"a\":1}{\"a\":2}").len(), 2);
+    }
+
+    #[test]
+    fn discovers_every_buildkit_builder_on_kiris_engine() {
+        let host = "unix:///Users/alice/.kiri/run/docker.sock";
+        let buildx_ls = vec![
+            json!({"Name": "kiri-build", "Driver": "docker-container", "Nodes": [{"Name": "kiri-build0", "Endpoint": "kiri"}]}),
+            json!({"Name": "default", "Driver": "docker-container", "Nodes": [{"Name": "default", "Endpoint": "default"}]}),
+            json!({"Name": "compose-url", "Driver": "docker-container", "Nodes": [{"Name": "compose-url0", "Endpoint": host}]}),
+            json!({"Name": "custom-kiri", "Driver": "docker-container", "Nodes": [{"Name": "custom-kiri0", "Endpoint": "kiri"}]}),
+            // Duplicate name must appear only once, keeping first-seen order.
+            json!({"Name": "kiri-build", "Driver": "docker-container", "Nodes": [{"Name": "kiri-build0", "Endpoint": "kiri"}]}),
+            // Builder on Kiri without an existing BuildKit container must be skipped (never wake/create).
+            json!({"Name": "not-started", "Driver": "docker-container", "Nodes": [{"Name": "not-started0", "Endpoint": "kiri"}]}),
+            json!({"Name": "default-missing", "Driver": "docker-container", "Nodes": [{"Name": "default-missing0", "Endpoint": "default"}]}),
+            // Non-docker-container driver must be skipped.
+            json!({"Name": "plain-docker", "Driver": "docker", "Nodes": [{"Name": "default", "Endpoint": "default"}]}),
+            // Foreign contexts / sockets must be rejected even if a container of that name exists.
+            json!({"Name": "desktop-builder", "Driver": "docker-container", "Nodes": [{"Name": "desktop-builder0", "Endpoint": "desktop-linux"}]}),
+            json!({"Name": "orb-builder", "Driver": "docker-container", "Nodes": [{"Name": "orb-builder0", "Endpoint": "orbstack"}]}),
+            json!({"Name": "other-sock", "Driver": "docker-container", "Nodes": [{"Name": "other-sock0", "Endpoint": "unix:///var/run/other.sock"}]}),
+        ];
+        let containers = json!([
+            {"Names": ["/buildx_buildkit_kiri-build0"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_default"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_compose-url0"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_custom-kiri0"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_desktop-builder0"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_orb-builder0"], "Image": "moby/buildkit:buildx-stable-1"},
+            {"Names": ["/buildx_buildkit_other-sock0"], "Image": "moby/buildkit:buildx-stable-1"},
+        ]);
+        let found = builders_from(&buildx_ls, &containers, "kiri", host);
+        assert_eq!(found, vec!["kiri-build", "default", "compose-url", "custom-kiri"]);
+    }
+
+    #[test]
+    fn matches_windows_npipe_endpoints_case_and_slash_insensitively() {
+        let host = "npipe:////./pipe/kiri";
+        let buildx_ls = vec![
+            json!({"Name": "default", "Driver": "docker-container", "Nodes": [{"Name": "default", "Endpoint": r"NPIPE://\\.\pipe\KIRI"}]}),
+            json!({"Name": "other-pipe", "Driver": "docker-container", "Nodes": [{"Name": "other-pipe0", "Endpoint": "npipe:////./pipe/docker_engine"}]}),
+        ];
+        let containers = json!([
+            {"Names": ["/buildx_buildkit_default"]},
+            {"Names": ["/buildx_buildkit_other-pipe0"]},
+        ]);
+        assert_eq!(builders_from(&buildx_ls, &containers, "kiri", host), vec!["default"]);
+    }
+
+    #[test]
+    fn rejects_empty_or_flag_like_builder_in_detail_layers_and_remove() {
+        for (builder, id) in [("", "abc123"), ("-bad", "abc123"), ("--builder", "abc123"), ("kiri-build", ""), ("kiri-build", "bad/id")] {
+            assert_eq!(detail(builder, id).unwrap_err().to_string(), "not a build", "detail({builder:?}, {id:?})");
+            assert_eq!(layers(builder, id).unwrap_err().to_string(), "not a build", "layers({builder:?}, {id:?})");
+            assert_eq!(remove(builder, id).unwrap_err().to_string(), "not a build", "remove({builder:?}, {id:?})");
+        }
     }
 }
 

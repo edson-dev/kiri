@@ -86,6 +86,24 @@ there, so it wants `KIRI_TEST_KILL=1`).
 Not yet: an apt/dnf repository (today the packages are release assets;
 a repository is what gives `apt upgrade`), and signing.
 
+## Arch Linux
+
+`arch/PKGBUILD` builds `kiri-ui`, the desktop window (`kiri --features window`),
+for Arch Linux (`x86_64` and `aarch64`, including Omarchy and Asahi). It
+installs `/usr/lib/kiri/kiri-window` where `kiri ui` expects it, plus the
+application-menu launcher and icons, without replacing an installed Kiri engine,
+CLI, systemd service, Docker context, or container store. See `arch/README.md`
+for build and install steps.
+
+## Nix and NixOS
+
+`flake.nix` builds `kiri` and `kiri-init` on `x86_64-linux` and `aarch64-linux`
+(`nix build .#kiri`), and exports `nixosModules.default` (`services.kiri.enable = true;`),
+which creates the `kiri` group, configures NetworkManager to leave Kiri's
+bridges and veths unmanaged, and runs `kiri.service` with the same cgroup
+delegation, resource limits, and `/run/docker.sock` fallback link as the `.deb`
+and `.rpm` packages.
+
 ## Homebrew (planned, not built)
 
 The Mac already has the app and the dmg; Homebrew is the third way in, for

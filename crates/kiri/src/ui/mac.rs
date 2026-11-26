@@ -13,8 +13,8 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2::sel;
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType, NSMenu, NSMenuDelegate, NSMenuItem,
-    NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType, NSEvent, NSMenu, NSMenuDelegate, NSMenuItem,
+    NSResponder, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use objc2_web_kit::{WKScriptMessage, WKScriptMessageHandler, WKUserContentController, WKWebView, WKWebViewConfiguration};
@@ -29,6 +29,17 @@ thread_local! {
     static WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
     /// The menu bar item; AppKit removes it once it is released.
     static STATUS_ITEM: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
+    /// Where a page made again (after the window let go of its own) sends
+    /// its messages.
+    static PAGE_TX: RefCell<Option<Sender<Cmd>>> = const { RefCell::new(None) };
+    /// Scripts for a page made again, kept until it says `ready`: the menu
+    /// bar's Settings… or a container shows the window and sends at once.
+    static QUEUED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    /// The last left mouse-down the app received (`watch_presses`), so a
+    /// drag the page asks for starts where the button went down.
+    static PRESS: RefCell<Option<Retained<objc2_app_kit::NSEvent>>> = const { RefCell::new(None) };
+    /// The event monitor that keeps `PRESS`; kept for as long as the app runs.
+    static PRESS_MONITOR: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
 }
 
 /// `autostart` boots the VM as soon as the page has loaded; `view` picks the
@@ -66,6 +77,7 @@ pub fn run(autostart: bool, view: Option<String>) -> io::Result<()> {
         for name in ["NSWindowDidResizeNotification", "NSWindowDidExitFullScreenNotification", "NSWindowDidBecomeKeyNotification", "NSWindowDidResignKeyNotification"] {
             let _: () = msg_send![&*centre, addObserver: &*delegate, selector: sel!(windowLaidOut:), name: &*NSString::from_str(name), object: &*window];
         }
+        let _: () = msg_send![&*centre, addObserver: &*delegate, selector: sel!(windowWillClose:), name: &*NSString::from_str("NSWindowWillCloseNotification"), object: &*window];
     }
     window.center();
     window.makeKeyAndOrderFront(None);
@@ -109,14 +121,28 @@ fn make_window(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Op
     window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
     window.setMinSize(NSSize::new(760.0, 480.0));
 
+    PAGE_TX.with(|t| *t.borrow_mut() = Some(tx.clone()));
+    let webview = make_webview(mtm, frame, tx, autostart, view);
+    window.setContentView(Some(&webview));
+    read_direction();
+    place_lights(&window);
+    WEBVIEW.with(|w| *w.borrow_mut() = Some(webview));
+    WINDOW.with(|w| *w.borrow_mut() = Some(window.clone()));
+    watch_presses();
+    Ok(window)
+}
+
+/// The page, in a new WebKit view of `frame`'s size.
+fn make_webview(mtm: MainThreadMarker, frame: NSRect, tx: Sender<Cmd>, autostart: bool, view: Option<String>) -> Retained<WKWebView> {
     // SAFETY: WebKit objects created and configured on the main thread.
-    let webview = unsafe {
+    unsafe {
         let config = WKWebViewConfiguration::new(mtm);
         let handler = MessageHandler::new(mtm, tx, autostart, view);
         config
             .userContentController()
             .addScriptMessageHandler_name(ProtocolObject::from_ref(&*handler), &NSString::from_str("kiri"));
-        let webview = WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), frame, &config);
+        let webview = WebView::new(mtm, frame, &config);
+        webview.setAllowsLinkPreview(false);
         if cfg!(debug_assertions) {
             webview.setInspectable(true);
         }
@@ -124,14 +150,60 @@ fn make_window(mtm: MainThreadMarker, tx: Sender<Cmd>, autostart: bool, view: Op
         let no: Retained<AnyObject> = msg_send![objc2::class!(NSNumber), numberWithBool: false];
         let _: () = msg_send![&webview, setValue: &*no, forKey: &*NSString::from_str("drawsBackground")];
         webview.loadHTMLString_baseURL(&NSString::from_str(&super::assemble::page(PAGE, prefs()["lang"].as_str())), None);
-        webview
+        Retained::into_super(webview)
+    }
+}
+
+/// The window closed with Settings → Closing the window → Close: it lets go
+/// of its page, which ends WebKit's processes for it. The menu bar item and
+/// the engine stay; [`show_window`] makes the page again.
+fn release_page() {
+    if prefs()["closeButton"] != "close" {
+        return;
+    }
+    let Some(webview) = WEBVIEW.with(|w| w.borrow_mut().take()) else { return };
+    QUEUED.with(|q| *q.borrow_mut() = None);
+    // SAFETY: main thread; the content controller holds the message
+    // handler, which goes with the name it was added under.
+    unsafe { webview.configuration().userContentController().removeScriptMessageHandlerForName(&NSString::from_str("kiri")) };
+    WINDOW.with(|w| {
+        if let Some(window) = w.borrow().as_ref() {
+            window.setContentView(None);
+        }
+    });
+    drop(webview);
+    super::page_gone();
+}
+
+/// Keeps each left mouse-down AppKit delivers, before the window gets it,
+/// for `drag`, and clears it on mouse-up. The monitor hands every event on
+/// unchanged.
+fn watch_presses() {
+    use std::ptr::NonNull;
+    use objc2_app_kit::{NSEvent, NSEventMask};
+    let handler = block2::RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
+        // SAFETY: AppKit calls a local monitor on the main thread with a valid event.
+        record_press(unsafe { event.as_ref() });
+        event.as_ptr()
+    });
+    let mask = NSEventMask::LeftMouseDown | NSEventMask::LeftMouseUp;
+    // SAFETY: an NSEvent class method on the main thread; the handler
+    // returns the event it was given, so delivery is as before.
+    let monitor: Option<Retained<AnyObject>> =
+        unsafe { msg_send![objc2::class!(NSEvent), addLocalMonitorForEventsMatchingMask: mask, handler: &*handler] };
+    PRESS_MONITOR.with(|m| *m.borrow_mut() = monitor);
+}
+
+fn record_press(event: &objc2_app_kit::NSEvent) {
+    use objc2_app_kit::NSEventType;
+    let press = if event.r#type() == NSEventType::LeftMouseDown {
+        // SAFETY: `event` is a live NSEvent reference; retaining it keeps it
+        // alive after the current run-loop turn's autorelease pool drains.
+        unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
+    } else {
+        None
     };
-    window.setContentView(Some(&webview));
-    read_direction();
-    place_lights(&window);
-    WEBVIEW.with(|w| *w.borrow_mut() = Some(webview));
-    WINDOW.with(|w| *w.borrow_mut() = Some(window.clone()));
-    Ok(window)
+    PRESS.with(|p| *p.borrow_mut() = press);
 }
 
 /// The page's strip across the top (index.html's `.strip`), in points.
@@ -266,6 +338,18 @@ fn show_window(mtm: MainThreadMarker) {
     NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Regular);
     WINDOW.with(|w| {
         if let Some(window) = w.borrow().as_ref() {
+            // The page was let go of when the window closed: a new one,
+            // which opens on its first section, as at launch.
+            if WEBVIEW.with(|v| v.borrow().is_none())
+                && let Some(tx) = PAGE_TX.with(|t| t.borrow().clone())
+            {
+                let frame = NSRect::new(NSPoint::new(0.0, 0.0), window.frame().size);
+                let webview = make_webview(mtm, frame, tx, false, None);
+                QUEUED.with(|q| *q.borrow_mut() = Some(Vec::new()));
+                window.setContentView(Some(&webview));
+                WEBVIEW.with(|v| *v.borrow_mut() = Some(webview));
+                place_lights(window);
+            }
             window.makeKeyAndOrderFront(None);
         }
     });
@@ -351,6 +435,14 @@ pub(super) fn relang() {
 /// Runs JavaScript in the page. Callable from any thread.
 pub(super) fn eval(js: String) {
     DispatchQueue::main().exec_async(move || {
+        let js = QUEUED.with(|q| match q.borrow_mut().as_mut() {
+            Some(queued) => {
+                queued.push(js);
+                None
+            }
+            None => Some(js),
+        });
+        let Some(js) = js else { return };
         WEBVIEW.with(|w| {
             if let Some(webview) = w.borrow().as_ref() {
                 let js = NSString::from_str(&js);
@@ -372,27 +464,52 @@ pub(super) fn quit() {
 
 /// The page covers the title bar, and WebKit ignores CSS drag regions, so
 /// the page asks for the drag itself on mouse-down over empty chrome. The
-/// message lands after the mouse-down: if the button is already up (a quick
-/// click), AppKit's current event is the mouse-up, and a drag started then
-/// waits for a release that already happened, holding the window until the
-/// next click.
+/// message lands after the mouse-down, when AppKit's current event is often
+/// no longer it (a hand already moving sends mouse-dragged events, a Force
+/// Touch trackpad pressure ones), so nothing moved (#337). The drag starts
+/// from the real press `watch_presses` kept instead: its place and time,
+/// so the window follows the pointer from where the button went down. Only
+/// while the button is held: after a quick click the current event is the
+/// mouse-up, and a drag started then waits for a release that already
+/// happened, holding the window until the next click.
 pub(super) fn drag() {
+    use objc2_app_kit::NSEvent;
     let Some(mtm) = MainThreadMarker::new() else { return };
+    let buttons = NSEvent::pressedMouseButtons();
     WINDOW.with(|w| {
-        if let (Some(window), Some(event)) = (w.borrow().as_ref(), NSApplication::sharedApplication(mtm).currentEvent()) {
-            if event.r#type() == objc2_app_kit::NSEventType::LeftMouseDown && objc2_app_kit::NSEvent::pressedMouseButtons() & 1 != 0 {
-                window.performWindowDragWithEvent(&event);
-            }
+        let Some(window) = w.borrow().clone() else { return };
+        if let Some(down) = press_for_drag(window.windowNumber(), buttons, || NSApplication::sharedApplication(mtm).currentEvent()) {
+            window.performWindowDragWithEvent(&down);
         }
     });
 }
 
+fn press_for_drag(
+    window_number: isize,
+    buttons: usize,
+    current: impl FnOnce() -> Option<Retained<objc2_app_kit::NSEvent>>,
+) -> Option<Retained<objc2_app_kit::NSEvent>> {
+    use objc2_app_kit::NSEventType;
+    if buttons & 1 == 0 {
+        PRESS.with(|p| *p.borrow_mut() = None);
+        return None;
+    }
+    let ours = |e: &objc2_app_kit::NSEvent| e.r#type() == NSEventType::LeftMouseDown && e.windowNumber() == window_number;
+    // This window's press; without one (none seen yet), the current event if it is a press.
+    PRESS.with(|p| p.borrow().clone()).filter(|e| ours(e)).or_else(|| current().filter(|e| ours(e)))
+}
+
 /// Closes the window, as the menu's Close Window did before ⌘W went to the page.
+/// The page asks from inside WebKit's message callback, and closing can let
+/// go of that same page (`release_page`), so the close waits for the main
+/// queue's next turn.
 pub(super) fn close_window() {
-    WINDOW.with(|w| {
-        if let Some(window) = w.borrow().as_ref() {
-            window.performClose(None);
-        }
+    DispatchQueue::main().exec_async(|| {
+        WINDOW.with(|w| {
+            if let Some(window) = w.borrow().as_ref() {
+                window.performClose(None);
+            }
+        });
     });
 }
 
@@ -452,6 +569,34 @@ pub(super) fn pick_compose_file(title: &str, _filters: &[String; 2], done: impl 
     });
 }
 
+/// Settings → Storage → Change…: AppKit's open panel for choosing a folder
+/// (with New Folder enabled). `done` gets the path, or None when cancelled.
+pub(super) fn pick_folder(title: &str, done: impl FnOnce(Option<std::path::PathBuf>) + Send + 'static) {
+    let title = title.to_owned();
+    DispatchQueue::main().exec_async(move || {
+        // SAFETY: on the main thread (main queue); NSOpenPanel's documented
+        // messages, with the argument types AppKit declares.
+        let picked = (|| unsafe {
+            let panel: Retained<AnyObject> = msg_send![objc2::class!(NSOpenPanel), openPanel];
+            let _: () = msg_send![&*panel, setCanChooseFiles: false];
+            let _: () = msg_send![&*panel, setCanChooseDirectories: true];
+            let _: () = msg_send![&*panel, setCanCreateDirectories: true];
+            let _: () = msg_send![&*panel, setAllowsMultipleSelection: false];
+            let words = NSString::from_str(&title);
+            let _: () = msg_send![&*panel, setTitle: &*words];
+            let _: () = msg_send![&*panel, setMessage: &*words];
+            let answer: isize = msg_send![&*panel, runModal];
+            if answer != 1 {
+                return None;
+            }
+            let url: Option<Retained<AnyObject>> = msg_send![&*panel, URL];
+            let path: Option<Retained<NSString>> = msg_send![&*url?, path];
+            Some(std::path::PathBuf::from(path?.to_string()))
+        })();
+        done(picked);
+    });
+}
+
 /// The installed font families, sorted; `mono` keeps the fixed-pitch ones.
 pub(super) fn font_families(mono: bool) -> Vec<String> {
     use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFString, CFType};
@@ -494,6 +639,38 @@ struct HandlerIvars {
 }
 
 define_class!(
+    // SAFETY: WKWebView is a main-thread AppKit view safe to subclass without Drop.
+    #[unsafe(super(WKWebView, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "KiriWebView"]
+    struct WebView;
+
+    unsafe impl NSObjectProtocol for WebView {}
+
+    impl WebView {
+        /// Kiri renders its own app editing menu (`#app-ctx` in `index.html`).
+        /// Clearing any AppKit `NSMenu` items WebKit builds guarantees Safari /
+        /// browser items (`Search with Google`, `Look Up`, `Translate`,
+        /// `Copy Link with Highlight`, `Share…`, `Speech`, `Services`) never
+        /// appear on macOS right-click or Ctrl-click.
+        #[unsafe(method(willOpenMenu:withEvent:))]
+        fn will_open_menu(&self, menu: &NSMenu, event: &NSEvent) {
+            menu.removeAllItems();
+            // SAFETY: forwarding `willOpenMenu:withEvent:` to `WKWebView` with valid args.
+            let _: () = unsafe { msg_send![super(self), willOpenMenu: menu, withEvent: event] };
+        }
+    }
+);
+
+impl WebView {
+    fn new(mtm: MainThreadMarker, frame: NSRect, config: &WKWebViewConfiguration) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: `WKWebView`'s designated initializer on a freshly allocated subclass instance.
+        unsafe { msg_send![super(this), initWithFrame: frame, configuration: config] }
+    }
+}
+
+define_class!(
     // SAFETY: NSObject has no subclassing requirements and this type has no Drop.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -510,7 +687,14 @@ define_class!(
             let body = unsafe { message.body() };
             let Ok(text) = body.downcast::<NSString>() else { return };
             let ivars = self.ivars();
-            super::handle(&text.to_string(), &ivars.tx, ivars.autostart, ivars.view.as_deref());
+            let text = text.to_string();
+            // A page made again has loaded: what was sent meanwhile goes in now.
+            if serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|m| m["cmd"] == "ready") {
+                for js in QUEUED.with(|q| q.borrow_mut().take()).unwrap_or_default() {
+                    eval(js);
+                }
+            }
+            super::handle(&text, &ivars.tx, ivars.autostart, ivars.view.as_deref());
         }
     }
 );
@@ -569,7 +753,9 @@ define_class!(
             if crate::update::staged().is_some() {
                 match crate::update::install_staged() {
                     Ok(version) => {
-                        if let Err(e) = crate::update::restart_engine(&version) {
+                        if !super::stop_on_quit()
+                            && let Err(e) = crate::update::restart_engine(&version)
+                        {
                             diag::error!("the engine did not restart on the update", version = version, error = e);
                         }
                     }
@@ -597,6 +783,12 @@ define_class!(
                     place_lights(w);
                 }
             });
+        }
+
+        /// The window is closing (its button, ⌘W or Close Window).
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _note: &NSNotification) {
+            release_page();
         }
 
         #[unsafe(method(openWindow:))]
@@ -726,5 +918,70 @@ impl AppDelegate {
         let this = Self::alloc(mtm).set_ivars(AppIvars { tx, engine: RefCell::new(Some(engine)), shown: RefCell::new(Vec::new()) });
         // SAFETY: NSObject's init on a freshly allocated object.
         unsafe { msg_send![super(this), init] }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2::msg_send;
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_foundation::NSPoint;
+
+    use super::{PRESS, press_for_drag, record_press};
+
+    fn mouse_event(kind: NSEventType, window_number: isize, event_number: isize) -> Retained<NSEvent> {
+        // SAFETY: AppKit event constructor with valid value arguments and a nil graphics context.
+        let event: Option<Retained<NSEvent>> = unsafe {
+            msg_send![
+                objc2::class!(NSEvent),
+                mouseEventWithType: kind,
+                location: NSPoint::new(24.0, 12.0),
+                modifierFlags: NSEventModifierFlags::empty(),
+                timestamp: 1.0f64,
+                windowNumber: window_number,
+                context: Option::<&objc2::runtime::AnyObject>::None,
+                eventNumber: event_number,
+                clickCount: 1isize,
+                pressure: 1.0f32,
+            ]
+        };
+        event.expect("mouse event")
+    }
+
+    #[test]
+    fn drag_uses_the_kept_press_across_autorelease_pools_until_release() {
+        PRESS.with(|p| *p.borrow_mut() = None);
+
+        // A mouse-down captured in an earlier run-loop turn survives the pool
+        // drain and is chosen even after the current event has moved on.
+        autoreleasepool(|_| {
+            let down = mouse_event(NSEventType::LeftMouseDown, 7, 101);
+            record_press(&down);
+        });
+        let dragged = mouse_event(NSEventType::LeftMouseDragged, 7, 102);
+        let picked = press_for_drag(7, 1, || Some(dragged)).expect("kept press");
+        assert_eq!((picked.r#type(), picked.windowNumber(), picked.eventNumber()), (NSEventType::LeftMouseDown, 7, 101));
+
+        // Another window never takes this window's press, nor lends its own.
+        assert!(press_for_drag(8, 1, || None).is_none());
+        let other = mouse_event(NSEventType::LeftMouseDown, 8, 103);
+        record_press(&other);
+        assert!(press_for_drag(7, 1, || Some(other)).is_none());
+
+        // Once the button is up, a late drag message starts nothing and clears the press.
+        let down = mouse_event(NSEventType::LeftMouseDown, 7, 104);
+        record_press(&down);
+        assert!(press_for_drag(7, 0, || None).is_none());
+        assert!(PRESS.with(|p| p.borrow().is_none()));
+
+        // A mouse-up also clears the kept press, and without one a live mouse-down fallback works.
+        record_press(&down);
+        let up = mouse_event(NSEventType::LeftMouseUp, 7, 105);
+        record_press(&up);
+        assert!(PRESS.with(|p| p.borrow().is_none()));
+        assert!(press_for_drag(7, 1, || None).is_none());
+        let fallback = press_for_drag(7, 1, || Some(down)).expect("current mouse-down fallback");
+        assert_eq!(fallback.eventNumber(), 104);
     }
 }

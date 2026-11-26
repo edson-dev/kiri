@@ -418,10 +418,15 @@ fn route(client: &mut impl ReadWrite, engine: &Engine, scheme: &str) -> io::Resu
         }
     };
     let text = String::from_utf8_lossy(&head[..end]);
-    let host = text
+    let mut hosts = text
         .lines()
-        .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.trim().to_owned()))
-        .unwrap_or_default();
+        .skip(1)
+        .filter_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.trim().to_owned()));
+    let host = hosts.next().unwrap_or_default();
+    if hosts.next().is_some() {
+        respond(client, 400, "Bad Request", "")?;
+        return Ok(None);
+    }
     let Some(target) = engine.route(&host) else {
         // The running containers are listed only for this machine's own
         // names. A page reached through DNS rebinding asks with its own
@@ -628,21 +633,42 @@ fn respond(client: &mut impl Write, status: u16, reason: &str, body: &str) -> io
     )
 }
 
+/// Parses a request `Host` header (`[::1]:80`, `127.0.0.1:80`,
+/// `web.kiri.local:8080`, `web.kiri.local.`), rejecting malformed or zero
+/// ports, non-IPv6 bracketed hosts, and multiple trailing dots.
+pub(super) fn parse_host_name(host: &str) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let valid_port = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n != 0);
+    if let Some(v6) = host.strip_prefix('[') {
+        let addr = match v6.split_once(']') {
+            Some((addr, "")) => addr,
+            Some((addr, rest)) if rest.strip_prefix(':').is_some_and(valid_port) => addr,
+            _ => return None,
+        };
+        addr.parse::<std::net::Ipv6Addr>().ok()?;
+        return Some(addr.to_ascii_lowercase());
+    }
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') && valid_port(port) => name,
+        Some(_) => return None,
+        None => host,
+    };
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty() || name.ends_with('.') {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
+
 /// Whether a request's Host is a name for this machine itself: `localhost`,
 /// anything under `.localhost` (which always resolves to loopback), a
 /// `.kiri.local` name, or a loopback address. Another site's domain is not,
 /// even when its DNS answers with 127.0.0.1.
 fn local_host(host: &str) -> bool {
-    let host = host.trim();
-    // Without the port: `[::1]:80`, `127.0.0.1:80`, `web.kiri.localhost:8080`.
-    let name = match host.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => match host.rsplit_once(':') {
-            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
-            _ => host,
-        },
-    };
-    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let Some(name) = parse_host_name(host) else { return false };
     name == "localhost" || name.ends_with(".localhost") || name.ends_with(".kiri.local") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
@@ -674,10 +700,33 @@ mod tests {
     /// machine's own names only: a rebinding page's Host is its own domain.
     #[test]
     fn only_this_machines_names_get_the_container_list() {
-        for local in ["localhost", "localhost:80", "nope.kiri.localhost", "NOPE.Kiri.Localhost:8080", "web.shop.kiri.local", "api.kiri.local:18780", "127.0.0.1", "127.0.0.1:80", "[::1]", "[::1]:443", "anything.localhost."] {
+        for local in ["localhost", "localhost:80", "localhost:65535", "nope.kiri.localhost", "NOPE.Kiri.Localhost:8080", "web.shop.kiri.local", "api.kiri.local:18780", "127.0.0.1", "127.0.0.1:80", "[::1]", "[::1]:1", "[::1]:443", "[::1]:65535", "anything.localhost."] {
             assert!(super::local_host(local), "{local}");
         }
-        for foreign in ["", "rebind.example.com", "rebind.example.com:80", "kiri.localhost.example.com", "localhost.example.com", "192.168.1.10", "10.0.0.1:80", "[2001:db8::1]:80", "notlocalhost", "kiri.local.evil.io"] {
+        for foreign in [
+            "",
+            "rebind.example.com",
+            "rebind.example.com:80",
+            "kiri.localhost.example.com",
+            "localhost.example.com",
+            "192.168.1.10",
+            "10.0.0.1:80",
+            "[2001:db8::1]:80",
+            "notlocalhost",
+            "kiri.local.evil.io",
+            "[::1]rebind.example.com",
+            "[::1]:notaport",
+            "[::1",
+            "[::1]:0",
+            "[::1]:65536",
+            "[::1]:+80",
+            "[::1]:",
+            "localhost:0",
+            "localhost:65536",
+            "localhost:+80",
+            "localhost:",
+            "localhost:abc",
+        ] {
             assert!(!super::local_host(foreign), "{foreign}");
         }
     }
@@ -713,5 +762,15 @@ mod tests {
         assert_eq!(choose(&[], None), 80);
         // Listening elsewhere only: keep the first candidate.
         assert_eq!(choose(&[3000], Some(&[9229])), 3000);
+    }
+
+    #[test]
+    fn parse_host_name_trims_trailing_dot_and_rejects_bad_ports() {
+        assert_eq!(super::parse_host_name("web.kiri.local."), Some("web.kiri.local".into()));
+        assert_eq!(super::parse_host_name("WEB.KIRI.LOCAL:8080"), Some("web.kiri.local".into()));
+        assert_eq!(super::parse_host_name("[::1]:8080"), Some("::1".into()));
+        for bad in ["", "web.kiri.local:0", "web.kiri.local:65536", "web.kiri.local:abc", "web.kiri.local:", "web.kiri.local:+80", "a:b:80", "[web.kiri.local]:80", "[localhost]", "web.kiri.local.."] {
+            assert_eq!(super::parse_host_name(bad), None, "{bad}");
+        }
     }
 }

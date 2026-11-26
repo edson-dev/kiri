@@ -59,8 +59,18 @@ fn run(mountpoint: &str) {
     }
 }
 
-fn trim(mountpoint: &str) -> io::Result<()> {
+/// Runs `FITRIM` on `mountpoint` and returns the trimmed byte count reported
+/// by the kernel (`fstrim_range.len`). Single-threaded and safe from the agent loop.
+pub(super) fn trim(mountpoint: &str) -> io::Result<u64> {
     let disk = File::open(mountpoint)?;
+    // Commit any pending ext4 journal transactions (e.g. a `docker image prune`
+    // or `docker volume rm` that finished moments ago) before FITRIM scans free
+    // block bitmaps; otherwise jbd2 still pins those blocks and marks the block
+    // group trimmed.
+    // SAFETY: syncfs takes any valid open file descriptor on the filesystem.
+    unsafe {
+        libc::syncfs(disk.as_raw_fd());
+    }
     let mut range = FstrimRange {
         start: 0,
         len: u64::MAX,
@@ -70,5 +80,25 @@ fn trim(mountpoint: &str) -> io::Result<()> {
     if unsafe { libc::ioctl(disk.as_raw_fd(), FITRIM, &mut range) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(range.len)
+}
+
+/// Reports `(in_use, capacity)` in bytes for the filesystem mounted at
+/// `mountpoint`, using `statvfs` (`in_use = (blocks - bfree) * frsize`,
+/// `capacity = blocks * frsize`). Uses `f_bfree` rather than `f_bavail`
+/// because `FITRIM` discards free blocks (`f_bfree`), never root-reserved
+/// non-free blocks.
+pub(super) fn stat(mountpoint: &str) -> io::Result<(u64, u64)> {
+    let path = std::ffi::CString::new(mountpoint).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: statvfs fills a zero-initialized struct for a valid NUL-terminated path.
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut s) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let frsize = if s.f_frsize > 0 { s.f_frsize as u64 } else { s.f_bsize as u64 };
+    let blocks = s.f_blocks as u64;
+    let bfree = s.f_bfree as u64;
+    let in_use = blocks.saturating_sub(bfree).saturating_mul(frsize);
+    let capacity = blocks.saturating_mul(frsize);
+    Ok((in_use, capacity))
 }

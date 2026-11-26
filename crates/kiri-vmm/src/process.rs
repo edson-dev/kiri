@@ -132,6 +132,11 @@ impl Vm {
         })?;
         let mut cmd = Command::new(&cfg.initrd);
         cmd.env("KIRI_AGENT_DIR", &dir).env_remove("KIRI_SOCKET");
+        if let Some(data) = &cfg.disk {
+            cmd.env("KIRI_AGENT_DATA", data);
+        } else {
+            cmd.env_remove("KIRI_AGENT_DATA");
+        }
         if let Some(fd) = cfg.console {
             cmd.stderr(std::process::Stdio::from(fd.try_clone()?)).stdout(std::process::Stdio::from(fd));
         } else {
@@ -141,6 +146,12 @@ impl Vm {
         let stopped = Arc::new(Mutex::new(OnStop::default()));
         watch(child.clone(), sender, stopped.clone())?;
         Ok(Vm { dir, child, events, closing: Arc::new(AtomicBool::new(false)), retired: false, stopped })
+    }
+
+    /// The folder of the agent's sockets, private to root, where it also
+    /// leaves notes for the engine.
+    pub fn agent_dir(&self) -> &Path {
+        &self.dir
     }
 
     pub fn next_event(&self, timeout: Duration) -> Option<Event> {

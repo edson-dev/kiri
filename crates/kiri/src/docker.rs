@@ -21,7 +21,7 @@ pub const COMMANDS: &[&str] = &[
 /// `kiri update` is two commands. Alone or with `--check` it updates Kiri;
 /// with anything else it is Docker's `update`, which always names a
 /// container (`kiri update --memory 256m web`).
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn is_container_update(args: &[String]) -> bool {
     args.iter().any(|a| !matches!(a.as_str(), "--check" | "-h" | "--help"))
 }
@@ -36,9 +36,7 @@ pub fn handles(command: &str) -> bool {
 pub fn run(args: &[String]) -> io::Result<()> {
     let docker = client::docker_cli().ok_or_else(|| io::Error::other("no docker CLI found; open Kiri once to set it up"))?;
     let socket = client::socket()?;
-    if !client::alive() {
-        return Err(io::Error::other("Kiri isn't running. Open Kiri, or start it with `kiri daemon`"));
-    }
+    client::check_alive()?;
     let mut cmd = std::process::Command::new(docker);
     cmd.args(args).env("DOCKER_HOST", format!("unix://{}", socket.display())).env_remove("DOCKER_CONTEXT");
     // With DOCKER_HOST and no context, buildx would pick the endpoint's own
@@ -57,6 +55,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
 /// Exits with docker's exit code.
 #[cfg(windows)]
 pub fn run(args: &[String]) -> io::Result<()> {
+    crate::setup_win::heal_quietly();
     let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("docker.exe"))).filter(|d| d.is_file());
     let status = std::process::Command::new(beside.unwrap_or_else(|| "docker.exe".into()))
         .args(["--context", crate::flavor::CONTEXT.get()])

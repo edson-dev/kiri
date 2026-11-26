@@ -8,11 +8,11 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
-use kiri_proto::{Exited, MAX_OUTPUT_CHUNK, Msg, Stats, Stream};
+use kiri_proto::{Exited, MAX_OUTPUT_CHUNK, MemoryPressure, Msg, Stats, Stream};
 
 use super::container::{self, NetCtx, Paths, Process, Root};
 use super::net::{self, Bridges, Dhcp};
-use super::{fsnotify, layers, meminfo, sys};
+use super::{fsnotify, layers, meminfo_full, sys};
 
 /// Input held for a process that is not reading yet. The host sends at most
 /// `INPUT_WINDOW` bytes beyond what `InputConsumed` acknowledged, so a
@@ -47,6 +47,36 @@ impl Proc {
 /// How long a hung-up terminal waits before it's polled again.
 const TTY_HUP_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
+type FileStamp = Option<(u64, u64, i64, i64)>;
+
+/// Caches the host's DNS servers by the metadata of `/etc/resolv.conf` and
+/// `/run/systemd/resolve/resolv.conf`, so DNS listener wake-ups only re-read
+/// them when either file's inode, size or modification time has changed.
+#[derive(Default)]
+struct HostDns {
+    stamp: Option<[FileStamp; 2]>,
+    checked_at: Option<std::time::Instant>,
+    servers: Vec<[u8; 4]>,
+}
+
+impl HostDns {
+    fn get(&mut self) -> &[[u8; 4]] {
+        use std::os::unix::fs::MetadataExt;
+        let now_inst = std::time::Instant::now();
+        if self.checked_at.is_some_and(|t| now_inst.saturating_duration_since(t) < std::time::Duration::from_millis(250)) {
+            return &self.servers;
+        }
+        self.checked_at = Some(now_inst);
+        let stat = |p: &str| std::fs::metadata(p).ok().map(|m| (m.ino(), m.len(), m.mtime(), m.mtime_nsec()));
+        let now = [stat("/etc/resolv.conf"), stat("/run/systemd/resolve/resolv.conf")];
+        if self.stamp != Some(now) {
+            self.servers = super::transport::host_dns();
+            self.stamp = Some(now);
+        }
+        &self.servers
+    }
+}
+
 pub fn serve(conn: File, paths: &Paths) -> io::Result<()> {
     let mut procs: HashMap<libc::pid_t, Proc> = HashMap::new();
     let served = serve_loop(conn, paths, &mut procs);
@@ -78,9 +108,20 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     // The published ports the kernel forwards, by container (on a Linux
     // host; in the VM, TCP ones reached over the NAT network).
     let mut published: Vec<(String, super::netlink::Dnat)> = Vec::new();
-    let host_dns = if host_process { super::transport::host_dns() } else { Vec::new() };
+    let mut host_dns = HostDns::default();
+    if host_process {
+        host_dns.get();
+        if super::sys::is_wsl()
+            && let Err(e) = super::localtime::ensure_localtime()
+        {
+            eprintln!("kiri-init: localtime: {e}");
+        }
+    }
     let mut dhcp: Option<Dhcp> = if host_process {
         if let Err(e) = net::host_uplink() {
+            if e.kind() == io::ErrorKind::AddrInUse {
+                return Err(e);
+            }
             eprintln!("kiri-init: no uplink: {e}");
         }
         None
@@ -95,8 +136,11 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     };
     // On a Linux host, SIGTERM or SIGINT stops the agent as Shutdown does.
     let term = if host_process { Some(term_signals()?) } else { None };
-    // On a Linux host, Docker's firewall may come after the engine.
+    // On a Linux host, its firewall may start, reload or flush after the engine,
+    // and interfaces/routes (foreign bridges, default-route bridges, VPNs) may appear or change.
     let firewall = if host_process { net::firewall_events() } else { None };
+    let link_events = if host_process { net::link_route_events() } else { None };
+    let netns_lock = if host_process { net::netns_lock_fd() } else { None };
     let mut bridges = Bridges::default();
     // In the VM, lookups the gateway's resolver fails go through the host.
     let mut dns = super::dns::Dns::default();
@@ -107,6 +151,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
     // listener would only be a port open to the LAN and a clash with any
     // host service on it.
     let host_bound = if host_process { None } else { Some(super::relay::listen_host_bound(net::HOST_RELAY_PORT)?) };
+    let mut egress = if host_process { None } else { Some(super::relay::listen_host_bound(net::EGRESS_RELAY_PORT)?) };
     let framed = super::relay::listen_framed()?;
     let ssh_agent = super::relay::listen_ssh_agent()?;
     // The engine's API for containers that mount the docker socket (VM only).
@@ -146,12 +191,11 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         fds.push(libc::pollfd { fd: sigfd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         // Always present (fd -1 is ignored by poll), so process fds start at 3.
         fds.push(libc::pollfd { fd: dhcp.as_ref().map_or(-1, Dhcp::fd), events: libc::POLLIN, revents: 0 });
-        for fd in dns.fds() {
-            fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
-        }
+        dns.interest(&mut fds);
         fds.push(libc::pollfd { fd: forward.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: framed.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: host_bound.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: egress.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: ssh_agent.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: engine_api.as_ref().map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: copies.as_raw_fd(), events: libc::POLLIN, revents: 0 });
@@ -160,6 +204,8 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         fds.push(libc::pollfd { fd: pressure.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLPRI, revents: 0 });
         fds.push(libc::pollfd { fd: term.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: firewall.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: link_events.as_ref().map_or(-1, |f| f.as_raw_fd()), events: libc::POLLIN, revents: 0 });
+        fds.push(libc::pollfd { fd: netns_lock.unwrap_or(-1), events: libc::POLLIN, revents: 0 });
         fds.push(libc::pollfd { fd: measuring.as_ref().map_or(-1, super::usage::Job::fd), events: libc::POLLIN, revents: 0 });
         super::copy::interest(&mut fds);
         for r in &relays {
@@ -231,8 +277,6 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
             }
         }
 
-        dns.on_timer();
-
         // Output and input first, so a process's last words go out before its exit.
         for pfd in &fds[3..] {
             if pfd.revents == 0 {
@@ -244,6 +288,14 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
             }
             if let Some(f) = firewall.as_ref().filter(|f| f.as_raw_fd() == pfd.fd) {
                 net::firewall_changed(f);
+                continue;
+            }
+            if let Some(l) = link_events.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
+                net::link_route_changed(l);
+                continue;
+            }
+            if netns_lock == Some(pfd.fd) {
+                net::drain_netns_lock(pfd.fd);
                 continue;
             }
             if measuring.as_ref().is_some_and(|j| j.fd() == pfd.fd) {
@@ -272,8 +324,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 // At most ten a second: the host reacts to the first one.
                 if last_pressure.elapsed() >= std::time::Duration::from_millis(100) {
                     last_pressure = std::time::Instant::now();
+                    let (_, mem_available_kib, _, _) = meminfo_full();
+                    let (mem_stall, _) = super::cgroup::memory_trouble();
                     out.clear();
-                    Msg::MemoryPressure.encode(&mut out);
+                    Msg::MemoryPressure(MemoryPressure { mem_available_kib, mem_stall }).encode(&mut out);
                     conn.write_all(&out)?;
                 }
                 continue;
@@ -314,7 +368,13 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 continue;
             }
             if let Some(l) = host_bound.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
-                while let Some(r) = super::relay::accept_host_bound(l, super::net::HOST_ADDR) {
+                while let Some(r) = super::relay::accept_host_bound(l, super::net::HOST_ADDR, super::net::HOST_RELAY_PORT) {
+                    relays.push(r);
+                }
+                continue;
+            }
+            if let Some(l) = egress.as_ref().filter(|l| l.as_raw_fd() == pfd.fd) {
+                while let Some(r) = super::relay::accept_egress(l, super::net::HOST_ADDR) {
                     relays.push(r);
                 }
                 continue;
@@ -327,7 +387,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 continue;
             }
             if dns.owns(pfd.fd) {
-                let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns);
+                if host_process && dns.is_listener(pfd.fd) {
+                    host_dns.get();
+                }
+                let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns.servers[..], |l| &l.dns);
                 dns.on_readable(pfd.fd, upstream);
                 continue;
             }
@@ -361,6 +424,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         }
 
         relays.retain(|r| !r.dead);
+
+        // After the replies that arrived with this wake-up were read, so one
+        // that came in just as its wait ran out is not thrown away.
+        dns.on_timer();
 
         if fds[1].revents != 0 {
             drain_signals(&sigfd);
@@ -413,11 +480,21 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     return Ok(());
                 }
                 Ok(Msg::StatsRequest) => {
-                    let (mem_total_kib, mem_available_kib) = meminfo();
+                    let (mem_total_kib, mem_available_kib, mem_balloon_kib, mem_committed_kib) = meminfo_full();
                     let agent_rss_kib = self_rss_kib();
                     let (mem_stall, oom_kills) = super::cgroup::memory_trouble();
-                    Msg::Stats(Stats { uptime_ns: sys::boottime_ns(), mem_total_kib, mem_available_kib, agent_rss_kib, mem_used_kib: held_kib(paths, agent_rss_kib), mem_stall, oom_kills })
-                        .encode(&mut out)
+                    Msg::Stats(Stats {
+                        uptime_ns: sys::boottime_ns(),
+                        mem_total_kib,
+                        mem_available_kib,
+                        agent_rss_kib,
+                        mem_used_kib: held_kib(paths, agent_rss_kib),
+                        mem_stall,
+                        oom_kills,
+                        mem_balloon_kib,
+                        mem_committed_kib,
+                    })
+                    .encode(&mut out)
                 }
                 Ok(Msg::LayerQuery(digest)) => Msg::LayerStatus(layers::present(&paths.layers, digest)).encode(&mut out),
                 // The blob follows the frame on the same stream.
@@ -428,8 +505,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 Ok(Msg::Run(spec)) => match {
                     // A container that wants the network must not start before the
                     // VM has it: right after boot the DHCP lease can be a few
-                    // hundred milliseconds away.
-                    if spec.flags & (kiri_proto::run_flags::NET_NONE | kiri_proto::run_flags::NET_HOST) == 0 {
+                    // hundred milliseconds away. Only `--network none` skips it;
+                    // `--network host` shares the VM's network and needs the lease
+                    // too (on a Linux host `dhcp` is None so this is a no-op).
+                    if needs_lease(spec.flags) {
                         wait_for_lease(&mut dhcp, std::time::Duration::from_secs(3));
                     }
                     // Only its network namespace is joined, which exists from
@@ -437,11 +516,14 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     let join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::NETNS).next().and_then(|t| netns_pid(procs, t));
                     // A PID namespace exists from clone too.
                     let pid_join_pid = kiri_proto::net_opts::values(spec.net.opts, kiri_proto::net_opts::PIDNS).next().and_then(|t| live_pid(procs, t));
+                    if host_process {
+                        host_dns.get();
+                    }
                     failed_starts.remove(spec.id);
                     container::spawn(
                     &spec,
                     paths,
-                    NetCtx { bridges: &mut bridges, dns: &mut dns, upstream_dns: dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns), join_pid, pid_join_pid },
+                    NetCtx { bridges: &mut bridges, dns: &mut dns, upstream_dns: dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns.servers[..], |l| &l.dns), join_pid, pid_join_pid },
                 )
                 } {
                     Ok(run) => {
@@ -537,15 +619,18 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     continue;
                 }
                 Ok(Msg::Publish(p)) => {
-                    // In the VM: from the Mac over the NAT network, TCP only.
+                    // In the VM: from the Mac over the NAT network (TCP only),
+                    // or on loopback (127.0.0.1) so `--network host` containers
+                    // reach published ports via the host relay even without eth0.
                     let gateway = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map(|l| l.gateway);
-                    if !host_process && (p.udp || gateway.is_none()) {
+                    let loopback = p.host_ip == super::netlink::LOOPBACK;
+                    if !host_process && (p.udp || (!loopback && gateway.is_none())) {
                         Msg::Error("published ports are relayed on this platform").encode(&mut out);
                     } else {
                         let d = super::netlink::Dnat { udp: p.udp, host_ip: p.host_ip, host_port: p.host_port, to_ip: p.to_ip, to_port: p.to_port };
                         published.push((p.id.to_owned(), d));
                         let all = published.iter().map(|(_, d)| *d).collect::<Vec<_>>();
-                        match if host_process { net::publish(&all) } else { net::publish_vm(&all, gateway.expect("checked")) } {
+                        match if host_process { net::publish(&all) } else { net::publish_vm(&all, gateway.unwrap_or([0; 4])) } {
                             Ok(()) => Msg::Ack.encode(&mut out),
                             Err(e) => {
                                 published.pop();
@@ -560,7 +645,7 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     if published.len() != before {
                         let all = published.iter().map(|(_, d)| *d).collect::<Vec<_>>();
                         let gateway = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or([0; 4], |l| l.gateway);
-                        if let Err(e) = if host_process { net::publish(&all) } else { net::publish_vm(&all, gateway) } {
+                        if let Err(e) = if host_process { net::unpublish(&all) } else { net::publish_vm(&all, gateway) } {
                             eprintln!("kiri-init: unpublish {id}: {e}");
                         }
                     }
@@ -600,24 +685,54 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     fs_events.add(lines.iter());
                     continue;
                 }
+                Ok(Msg::SetEgressRoutes(routes)) => {
+                    let parsed = net::parse_egress_routes(routes);
+                    if !host_process && !parsed.is_empty() && egress.is_none() {
+                        egress = super::relay::listen_host_bound(net::EGRESS_RELAY_PORT)
+                            .inspect_err(|e| eprintln!("kiri-init: no egress relay listener: {e}"))
+                            .ok();
+                    }
+                    dns.prefer_relay = !host_process && net::egress_prefers_dns_relay(&parsed);
+                    if let Err(e) = net::set_egress_routes(parsed) {
+                        eprintln!("kiri-init: egress routes: {e}");
+                    }
+                    continue;
+                }
                 Ok(Msg::Retain(keep)) => {
                     let running: Vec<&str> = procs.values().map(|p| p.run.id.as_str()).collect();
                     container::retain(paths, keep, &running);
                     continue;
                 }
                 Ok(Msg::RetainLayers(keep)) => {
-                    layers::retain(&paths.layers, keep.iter());
+                    // Any layer currently mounted as a lowerdir of a running
+                    // container or copy job stays until its mount is released.
+                    let mounted = super::roots::in_use_layers();
+                    layers::retain(&paths.layers, keep.iter().chain(mounted.iter().map(String::as_str)));
                     continue;
                 }
                 Ok(Msg::SetTime(ns)) => {
                     // A host process shares the host's clock; only the VM needs
                     // telling. The host sends it again every minute and after
-                    // the Mac wakes: stepped only when off by more than a
-                    // quarter second, so the clock is not nudged back and forth.
-                    if !host_process && clock_off(ns) {
-                        let ts = libc::timespec { tv_sec: (ns / 1_000_000_000) as _, tv_nsec: (ns % 1_000_000_000) as _ };
-                        // SAFETY: `ts` is a valid timespec.
-                        unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+                    // the Mac wakes: slew sub-second drift smoothly with
+                    // adjtimex (#509) and hard-step only large jumps (> 1 s).
+                    if !host_process {
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+                        match clock_adjustment(now, ns) {
+                            ClockAdjust::None => {}
+                            ClockAdjust::Slew(offset_us) => {
+                                // SAFETY: zeroed `libc::timex` is valid; only plain scalar fields are set.
+                                let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+                                tx.modes = libc::ADJ_OFFSET_SINGLESHOT;
+                                tx.offset = offset_us as _;
+                                // SAFETY: `tx` is a valid initialized `libc::timex`.
+                                unsafe { libc::adjtimex(&mut tx) };
+                            }
+                            ClockAdjust::Step => {
+                                let ts = libc::timespec { tv_sec: (ns / 1_000_000_000) as _, tv_nsec: (ns % 1_000_000_000) as _ };
+                                // SAFETY: `ts` is a valid timespec.
+                                unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+                            }
+                        }
                     }
                     continue;
                 }
@@ -664,46 +779,72 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                         let mac = kiri_proto::net_opts::values(n.opts, kiri_proto::net_opts::MAC).next().and_then(net::parse_mac);
                         let v6 = net::Ip6::from_opts(n.opts);
                         let plug = net::Plug::from_opts(n.opts);
-                        let attached = net::attach(&mut bridges, n.bridge, &host_if, pid, num, n.ip, n.prefix, n.gateway, mac, v6, plug)
+                        let is_user = n.bridge != "kiri0";
+                        let attached = net::attach(&mut bridges, n.bridge, &host_if, pid, num, n.ip, n.prefix, n.gateway, mac, v6, plug).and_then(|()| {
+                            if !is_user {
+                                if !plug.no_ipv4 && dns.relay {
+                                    dns.serve_or_warn(n.bridge, n.gateway);
+                                }
+                                return Ok(());
+                            }
                             // A gateway that won't take the listener doesn't
                             // stop the connect: names answer at 127.0.0.11 in
                             // the container (dns.rs `serve_or_warn`, #477).
-                            .map(|()| {
-                                if !plug.no_ipv4 {
-                                    dns.serve_or_warn(n.bridge, n.gateway);
-                                }
-                            })
-                            .and_then(|()| std::fs::File::open(format!("/proc/{pid}/ns/net")).and_then(|ns| dns.serve_in(&ns, pid, n.ip, n.bridge)));
+                            if !plug.no_ipv4 {
+                                dns.serve_or_warn(n.bridge, n.gateway);
+                            }
+                            let res = std::fs::File::open(format!("/proc/{pid}/ns/net")).and_then(|ns| dns.serve_in(&ns, pid, n.bridge));
+                            if res.is_err() {
+                                let _ = net::detach(&host_if);
+                            }
+                            res
+                        });
                         match attached {
                             Ok(()) => {
-                                if let Some(name) = kiri_proto::net_opts::values(n.opts, kiri_proto::net_opts::NETWORK).next() {
-                                    dns.name_network(n.bridge, name);
-                                }
-                                if !plug.no_ipv4 {
-                                    dns.register(n.bridge, n.dns_names.iter(), n.ip);
-                                }
-                                if let Some(v) = v6 {
-                                    dns.register6(n.bridge, n.dns_names.iter(), n.ip, v.ip);
+                                dns.set_bridge_ipv6(n.bridge, bridges.has_ipv6(n.bridge));
+                                if is_user {
+                                    if let Some(name) = kiri_proto::net_opts::values(n.opts, kiri_proto::net_opts::NETWORK).next() {
+                                        dns.name_network(n.bridge, name);
+                                    }
+                                    if !plug.no_ipv4 {
+                                        dns.register(n.bridge, n.dns_names.iter(), n.ip);
+                                    }
+                                    if let Some(v) = v6 {
+                                        dns.register6(n.bridge, n.dns_names.iter(), n.ip, v.ip);
+                                    }
                                 }
                                 if let Some(p) = procs.get_mut(&pid) {
-                                    p.run.dns_entries.push((n.bridge.to_owned(), n.ip));
-                                    p.run.veths.push(host_if.clone());
+                                    if is_user {
+                                        record_dns_entry(&mut p.run, n.bridge, n.ip);
+                                    }
+                                    p.run.uplinks.retain(|u| u.veth != host_if);
+                                    p.run.uplinks.extend(net::Uplink::of(&host_if, ifname, n.gateway, v6, plug));
+                                    p.run.veths.retain(|(iface, _)| iface != ifname);
+                                    p.run.veths.push((ifname.to_owned(), host_if.clone()));
                                 }
                                 // A user network's names come from the embedded
                                 // DNS, which now answers in the container: its
                                 // resolv.conf names it from here on (#449).
-                                if n.bridge != "kiri0" && !plug.no_ipv4 {
-                                    let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns[..], |l| &l.dns);
+                                if is_user {
+                                    if host_process {
+                                        host_dns.get();
+                                    }
+                                    let upstream = dhcp.as_ref().and_then(|d| d.lease.as_ref()).map_or(&host_dns.servers[..], |l| &l.dns);
                                     let is_kiri = |a: [u8; 4]| upstream.contains(&a) || dns.serves_at(a) || a == [1, 1, 1, 1];
                                     match container::use_embedded_dns(id, is_kiri) {
                                         Ok(Some(servers)) if !servers.is_empty() => {
-                                            if let Some(owner) = dns.owner_of(pid) {
-                                                dns.set_upstream(owner, servers);
+                                            dns.set_container_upstream(pid, servers.clone());
+                                            dns.set_upstream(n.ip, servers);
+                                        }
+                                        Ok(_) => {
+                                            if let Some(servers) = dns.container_upstream(pid) {
+                                                dns.set_upstream(n.ip, servers);
                                             }
                                         }
-                                        Ok(_) => {}
                                         Err(e) => eprintln!("kiri-init: {id}: resolv.conf: {e}"),
                                     }
+                                } else {
+                                    attach_kiri0_upstream(&mut dns, procs, pid, n.bridge, n.ip);
                                 }
                                 Msg::Ack.encode(&mut out)
                             }
@@ -712,9 +853,47 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     }
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
+                Ok(Msg::DnsRename { id, bridge, ip, ip6, v4, names }) => {
+                    // The names registered at start are keyed by address, so
+                    // they are replaced as a set; its `--dns` servers stay. A
+                    // stopped container sends no such frame. No reply.
+                    // Only a live container's own address on one of Kiri's
+                    // bridges: a frame that raced the container's exit or its
+                    // leaving the network, or that names another's address,
+                    // changes nothing.
+                    if rename_allowed(procs, id, bridge, ip) {
+                        let ip6 = <[u8; 16]>::try_from(ip6).ok();
+                        dns.rename(bridge, ip, ip6, v4, &names.iter().collect::<Vec<_>>());
+                    }
+                    continue;
+                }
                 Ok(Msg::UplinkQuery) => match dhcp.as_ref().and_then(|d| d.lease.as_ref()) {
                     Some(l) => Msg::Uplink { ip: l.ip, gateway: l.gateway }.encode(&mut out),
                     None => Msg::Error("no uplink lease").encode(&mut out),
+                },
+                Ok(Msg::DiskUsageQuery) => match super::trim::stat(super::DATA) {
+                    Ok((in_use, capacity)) => Msg::DiskUsage { in_use, capacity }.encode(&mut out),
+                    Err(e) => Msg::Error(&format!("disk usage: {e}")).encode(&mut out),
+                },
+                Ok(Msg::TrimDisk) => match super::trim::trim(super::DATA) {
+                    Ok(trimmed) => {
+                        let (in_use, capacity) = super::trim::stat(super::DATA).unwrap_or((0, 0));
+                        Msg::DiskTrimmed { trimmed, in_use, capacity }.encode(&mut out);
+                    }
+                    Err(e) => Msg::Error(&format!("trim: {e}")).encode(&mut out),
+                },
+                Ok(Msg::SetUplink { ip, prefix, gateway, dns: dns_ip }) => match dhcp.as_mut() {
+                    _ if host_process => Msg::Error("set uplink is only for the VM").encode(&mut out),
+                    Some(d) => match d.apply_static(ip, prefix, gateway, dns_ip) {
+                        Ok(applied) => {
+                            if applied {
+                                eprintln!("kiri-init: DHCP did not answer; configured {} statically as {}/{} via {} from host", net::UPLINK, net::ip_str(ip), prefix, net::ip_str(gateway));
+                            }
+                            Msg::Ack.encode(&mut out);
+                        }
+                        Err(e) => Msg::Error(&format!("set uplink: {e}")).encode(&mut out),
+                    },
+                    None => Msg::Error("no uplink interface").encode(&mut out),
                 },
                 Ok(Msg::Route { dst, prefix, via, add }) => match net::route(dst, prefix, via, add) {
                     Ok(()) => Msg::Ack.encode(&mut out),
@@ -723,15 +902,26 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                 Ok(Msg::NetDetach { id, ifname, bridge, ip }) => match netns_pid(procs, id) {
                     Some(pid) => {
                         let num: u32 = ifname.strip_prefix("eth").and_then(|v| v.parse().ok()).unwrap_or(1);
+                        let host_if = procs
+                            .get(&pid)
+                            .and_then(|p| p.run.veth_for(ifname).map(str::to_owned))
+                            .unwrap_or_else(|| extra_veth(id, num));
                         dns.unregister(bridge, ip);
                         dns.leave(pid, bridge);
-                        let host_if = extra_veth(id, num);
                         if let Some(p) = procs.get_mut(&pid) {
                             p.run.dns_entries.retain(|(b, a)| !(b == bridge && *a == ip));
-                            p.run.veths.retain(|v| *v != host_if);
+                            p.run.veths.retain(|(iface, _)| iface != ifname);
                         }
                         match net::detach(&host_if) {
-                            Ok(()) => Msg::Ack.encode(&mut out),
+                            Ok(()) => {
+                                if let Some(p) = procs.get_mut(&pid) {
+                                    // Unplugged already: a route that cannot move is no reason to fail the disconnect.
+                                    if let Err(e) = net::hand_over_default_routes(pid, &mut p.run.uplinks, &host_if) {
+                                        eprintln!("kiri-init: moving {id}'s default route after a disconnect: {e}");
+                                    }
+                                }
+                                Msg::Ack.encode(&mut out)
+                            }
                             Err(e) => Msg::Error(&format!("disconnect: {e}")).encode(&mut out),
                         }
                     }
@@ -764,7 +954,20 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
                     },
                     None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
                 },
+                Ok(Msg::FsReadLink { id, path }) => match running_rootfs(procs, paths, id) {
+                    Some(root) => match super::fsview::read_link(&root, path, &mut fs_buf) {
+                        Ok(()) => Msg::FsData(&fs_buf).encode(&mut out),
+                        Err(e) => Msg::Error(&format!("readlink {path}: {e}")).encode(&mut out),
+                    },
+                    None => Msg::Error(&format!("container {id} is not running")).encode(&mut out),
+                },
                 Ok(other) => Msg::Error(&format!("unexpected {other:?}")).encode(&mut out),
+                // A frame the host expects no reply to gets none, decoded
+                // or not: an answer would be read as the next one's reply.
+                Err(e) if kiri_proto::takes_no_reply(&frame) => {
+                    eprintln!("kiri-init: dropped a bad no-reply frame: {e:?}");
+                    continue;
+                }
                 Err(e) => Msg::Error(&format!("bad frame: {e:?}")).encode(&mut out),
             }
             conn.write_all(&out)?;
@@ -774,6 +977,13 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
 
 /// A PSI trigger: readable (POLLPRI) when tasks stall on memory for 50 ms
 /// within any 500 ms window. None if the kernel has no PSI.
+/// Whether a container start should wait for the VM's DHCP lease: every
+/// network mode except `--network none`, including `--network host` (which
+/// shares the VM's network and needs its route and upstream DNS).
+fn needs_lease(flags: u32) -> bool {
+    flags & kiri_proto::run_flags::NET_NONE == 0
+}
+
 /// Runs the DHCP client alone until it has a lease or `max` passes.
 fn wait_for_lease(dhcp: &mut Option<Dhcp>, max: std::time::Duration) {
     let Some(d) = dhcp.as_mut() else { return };
@@ -789,7 +999,11 @@ fn wait_for_lease(dhcp: &mut Option<Dhcp>, max: std::time::Duration) {
         // SAFETY: one valid pollfd.
         unsafe { libc::poll(&mut pfd, 1, wait.max(1)) };
         if pfd.revents != 0 {
-            let _ = d.on_readable();
+            if let Ok(true) = d.on_readable()
+                && let Some(l) = &d.lease
+            {
+                eprintln!("kiri-init: {} is {}/{} via {}", net::UPLINK, net::ip_str(l.ip), l.prefix, net::ip_str(l.gateway));
+            }
         }
         let _ = d.on_timer();
     }
@@ -819,6 +1033,34 @@ fn live_pid(procs: &HashMap<libc::pid_t, Proc>, id: &str) -> Option<libc::pid_t>
 /// and is not yet entered: its child has perhaps not joined it, and
 /// `/proc/<pid>/ns/net` could still be the host's. Answered as for a
 /// container that is not running.
+/// Records `(bridge, ip)` once in `run.dns_entries` so container exit (or
+/// `NetDetach`) cleans up any names and per-IP DNS upstreams registered for it.
+fn record_dns_entry(run: &mut Process, bridge: &str, ip: [u8; 4]) {
+    if !run.dns_entries.iter().any(|(b, a)| b == bridge && *a == ip) {
+        run.dns_entries.push((bridge.to_owned(), ip));
+    }
+}
+
+/// Applies the container's `--dns` upstreams to a newly attached `kiri0`
+/// address and records it in `dns_entries` so exit without `NetDetach` drops it.
+fn attach_kiri0_upstream(dns: &mut super::dns::Dns, procs: &mut HashMap<libc::pid_t, Proc>, pid: libc::pid_t, bridge: &str, ip: [u8; 4]) {
+    if let Some(servers) = dns.container_upstream(pid) {
+        dns.set_upstream(ip, servers);
+        if let Some(p) = procs.get_mut(&pid) {
+            record_dns_entry(&mut p.run, bridge, ip);
+        }
+    }
+}
+
+/// Whether a `DnsRename` may change names: `ip` on `bridge` is a live
+/// container's own entry, and the bridge is one of Kiri's user networks.
+fn rename_allowed(procs: &HashMap<libc::pid_t, Proc>, id: &str, bridge: &str, ip: [u8; 4]) -> bool {
+    bridge.starts_with("kiri")
+        && bridge != "kiri0"
+        && ip != [0; 4]
+        && procs.values().any(|p| p.run.container.is_none() && p.exited.is_none() && p.run.id == id && p.run.dns_entries.iter().any(|(b, a)| b == bridge && *a == ip))
+}
+
 fn netns_pid(procs: &HashMap<libc::pid_t, Proc>, id: &str) -> Option<libc::pid_t> {
     procs.iter().find(|(_, p)| p.run.container.is_none() && p.run.id == id && p.exited.is_none() && (!p.run.joins_netns || p.enterable())).map(|(pid, _)| *pid)
 }
@@ -980,15 +1222,31 @@ fn self_rss_kib() -> u64 {
     pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64 / 1024
 }
 
-/// Whether the guest's clock is more than a quarter second from `ns`
-/// (Unix nanoseconds, the host's time).
-fn clock_off(ns: u64) -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
-    off_by_more(now, ns, 250_000_000)
+const CLOCK_SLOP_NS: u64 = 250_000_000;
+const CLOCK_STEP_NS: u64 = 1_000_000_000;
+const ADJ_MAX_PHASE_US: i64 = 500_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockAdjust {
+    None,
+    /// Smoothly slew `offset_us` microseconds via `adjtimex(ADJ_OFFSET_SINGLESHOT)`.
+    Slew(i64),
+    /// Hard-step `CLOCK_REALTIME` after large jumps (e.g. VM wake from sleep).
+    Step,
 }
 
-fn off_by_more(a: u64, b: u64, limit: u64) -> bool {
-    a.abs_diff(b) > limit
+/// Decides how the guest clock should correct drift toward `target_ns` (Unix ns):
+/// ignore `<= 250 ms`, slew `(250 ms, 1 s]` smoothly, and hard-step `> 1 s` (#509).
+fn clock_adjustment(now_ns: u64, target_ns: u64) -> ClockAdjust {
+    let diff = now_ns.abs_diff(target_ns);
+    if diff <= CLOCK_SLOP_NS {
+        return ClockAdjust::None;
+    }
+    if diff > CLOCK_STEP_NS {
+        return ClockAdjust::Step;
+    }
+    let signed_us = if target_ns >= now_ns { (diff / 1_000) as i64 } else { -((diff / 1_000) as i64) };
+    ClockAdjust::Slew(signed_us.clamp(-ADJ_MAX_PHASE_US, ADJ_MAX_PHASE_US))
 }
 
 /// Reads one frame into `buf`. Returns false on a clean end of stream.
@@ -1200,8 +1458,52 @@ fn reap(procs: &mut HashMap<libc::pid_t, Proc>) {
 
 #[cfg(test)]
 mod running_tests {
-    use super::{Process, await_start, live_pid, netns_pid, new_proc, running, running_pid, settle_roots};
+    use super::{Process, await_start, live_pid, netns_pid, new_proc, rename_allowed, running, running_pid, settle_roots};
     use std::collections::HashMap;
+
+    #[test]
+    fn a_dns_rename_changes_only_a_live_containers_own_address() {
+        let ip = [10, 5, 0, 2];
+        let mut procs = HashMap::new();
+        let mut run = Process::for_test("c1", 100);
+        run.dns_entries.push(("kiri1".to_owned(), ip));
+        procs.insert(100, new_proc(run, 0, 0));
+        assert!(rename_allowed(&procs, "c1", "kiri1", ip));
+        assert!(!rename_allowed(&procs, "c2", "kiri1", ip), "another container's id");
+        assert!(!rename_allowed(&procs, "c1", "kiri1", [10, 5, 0, 3]), "another address");
+        assert!(!rename_allowed(&procs, "c1", "kiri2", ip), "a network it is not on");
+        assert!(!rename_allowed(&procs, "c1", "kiri0", ip), "the default bridge");
+        assert!(!rename_allowed(&procs, "c1", "eth0", ip), "not one of Kiri's bridges");
+        let mut run = Process::for_test("c3", 300);
+        run.dns_entries.push(("kiri1".to_owned(), [0; 4]));
+        procs.insert(300, new_proc(run, 0, 0));
+        assert!(!rename_allowed(&procs, "c3", "kiri1", [0; 4]), "no address");
+        // Once it has exited its names are gone with it: a late frame
+        // must not put them back.
+        procs.get_mut(&100).unwrap().exited = Some((0, 0));
+        assert!(!rename_allowed(&procs, "c1", "kiri1", ip));
+    }
+
+    #[test]
+    fn kiri0_upstream_is_recorded_in_dns_entries_and_cleaned_up_on_exit() {
+        let kiri0_ip = [172, 17, 0, 5];
+        let mut dns = super::super::dns::Dns::default();
+        let mut procs = HashMap::new();
+        procs.insert(100, new_proc(Process::for_test("c1", 100), 0, 0));
+        dns.set_container_upstream(100, vec![[8, 8, 8, 8]]);
+
+        super::attach_kiri0_upstream(&mut dns, &mut procs, 100, "kiri0", kiri0_ip);
+        assert_eq!(procs[&100].run.dns_entries, [("kiri0".to_owned(), kiri0_ip)]);
+        assert_eq!(dns.ip_upstream(kiri0_ip), Some(vec![[8, 8, 8, 8]]));
+        assert!(!rename_allowed(&procs, "c1", "kiri0", kiri0_ip), "kiri0 stays disallowed for DnsRename");
+
+        let (_host, mut conn) = pipe();
+        let mut exited = procs.remove(&100).unwrap();
+        exited.exited = Some((0, 0));
+        super::finish(&mut conn, &mut dns, &procs, exited, true).unwrap();
+        assert_eq!(dns.ip_upstream(kiri0_ip), None, "container exit cleans up kiri0 per-IP upstream");
+        assert_eq!(dns.container_upstream(100), None);
+    }
 
     #[test]
     fn a_restarted_container_is_found_never_its_exited_run() {
@@ -1483,7 +1785,12 @@ mod running_tests {
         let mut procs = HashMap::new();
         let mut dns = super::super::dns::Dns::default();
         let mut failed = HashMap::new();
-        let paths = super::Paths { layers: "/l".into(), containers: "/c".into(), cgroup: "/g".into() };
+        let paths = super::Paths {
+            layers: "/l".into(),
+            containers: "/c".into(),
+            cgroup: "/g".into(),
+            cgroup_root: "/sys/fs/cgroup".into(),
+        };
         procs.insert(300, new_proc(Process::starting_for_test("c1", 300, r.into(), None), 0, 0));
         assert_eq!(super::running_rootfs(&procs, &paths, "c1"), Some("/c/c1/rootfs".into()), "not /proc/300/root, which is the agent's own root");
         assert_eq!(super::running_rootfs(&procs, &paths, "nope"), None);
@@ -1524,21 +1831,57 @@ mod running_tests {
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "killed and reaped once its root was in place");
         let _ = child.try_wait();
     }
+
+    #[test]
+    fn wait_for_lease_runs_for_bridged_and_host_but_not_none() {
+        use kiri_proto::run_flags;
+        assert!(super::needs_lease(0), "default bridge needs a lease");
+        assert!(super::needs_lease(run_flags::NET_HOST), "host network in the VM shares eth0 and needs a lease");
+        assert!(super::needs_lease(run_flags::NET_HOST | run_flags::REMOVE));
+        assert!(!super::needs_lease(run_flags::NET_NONE), "--network none skips waiting for a lease");
+        assert!(!super::needs_lease(run_flags::NET_NONE | run_flags::REMOVE));
+        // On a Linux host there is no DHCP client; wait_for_lease is an immediate no-op.
+        let mut none = None;
+        let t = std::time::Instant::now();
+        super::wait_for_lease(&mut none, std::time::Duration::from_secs(3));
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    }
 }
 
 #[cfg(test)]
 mod clock_tests {
-    use super::off_by_more;
+    use super::{ClockAdjust, clock_adjustment};
 
     #[test]
-    fn steps_only_when_the_clock_is_off() {
+    fn slews_subsecond_drift_and_steps_only_large_jumps() {
         let now = 1_792_800_000_000_000_000;
-        assert!(!off_by_more(now, now, 250_000_000));
-        assert!(!off_by_more(now, now + 200_000_000, 250_000_000));
-        assert!(!off_by_more(now + 200_000_000, now, 250_000_000));
-        // An hour behind, after the Mac slept.
-        assert!(off_by_more(now - 3_600_000_000_000, now, 250_000_000));
-        assert!(off_by_more(now + 300_000_000, now, 250_000_000));
+        assert_eq!(clock_adjustment(now, now), ClockAdjust::None);
+        assert_eq!(clock_adjustment(now, now + 200_000_000), ClockAdjust::None);
+        assert_eq!(clock_adjustment(now + 200_000_000, now), ClockAdjust::None);
+        // Sub-second drift (> 250 ms, <= 1 s) slews smoothly via adjtimex instead of stepping.
+        assert_eq!(clock_adjustment(now, now + 300_000_000), ClockAdjust::Slew(300_000));
+        assert_eq!(clock_adjustment(now + 300_000_000, now), ClockAdjust::Slew(-300_000));
+        assert_eq!(clock_adjustment(now, now + 800_000_000), ClockAdjust::Slew(500_000));
+        assert_eq!(clock_adjustment(now + 800_000_000, now), ClockAdjust::Slew(-500_000));
+        // An hour behind, after the Mac slept, still hard-steps.
+        assert_eq!(clock_adjustment(now - 3_600_000_000_000, now), ClockAdjust::Step);
+        assert_eq!(clock_adjustment(now, now + 1_500_000_000), ClockAdjust::Step);
+    }
+}
+
+#[cfg(test)]
+mod veth_tests {
+    use super::extra_veth;
+    use super::super::container::Process;
+
+    #[test]
+    fn detach_looks_up_first_kv_and_fallback_kx_veths() {
+        let mut p = Process::for_test("0123456789abcdef", 10);
+        p.veths.push(("eth0".into(), "kv0123456780001".into()));
+        p.veths.push(("eth1".into(), extra_veth(&p.id, 1)));
+        assert_eq!(p.veth_for("eth0"), Some("kv0123456780001"));
+        assert_eq!(p.veth_for("eth1"), Some("kx0123456781"));
+        assert_eq!(p.veth_for("eth2"), None);
     }
 }
 

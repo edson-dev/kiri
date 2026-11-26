@@ -55,7 +55,7 @@ pub fn handle(action: &str, value: &Value) {
         "start" => op("start", vec!["start".into()]),
         "stop" => op("stop", vec!["stop".into()]),
         "deletecluster" => op("deletecluster", vec!["delete".into()]),
-        // Settings → Kubernetes → Network: saved, and the node recreated with them.
+        // Settings → Kubernetes: saved, and the node recreated with them.
         "set" => {
             let sans: Vec<&str> = value["tls_san"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
             let lan = if value["lan"] == true { "on" } else { "off" };
@@ -63,7 +63,27 @@ pub fn handle(action: &str, value: &Value) {
             if let Some(port) = value["port"].as_u64() {
                 args.extend(["--port".into(), port.to_string()]);
             }
+            if let Some(ver) = value.get("version") {
+                let raw = ver.as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("default");
+                args.extend(["--version".into(), raw.to_owned()]);
+            }
+            if let Some(kargs) = value.get("k3s_args").and_then(Value::as_array) {
+                let list: Vec<String> = kargs.iter().filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
+                if list.is_empty() {
+                    args.push("--clear-k3s-args".into());
+                } else {
+                    for a in list {
+                        args.extend(["--k3s-arg".into(), a]);
+                    }
+                }
+            }
             op("set", args);
+        }
+        "manifests" => {
+            if let Ok(dir) = crate::k8s::manifests_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                super::open(&dir);
+            }
         }
         "delete" => delete(arg("ns"), arg("pod")),
         "logs" => logs(arg("ns"), arg("pod"), arg("container"), value["previous"] == true),
@@ -73,8 +93,15 @@ pub fn handle(action: &str, value: &Value) {
     }
 }
 
-/// Settings' Copy buttons (the API server's address, a kubectl command), by
-/// pbcopy: the page's own clipboard needs a gesture WebKit doesn't always see.
+/// Settings' Copy buttons (the API server's address, a kubectl command):
+/// the page's own clipboard needs a gesture WebKit doesn't always see.
+#[cfg(target_os = "linux")]
+fn copy(text: &str) {
+    super::window::copy(text);
+    emit(notice("ok", &super::trf("Copied {text}", &[("text", &text)])));
+}
+
+#[cfg(not(target_os = "linux"))]
 fn copy(text: &str) {
     use std::io::Write;
     let done = std::process::Command::new("/usr/bin/pbcopy").stdin(std::process::Stdio::piped()).spawn().and_then(|mut c| {
@@ -226,6 +253,10 @@ fn read_lists() -> Value {
     v["op"] = json!(current_op());
     v["context"] = json!(crate::flavor::CONTEXT.get());
     v["config"] = json!(crate::k8s::config());
+    v["default_version"] = json!(crate::k8s::DEFAULT_VERSION);
+    if let Ok(dir) = crate::k8s::manifests_dir() {
+        v["manifests_dir"] = json!(dir);
+    }
     v
 }
 

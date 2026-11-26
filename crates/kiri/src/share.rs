@@ -30,7 +30,7 @@ use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -101,10 +101,22 @@ struct TrafficFile {
     url: Mutex<String>,
     counts: [AtomicU64; 3],
     dirty: AtomicBool,
-    done: AtomicBool,
+    /// Serializes writes to `path` and `Event::Ended` teardown; once `true`,
+    /// neither a timer tick nor a late event can recreate `path` after removal.
+    ended: Mutex<bool>,
 }
 
 impl TrafficFile {
+    fn new(path: PathBuf) -> Self {
+        TrafficFile {
+            path,
+            url: Mutex::new(String::new()),
+            counts: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            dirty: AtomicBool::new(false),
+            ended: Mutex::new(false),
+        }
+    }
+
     fn start() -> Option<Arc<TrafficFile>> {
         let dir = traffic_dir().ok()?;
         std::fs::create_dir_all(&dir).ok()?;
@@ -114,18 +126,12 @@ impl TrafficFile {
                 let _ = std::fs::remove_file(e.path());
             }
         }
-        let f = Arc::new(TrafficFile {
-            path: dir.join(format!("{}.json", std::process::id())),
-            url: Mutex::new(String::new()),
-            counts: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
-            dirty: AtomicBool::new(false),
-            done: AtomicBool::new(false),
-        });
+        let f = Arc::new(TrafficFile::new(dir.join(format!("{}.json", std::process::id()))));
         let w = f.clone();
         std::thread::spawn(move || {
-            while !w.done.load(Ordering::SeqCst) {
+            while !*w.ended.lock().unwrap_or_else(PoisonError::into_inner) {
                 std::thread::sleep(Duration::from_secs(2));
-                if w.dirty.swap(false, Ordering::SeqCst) && !w.done.load(Ordering::SeqCst) {
+                if w.dirty.swap(false, Ordering::SeqCst) {
                     w.write();
                 }
             }
@@ -134,18 +140,25 @@ impl TrafficFile {
     }
 
     fn write(&self) {
-        let [r, i, o] = &self.counts;
-        let v = json!({"url": *self.url.lock().unwrap(), "requests": r.load(Ordering::Relaxed), "in": i.load(Ordering::Relaxed), "out": o.load(Ordering::Relaxed)});
-        let tmp = self.path.with_extension("tmp");
-        if std::fs::write(&tmp, v.to_string()).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
+        let ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+        if *ended {
+            return;
         }
+        let [r, i, o] = &self.counts;
+        let v = json!({
+            "url": *self.url.lock().unwrap_or_else(PoisonError::into_inner),
+            "requests": r.load(Ordering::Relaxed),
+            "in": i.load(Ordering::Relaxed),
+            "out": o.load(Ordering::Relaxed),
+        });
+        // The file holds a shared URL's traffic; readable only by this user.
+        let _ = write_private_atomic(&self.path, v.to_string().as_bytes(), false);
     }
 
     fn on(&self, e: &Event) {
         match e {
             Event::Live { url, .. } => {
-                *self.url.lock().unwrap() = url.clone();
+                *self.url.lock().unwrap_or_else(PoisonError::into_inner) = url.clone();
                 self.write();
             }
             Event::Request(r) => {
@@ -155,7 +168,8 @@ impl TrafficFile {
                 self.dirty.store(true, Ordering::SeqCst);
             }
             Event::Ended { .. } => {
-                self.done.store(true, Ordering::SeqCst);
+                let mut ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+                *ended = true;
                 let _ = std::fs::remove_file(&self.path);
             }
             _ => {}
@@ -283,24 +297,83 @@ pub fn read_config() -> Config {
     cfg
 }
 
+static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_tmp_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from("file"));
+    let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    name.push(format!(".{}.{}.tmp", std::process::id(), seq));
+    path.with_file_name(name)
+}
+
+/// Writes `bytes` to a unique sibling temp file opened with `create_new(true)`
+/// and mode `0600` (so it never follows symlinks or races on a shared `.tmp`
+/// filename), cleaning up the temp file on any write or rename error.
+fn write_private_atomic(path: &std::path::Path, bytes: &[u8], sync: bool) -> io::Result<()> {
+    write_private_atomic_with(path, bytes, sync, || next_tmp_path(path))
+}
+
+fn write_private_atomic_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    sync: bool,
+    mut next_tmp: impl FnMut() -> PathBuf,
+) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut opened = None;
+    for _ in 0..64 {
+        let candidate = next_tmp();
+        match options.open(&candidate) {
+            Ok(f) => {
+                opened = Some((candidate, f));
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let (tmp, mut f) = opened.ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "could not create unique temporary file"))?;
+    let write_res = (|| -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(bytes)?;
+        if sync {
+            f.sync_all()?;
+        }
+        Ok(())
+    })();
+    drop(f);
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Writes the config atomically, readable only by this user (it holds the token).
 pub fn save(cfg: &Config) -> io::Result<()> {
     let path = config_path()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut f = options.open(&tmp)?;
-    f.write_all(serde_json::to_string_pretty(cfg).map_err(io::Error::other)?.as_bytes())?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, &path)
+    let data = serde_json::to_string_pretty(cfg).map_err(io::Error::other)?;
+    write_private_atomic(&path, data.as_bytes(), true)
 }
 
 // ---------------------------------------------------------------- the edge
@@ -328,15 +401,60 @@ fn server(cfg: &Config) -> Server {
     Server { host, port, dial }
 }
 
-fn tls_config(alpn: &[u8]) -> io::Result<Arc<rustls::ClientConfig>> {
+/// Largest `KIRI_SHARE_CA` PEM file accepted (2 MiB) and most certificates
+/// read from it, bounding memory even on hostile or misconfigured paths.
+const MAX_SHARE_CA_BYTES: u64 = 2 << 20;
+const MAX_SHARE_CA_CERTS: usize = 1024;
+
+/// The roots a Share tunnel verifies against: the system's roots merged
+/// with webpki's (like the registry client, #303), plus `share_ca`
+/// (`KIRI_SHARE_CA`), skipping any certificate rustls refuses to add —
+/// the same quiet skip as `platform_certs()` skipping load errors. The
+/// merged list comes from places the user doesn't curate (the keychain,
+/// `/etc/ssl`), so one anchor rustls won't take shouldn't take every
+/// tunnel down. `share_ca`, unlike the merged roots, is chosen on
+/// purpose: an explicit CA that doesn't parse is a misconfiguration
+/// worth reporting.
+fn root_store(
+    trusted: &[rustls::pki_types::CertificateDer<'static>],
+    share_ca: Option<&std::path::Path>,
+) -> io::Result<rustls::RootCertStore> {
     let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if let Some(ca) = std::env::var_os("KIRI_SHARE_CA") {
-        let certs = rustls::pki_types::CertificateDer::pem_file_iter(&ca).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
-        for c in certs {
-            roots.add(c.map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
+    roots.add_parsable_certificates(trusted.to_vec());
+    if let Some(ca) = share_ca {
+        use std::io::Read as _;
+        let f = std::fs::File::open(ca).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
+        if !f.metadata().map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?.is_file() {
+            return Err(io::Error::other("KIRI_SHARE_CA: not a regular file"));
+        }
+        let mut bytes = Vec::new();
+        f.take(MAX_SHARE_CA_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
+        if bytes.len() as u64 > MAX_SHARE_CA_BYTES {
+            return Err(io::Error::other(format!(
+                "KIRI_SHARE_CA: file exceeds {} MiB",
+                MAX_SHARE_CA_BYTES >> 20
+            )));
+        }
+        for (i, c) in rustls::pki_types::CertificateDer::pem_slice_iter(&bytes).enumerate() {
+            if i >= MAX_SHARE_CA_CERTS {
+                return Err(io::Error::other(format!(
+                    "KIRI_SHARE_CA: more than {MAX_SHARE_CA_CERTS} certificates"
+                )));
+            }
+            roots
+                .add(c.map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?)
+                .map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
         }
     }
+    Ok(roots)
+}
+
+fn tls_config(alpn: &[u8]) -> io::Result<Arc<rustls::ClientConfig>> {
+    // KIRI_SHARE_CA, if set, is added on top of the merged roots, last.
+    let share_ca = std::env::var_os("KIRI_SHARE_CA").map(std::path::PathBuf::from);
+    let roots = root_store(&crate::roots::trusted(), share_ca.as_deref())?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut c = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -752,6 +870,41 @@ pub fn is_shorthand(arg: &str) -> bool {
     port_or_addr(arg).is_some()
 }
 
+fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+    }
+}
+
+/// A target that isn't one of this machine's own loopback or unspecified names
+/// or addresses. Sharing it puts a public URL in front of a service that lives
+/// elsewhere on the machine's network, so the tunnel warns about it.
+fn target_is_global(t: &Target) -> bool {
+    let Some((host, _)) = t.addr.rsplit_once(':') else { return false };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.trim_end_matches('.').eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !is_local_ip(ip),
+        Err(_) => true,
+    }
+}
+
+fn non_local_warning(t: &Target) -> Option<String> {
+    target_is_global(t).then(|| {
+        format!(
+            "`{}` is not localhost: the public URL reaches it, whoever has the link.",
+            t.display
+        )
+    })
+}
+
 fn port_or_addr(arg: &str) -> Option<Target> {
     if !arg.is_empty() && arg.len() <= 5 && arg.bytes().all(|b| b.is_ascii_digit()) {
         let port: u16 = arg.parse().ok().filter(|p| *p > 0)?;
@@ -936,13 +1089,13 @@ struct Stopper {
 
 impl Stopper {
     fn is_stopped(&self) -> bool {
-        *self.stopped.lock().unwrap()
+        *self.stopped.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Sleeps up to `d`; returns true if stopped meanwhile.
     fn sleep(&self, d: Duration) -> bool {
-        let g = self.stopped.lock().unwrap();
-        let (g, _) = self.cv.wait_timeout_while(g, d, |s| !*s).unwrap();
+        let g = self.stopped.lock().unwrap_or_else(PoisonError::into_inner);
+        let (g, _) = self.cv.wait_timeout_while(g, d, |s| !*s).unwrap_or_else(PoisonError::into_inner);
         *g
     }
 }
@@ -958,9 +1111,9 @@ impl Handle {
     }
 
     fn signal(&self) {
-        *self.stop.stopped.lock().unwrap() = true;
+        *self.stop.stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
         self.stop.cv.notify_all();
-        if let Some(s) = self.stop.sock.lock().unwrap().as_ref() {
+        if let Some(s) = self.stop.sock.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }
     }
@@ -1054,11 +1207,22 @@ fn run_tunnel(srv: Server, token: String, who: Who, opts: Options, stop: Arc<Sto
     let mut attempt = 0u32;
     // When a session that was live ended.
     let mut lost = None;
+    let mut warned_non_local = false;
     let reason = loop {
         if stop.is_stopped() {
             break None;
         }
         on_event(Event::Connecting { server: srv.host.clone() });
+        // A target away from localhost exposes a service elsewhere on the
+        // machine's network: say so once in the log and event stream.
+        if !warned_non_local {
+            warned_non_local = true;
+            if let Some(msg) = non_local_warning(&opts.target) {
+                #[cfg(unix)]
+                crate::diag::warn!("sharing non-localhost target", target = opts.target.addr);
+                on_event(Event::Notice(msg));
+            }
+        }
         let end = match session(&srv, &token, &who, &name, &opts.target, &stop, &on_event) {
             Ok((end, issued)) => {
                 if let Some(issued) = issued {
@@ -1142,7 +1306,7 @@ impl Lanes {
 
     /// The lane with the least queued, or None when streams send `Data`.
     fn pick(&self) -> Option<Arc<Lane>> {
-        let list = self.list.lock().unwrap();
+        let list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
         if list.is_empty() {
             return None;
         }
@@ -1152,8 +1316,8 @@ impl Lanes {
 
     fn end(&self) {
         self.over.store(true, Ordering::Release);
-        self.list.lock().unwrap().clear();
-        for s in self.socks.lock().unwrap().drain(..) {
+        self.list.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        for s in self.socks.lock().unwrap_or_else(PoisonError::into_inner).drain(..) {
             let _ = s.shutdown(Shutdown::Both);
         }
     }
@@ -1169,7 +1333,7 @@ impl Lane {
 
 /// Writes `bytes` to a TLS connection, whole.
 fn write_all_tls(tls: &Mutex<rustls::ClientConnection>, sock: &TcpStream, mut bytes: &[u8]) -> io::Result<()> {
-    let mut c = tls.lock().unwrap();
+    let mut c = tls.lock().unwrap_or_else(PoisonError::into_inner);
     let mut sock = sock;
     while !bytes.is_empty() {
         let n = c.writer().write(bytes)?;
@@ -1200,7 +1364,7 @@ impl Stream {
     fn kill(&self) {
         self.reset.store(true, Ordering::Release);
         self.cv.notify_all();
-        if let Some(s) = self.local.lock().unwrap().as_ref() {
+        if let Some(s) = self.local.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }
     }
@@ -1241,7 +1405,7 @@ impl Session {
             }
         });
         if spawned.is_ok() && !self.lanes.over.load(Ordering::Acquire) {
-            self.lanes.list.lock().unwrap().push(lane);
+            self.lanes.list.lock().unwrap_or_else(PoisonError::into_inner).push(lane);
         }
     }
 
@@ -1267,7 +1431,7 @@ impl Session {
         if self.lanes.over.load(Ordering::Acquire) {
             return;
         }
-        self.lanes.socks.lock().unwrap().push(keep);
+        self.lanes.socks.lock().unwrap_or_else(PoisonError::into_inner).push(keep);
         let _ = reader.set_read_timeout(Some(IDLE));
         let conn = Arc::new((Mutex::new(conn), sock));
         let mut join = Vec::new();
@@ -1284,7 +1448,7 @@ impl Session {
                 _ => break,
             };
             {
-                let mut c = conn.0.lock().unwrap();
+                let mut c = conn.0.lock().unwrap_or_else(PoisonError::into_inner);
                 let mut input = &raw[..n];
                 while !input.is_empty() {
                     if c.read_tls(&mut input).is_err() || c.process_new_packets().is_err() {
@@ -1337,7 +1501,7 @@ impl Session {
 
     fn end_all(&self) {
         self.lanes.end();
-        for (_, s) in self.streams.lock().unwrap().drain() {
+        for (_, s) in self.streams.lock().unwrap_or_else(PoisonError::into_inner).drain() {
             s.kill();
             let _ = s.to_local.send(None);
         }
@@ -1364,30 +1528,30 @@ impl Session {
             Msg::Refused(r) => return Some(End::Final(r.to_owned())),
             Msg::Open { stream, .. } => self.open(stream),
             Msg::Data { stream, data } => {
-                let s = self.streams.lock().unwrap().get(&stream).cloned();
+                let s = self.streams.lock().unwrap_or_else(PoisonError::into_inner).get(&stream).cloned();
                 if let Some(s) = s {
                     s.bytes_in.fetch_add(data.len() as u64, Ordering::Relaxed);
                     if s.to_local.send(Some(data.to_vec())).is_err() {
-                        self.streams.lock().unwrap().remove(&stream);
+                        self.streams.lock().unwrap_or_else(PoisonError::into_inner).remove(&stream);
                         s.kill();
                         let _ = self.send(Msg::Reset { stream });
                     }
                 }
             }
             Msg::Window { stream, credit } => {
-                if let Some(s) = self.streams.lock().unwrap().get(&stream) {
-                    let mut c = s.credit.lock().unwrap();
+                if let Some(s) = self.streams.lock().unwrap_or_else(PoisonError::into_inner).get(&stream) {
+                    let mut c = s.credit.lock().unwrap_or_else(PoisonError::into_inner);
                     *c = c.saturating_add(credit).min(self.lanes.window());
                     s.cv.notify_all();
                 }
             }
             Msg::Close { stream } => {
-                if let Some(s) = self.streams.lock().unwrap().get(&stream) {
+                if let Some(s) = self.streams.lock().unwrap_or_else(PoisonError::into_inner).get(&stream) {
                     let _ = s.to_local.send(None);
                 }
             }
             Msg::Reset { stream } => {
-                if let Some(s) = self.streams.lock().unwrap().remove(&stream) {
+                if let Some(s) = self.streams.lock().unwrap_or_else(PoisonError::into_inner).remove(&stream) {
                     s.kill();
                     let _ = s.to_local.send(None);
                 }
@@ -1433,11 +1597,11 @@ impl Session {
             request: Mutex::new(None),
             status: Mutex::new(0),
         });
-        self.streams.lock().unwrap().insert(id, stream.clone());
+        self.streams.lock().unwrap_or_else(PoisonError::into_inner).insert(id, stream.clone());
         let sess = self.clone();
         let spawned = std::thread::Builder::new().name("share-stream".into()).spawn(move || sess.carry(id, stream, rx));
         if spawned.is_err() {
-            self.streams.lock().unwrap().remove(&id);
+            self.streams.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
             let _ = self.send(Msg::Reset { stream: id });
         }
     }
@@ -1461,7 +1625,7 @@ impl Session {
         let local = match self.connect_local() {
             Ok(s) => s,
             Err(e) => {
-                self.streams.lock().unwrap().remove(&id);
+                self.streams.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
                 let _ = self.send(Msg::Reset { stream: id });
                 // The request line has usually arrived by now; log it as unanswered.
                 if let Ok(Some(first)) = rx.recv_timeout(Duration::from_millis(200))
@@ -1469,7 +1633,7 @@ impl Session {
                 {
                     (self.on_event)(Event::Request(Request { method, path, status: 0, ms: started.elapsed().as_millis() as u64, bytes_in: first.len() as u64, bytes_out: 0, at }));
                 }
-                let mut last = self.offline_notice.lock().unwrap();
+                let mut last = self.offline_notice.lock().unwrap_or_else(PoisonError::into_inner);
                 if last.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
                     *last = Some(Instant::now());
                     (self.on_event)(Event::Notice(format!("nothing is answering on {} ({e})", self.target.addr)));
@@ -1479,11 +1643,11 @@ impl Session {
         };
         let _ = local.set_nodelay(true);
         let (Ok(writer_sock), Ok(handle)) = (local.try_clone(), local.try_clone()) else {
-            self.streams.lock().unwrap().remove(&id);
+            self.streams.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
             let _ = self.send(Msg::Reset { stream: id });
             return;
         };
-        *stream.local.lock().unwrap() = Some(handle);
+        *stream.local.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
         if stream.reset.load(Ordering::Acquire) {
             let _ = local.shutdown(Shutdown::Both);
         }
@@ -1499,9 +1663,9 @@ impl Session {
         let mut seq = 0u32;
         loop {
             let allow = {
-                let mut c = stream.credit.lock().unwrap();
+                let mut c = stream.credit.lock().unwrap_or_else(PoisonError::into_inner);
                 while *c == 0 && !stream.reset.load(Ordering::Acquire) {
-                    c = stream.cv.wait(c).unwrap();
+                    c = stream.cv.wait(c).unwrap_or_else(PoisonError::into_inner);
                 }
                 if stream.reset.load(Ordering::Acquire) {
                     break;
@@ -1525,7 +1689,7 @@ impl Session {
                 Ok(n) => n,
                 Err(_) => {
                     if !stream.reset.swap(true, Ordering::AcqRel) {
-                        self.streams.lock().unwrap().remove(&id);
+                        self.streams.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
                         let _ = self.send(Msg::Reset { stream: id });
                     }
                     break;
@@ -1534,10 +1698,13 @@ impl Session {
             if first {
                 first = false;
                 if let Some(code) = parse_status_line(&buf[..n]) {
-                    *stream.status.lock().unwrap() = code;
+                    *stream.status.lock().unwrap_or_else(PoisonError::into_inner) = code;
                 }
             }
-            *stream.credit.lock().unwrap() -= n as u32;
+            {
+                let mut c = stream.credit.lock().unwrap_or_else(PoisonError::into_inner);
+                *c = c.saturating_sub(n as u32);
+            }
             let sent = match self.lanes.pick() {
                 Some(lane) => {
                     let mut frame = Vec::with_capacity(proto::CHUNK_HEADER + n);
@@ -1562,13 +1729,13 @@ impl Session {
         if let Ok(w) = writer {
             let _ = w.join();
         }
-        self.streams.lock().unwrap().remove(&id);
-        let request = stream.request.lock().unwrap().take();
+        self.streams.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+        let request = stream.request.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some((method, path)) = request {
             (self.on_event)(Event::Request(Request {
                 method,
                 path,
-                status: *stream.status.lock().unwrap(),
+                status: *stream.status.lock().unwrap_or_else(PoisonError::into_inner),
                 ms: started.elapsed().as_millis() as u64,
                 bytes_in: stream.bytes_in.load(Ordering::Relaxed),
                 bytes_out: stream.bytes_out.load(Ordering::Relaxed),
@@ -1588,11 +1755,11 @@ impl Session {
             };
             if first {
                 first = false;
-                *stream.request.lock().unwrap() = parse_request_line(&data);
+                *stream.request.lock().unwrap_or_else(PoisonError::into_inner) = parse_request_line(&data);
             }
             if local.write_all(&data).is_err() {
                 if !stream.reset.swap(true, Ordering::AcqRel) {
-                    self.streams.lock().unwrap().remove(&id);
+                    self.streams.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
                     let _ = self.send(Msg::Reset { stream: id });
                 }
                 stream.kill();
@@ -1623,7 +1790,7 @@ fn session(srv: &Server, token: &str, who: &Who, name: &str, target: &Target, st
     }
     let mut reader = sock.try_clone()?;
     reader.set_read_timeout(Some(IDLE))?;
-    *stop.sock.lock().unwrap() = Some(sock.try_clone()?);
+    *stop.sock.lock().unwrap_or_else(PoisonError::into_inner) = Some(sock.try_clone()?);
     if stop.is_stopped() {
         let _ = sock.shutdown(Shutdown::Both);
     }
@@ -1656,7 +1823,7 @@ fn session(srv: &Server, token: &str, who: &Who, name: &str, target: &Target, st
     let end = read_loop(&sess, &mut reader, &mut welcomed);
     sess.end_all();
     let _ = sess.sock.shutdown(Shutdown::Both);
-    *stop.sock.lock().unwrap() = None;
+    *stop.sock.lock().unwrap_or_else(PoisonError::into_inner) = None;
     Ok((end, welcomed))
 }
 
@@ -1672,7 +1839,7 @@ fn read_loop(sess: &Arc<Session>, reader: &mut TcpStream, welcomed: &mut Option<
         };
         let mut closed = false;
         {
-            let mut c = sess.tls.lock().unwrap();
+            let mut c = sess.tls.lock().unwrap_or_else(PoisonError::into_inner);
             let mut input = &raw[..n];
             while !input.is_empty() {
                 if let Err(e) = c.read_tls(&mut input) {
@@ -1831,7 +1998,7 @@ fn printer(target: String) -> impl Fn(Event) + Send + Sync + 'static {
             }
         }
         Event::Live { url, rate, remaining, warning, domains } => {
-            let mut shown = shown_url.lock().unwrap();
+            let mut shown = shown_url.lock().unwrap_or_else(PoisonError::into_inner);
             if shown.as_deref() == Some(url.as_str()) {
                 println!("  {}  {}", p.accent("●"), p.dim("back online"));
                 return;
@@ -1876,8 +2043,14 @@ fn printer(target: String) -> impl Fn(Event) + Send + Sync + 'static {
 }
 
 pub fn run(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
     match args.first().map(String::as_str) {
-        None | Some("-h" | "--help" | "help") => Err(io::Error::other(USAGE)),
+        None => Err(io::Error::other(USAGE)),
         Some("login") => login_cli(&args[1..]),
         Some("logout") => {
             logout()?;
@@ -1966,7 +2139,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             let traffic = TrafficFile::start();
             let handle = start(Options { target, name, app: false }, move |e| {
                 if let Event::Ended { reason, error: true } = &e {
-                    *f.lock().unwrap() = Some(reason.clone());
+                    *f.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason.clone());
                 }
                 if let Some(t) = &traffic {
                     t.on(&e);
@@ -1982,7 +2155,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
                 Err(e) => return Err(e),
             };
             handle.wait();
-            match failed.lock().unwrap().take() {
+            match failed.lock().unwrap_or_else(PoisonError::into_inner).take() {
                 Some(_) => Err(io::Error::other("the tunnel closed")),
                 None => Ok(()),
             }
@@ -2125,8 +2298,9 @@ mod tests {
     #[test]
     fn a_kiri_share_writes_its_traffic_for_the_window() {
         let dir = std::env::temp_dir().join(format!("kiri-traffic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let f = TrafficFile { path: dir.join("1.json"), url: Mutex::new(String::new()), counts: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)], dirty: AtomicBool::new(false), done: AtomicBool::new(false) };
+        let f = TrafficFile::new(dir.join("1.json"));
         f.on(&Event::Live { url: "https://dock-4k.runkiri.cloud".into(), rate: 0, remaining: 0, warning: false, domains: Vec::new() });
         let req = |i, o| Event::Request(Request { method: "GET".into(), path: "/".into(), status: 200, ms: 1, bytes_in: i, bytes_out: o, at: SystemTime::now() });
         f.on(&req(100, 2000));
@@ -2135,6 +2309,11 @@ mod tests {
         assert_eq!(traffic_in(&dir).get("https://dock-4k.runkiri.cloud"), Some(&[2, 150, 2048]));
         f.on(&Event::Ended { reason: "stopped".into(), error: false });
         assert!(traffic_in(&dir).is_empty(), "removed when it ends");
+        // A late timer tick or event after `Ended` must never resurrect the traffic file.
+        f.write();
+        f.on(&Event::Live { url: "https://dock-4k.runkiri.cloud".into(), rate: 0, remaining: 0, warning: false, domains: Vec::new() });
+        assert!(traffic_in(&dir).is_empty(), "must not resurrect after Ended");
+        assert!(!f.path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2186,6 +2365,60 @@ mod tests {
         assert_eq!(parse_server("edge.runkiri.com"), ("edge.runkiri.com".into(), 443));
         assert_eq!(parse_server("https://Edge.Example:8443/"), ("edge.example".into(), 8443));
         assert_eq!(parse_server("localhost:"), ("localhost:".into(), 443));
+    }
+
+    /// A malformed anchor in the trusted list is skipped, not fatal: the
+    /// store still holds every certificate that parses.
+    #[test]
+    fn merged_roots_skip_a_cert_that_fails_to_add() {
+        // The bundled set, not this machine's store: every one of them
+        // parses, where a store may hold one rustls skips already.
+        let certs = crate::roots::bundled().to_vec();
+        let mut with_bad = certs.clone();
+        let good: &[u8] = certs[0].as_ref();
+        let bad = rustls::pki_types::CertificateDer::from(good[..good.len() / 2].to_vec());
+        with_bad.push(bad);
+        let no_ca = None;
+        let roots = root_store(&with_bad, no_ca).unwrap();
+        assert_eq!(
+            roots.len(),
+            certs.len(),
+            "the truncated cert is skipped, the rest land"
+        );
+        assert_eq!(roots.len(), with_bad.len() - 1);
+    }
+
+    /// KIRI_SHARE_CA stays loud: a PEM section that doesn't decode fails
+    /// `root_store` (what `tls_config` builds from the variable), a
+    /// parseable CA is added and passes. (A file with no PEM sections at
+    /// all iterates as empty upstream, pki-types 1.15.) `root_store` is
+    /// called with the file, not through the variable: setting one races
+    /// every other test reading the environment.
+    #[test]
+    fn kiri_share_ca_fails_loud_but_a_valid_ca_is_added() {
+        let dir = std::env::temp_dir();
+        let bad = dir.join(format!("kiri-share-ca-bad-{}.pem", std::process::id()));
+        std::fs::write(
+            &bad,
+            "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&key).unwrap();
+        let good = dir.join(format!("kiri-share-ca-good-{}.pem", std::process::id()));
+        std::fs::write(&good, ca.pem()).unwrap();
+        let oversized = dir.join(format!("kiri-share-ca-big-{}.pem", std::process::id()));
+        std::fs::write(&oversized, vec![b'A'; MAX_SHARE_CA_BYTES as usize + 1]).unwrap();
+        let loud = root_store(&[], Some(&bad)).is_err();
+        let added = root_store(&[], Some(&good)).is_ok_and(|r| r.len() == 1);
+        let too_big = root_store(&[], Some(&oversized)).is_err();
+        let _ = std::fs::remove_file(&bad);
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&oversized);
+        assert!(loud, "an undecodable KIRI_SHARE_CA fails loudly");
+        assert!(added, "a parseable KIRI_SHARE_CA is added");
+        assert!(too_big, "an oversized KIRI_SHARE_CA is refused");
     }
 
     #[test]
@@ -2311,5 +2544,111 @@ mod tests {
         assert_eq!(device_code_deadline(now, 900), now + Duration::from_secs(900));
         // A hostile expires_in neither panics nor waits more than an hour.
         assert_eq!(device_code_deadline(now, u64::MAX), now + Duration::from_secs(MAX_DEVICE_CODE_SECS));
+    }
+
+    #[test]
+    fn remote_share_targets_are_flagged() {
+        for remote in ["10.0.0.5:6379", "169.254.169.254:80", "nas.home.arpa:445", "[fd00::1]:8080"] {
+            let t = port_or_addr(remote).unwrap();
+            assert!(target_is_global(&t), "{remote} should be flagged as non-localhost");
+            let msg = non_local_warning(&t).unwrap();
+            assert!(msg.contains("not localhost") && msg.contains(&t.display), "{msg}");
+        }
+        for local in [
+            "3000",
+            "localhost:3000",
+            "LOCALHOST:3000",
+            "127.0.0.1:5173",
+            "127.0.0.2:8080",
+            "[::1]:3000",
+            "0.0.0.0:3000",
+            "[::]:3000",
+            "[::ffff:127.0.0.1]:3000",
+        ] {
+            let t = port_or_addr(local).unwrap();
+            assert!(!target_is_global(&t), "{local} should be treated as local");
+            assert!(non_local_warning(&t).is_none());
+        }
+    }
+
+    #[test]
+    fn traffic_and_state_files_are_user_only_0600() {
+        let dir = std::env::temp_dir().join(format!("kiri-traffic-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let f = TrafficFile::new(dir.join("t.json"));
+        *f.url.lock().unwrap() = "https://demo.runkiri.cloud".into();
+        f.counts[0].store(1, Ordering::Relaxed);
+        f.counts[1].store(2, Ordering::Relaxed);
+        f.counts[2].store(3, Ordering::Relaxed);
+        f.write();
+        assert!(f.path.is_file());
+        let leftover_tmp = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+        };
+        assert!(!leftover_tmp(), "no .tmp files left behind after atomic write");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&f.path), 0o600);
+
+            // Atomic write uses create_new on a unique temp file and atomically
+            // replaces the target without following a pre-existing symlink.
+            let victim = dir.join("victim");
+            std::fs::write(&victim, b"untouched").unwrap();
+            let state_path = dir.join("share.json");
+            std::os::unix::fs::symlink(&victim, &state_path).unwrap();
+            write_private_atomic(&state_path, b"{\"device\":\"abc\"}", true).unwrap();
+            assert!(!std::fs::symlink_metadata(&state_path).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+            assert_eq!(std::fs::read(&state_path).unwrap(), b"{\"device\":\"abc\"}");
+            assert_eq!(mode(&state_path), 0o600);
+            assert!(!leftover_tmp());
+
+            // Pre-existing symlink at a candidate temp filename is skipped
+            // (never followed) thanks to `create_new(true)`.
+            let colliding_tmp = dir.join("colliding.tmp");
+            let fallback_tmp = dir.join("fallback.tmp");
+            std::os::unix::fs::symlink(&victim, &colliding_tmp).unwrap();
+            let mut candidates = [colliding_tmp.clone(), fallback_tmp.clone()].into_iter();
+            write_private_atomic_with(&state_path, b"{\"device\":\"def\"}", true, || candidates.next().unwrap()).unwrap();
+            assert!(candidates.next().is_none(), "colliding symlink must be skipped to fallback candidate");
+            assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+            assert_eq!(std::fs::read(&state_path).unwrap(), b"{\"device\":\"def\"}");
+            assert_eq!(mode(&state_path), 0o600);
+            let _ = std::fs::remove_file(&colliding_tmp);
+            assert!(!leftover_tmp());
+        }
+
+        // Rename error (target is a directory) cleans up its temporary file.
+        let dir_target = dir.join("not-a-file");
+        std::fs::create_dir_all(&dir_target).unwrap();
+        assert!(write_private_atomic(&dir_target, b"data", false).is_err());
+        assert!(!leftover_tmp(), "temp file must be removed when rename fails");
+
+        // Concurrent TrafficFile writes and `Event::Ended` never leave a
+        // resurrected traffic file or stray temp files behind.
+        for i in 0..32 {
+            let tf = Arc::new(TrafficFile::new(dir.join(format!("race-{i}.json"))));
+            *tf.url.lock().unwrap() = "https://race.runkiri.cloud".into();
+            let writer = tf.clone();
+            let t = std::thread::spawn(move || {
+                for _ in 0..20 {
+                    writer.write();
+                }
+            });
+            tf.on(&Event::Ended { reason: "stopped".into(), error: false });
+            t.join().unwrap();
+            assert!(!tf.path.exists(), "race-{i}.json resurrected after Ended");
+        }
+        assert!(!leftover_tmp());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

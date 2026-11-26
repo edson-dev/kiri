@@ -39,6 +39,12 @@ const ENGINES: [(&str, &str, &str); 3] = [
 ];
 
 pub fn run(args: &[String]) -> io::Result<()> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+        || matches!(args.first().map(String::as_str), Some("help"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let mut o = Opts { runs: 50, image: "alpine:latest".into(), bridge: false, only: None };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -113,7 +119,7 @@ fn pct(v: &[Duration], p: usize) -> Duration {
 
 fn kiri(o: &Opts, warmup: usize) -> io::Result<Vec<Duration>> {
     let store = Store::open(Store::default_root()?)?;
-    let image = image(&store, &o.image)?;
+    let (image, _blob_pins) = image(&store, &o.image)?;
     let mut guest = Guest::boot(&BootOptions { data_disk: true, ..Default::default() })?;
     ensure_layers(&mut guest, &store, &image)?;
     let layers = layers_top_down(&image);

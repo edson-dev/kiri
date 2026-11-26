@@ -16,7 +16,7 @@
   <a href="https://github.com/libracoder/kiri/releases/latest"><img src="https://img.shields.io/github/v/release/libracoder/kiri?style=for-the-badge&label=release&color=2f6feb" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=for-the-badge" alt="Apache 2.0 License"></a>
   <a href="https://discord.gg/K5A8wuqcC"><img src="https://img.shields.io/badge/Discord-Join%20Us-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="crates/kiri/src/ui/lang"><img src="https://img.shields.io/badge/languages-38-2ea043?style=for-the-badge" alt="38 languages"></a>
+  <a href="crates/kiri/src/ui/lang"><img src="https://img.shields.io/badge/languages-42-2ea043?style=for-the-badge" alt="42 languages"></a>
 </p>
 
 <p align="center">
@@ -25,7 +25,8 @@
     <a href="https://docs.runkiri.com">Docs</a> ·
     <a href="docs/features.md">Features</a> ·
     <a href="https://runkiri.com/releases/">Download</a> ·
-    <a href="SECURITY.md">Security</a>
+    <a href="SECURITY.md">Security</a> ·
+    <a href="README.zh-CN.md">简体中文</a>
   </strong>
 </p>
 
@@ -102,7 +103,7 @@ comes from the Igbo word *ntakịrị*, "small".
 - **Local domains**: `http://<name>.kiri.local`, with HTTPS from Kiri's own certificate authority.
 - **More than containers**: a one-command Kubernetes cluster and Linux machines.
 - **A native window** for containers, images, volumes and networks, plus a menu bar item.
-- **In your language**: the window comes in 38 languages, on macOS, Windows and Linux alike.
+- **In your language**: the window comes in 42 languages, on macOS, Windows and Linux alike.
 
 ---
 
@@ -180,17 +181,21 @@ Kiri's own commands:
 
 | Command | What it does |
 |---------|--------------|
-| `kiri k8s start \| stop \| status \| delete` | A single-node Kubernetes cluster |
-| `kiri machine create NAME [--distro D] \| list \| shell NAME \| stop \| delete NAME` | Linux machines |
+| `kiri start` | Start Kiri again after a Stop, as Start in the window does |
+| `kiri k8s start \| stop \| status [--json] \| delete` | A single-node Kubernetes cluster |
+| `kiri machine create NAME [--distro D] \| list [--json] \| shell NAME \| stop \| delete NAME` | Linux machines |
 | `kiri share PORT\|CONTAINER [--name N]` | Share a local port or container on the internet |
 | `kiri import [orbstack \| desktop-linux]` | Bring images, volumes and containers over |
-| `kiri domains [set --http N --https N \| reset]` | The ports local domains answer on |
-| `kiri usb [list] \| attach DEVICE \| detach DEVICE` | USB devices for containers (beta) |
+| `kiri domains [set --http N --https N \| reset] [--json]` | The ports local domains answer on |
+| `kiri usb [list [--json]] \| attach DEVICE \| detach DEVICE` | USB devices for containers (beta) |
 | `kiri build-with [docker \| kiri]` | Which builder `docker build` uses |
 | `kiri update [--check]` | Install the newest release |
+| `kiri doctor [--json]` | Whether Kiri works here, one line per part, and what to run when one doesn't |
 | `kiri diag logs \| report` | Logs, and a report file to send with a bug |
 | `kiri bench [--runs N] [--network none\|bridge]` | Measure container start on your machine |
 | `kiri ui` | Open the window |
+
+`--json` prints one line of JSON for scripts, as the window gets it; `kiri registry` and `kiri share status` take it too.
 
 ---
 

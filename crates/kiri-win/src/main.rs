@@ -25,7 +25,7 @@ mod assemble;
 #[cfg(windows)]
 #[path = "../../kiri/src/ui/lang.rs"]
 mod lang;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod client;
 #[cfg(windows)]
 mod detail;
@@ -44,6 +44,10 @@ mod relay;
 #[cfg(windows)]
 #[path = "../../kiri/src/hostrelay.rs"]
 mod hostrelay;
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+#[path = "../../kiri/src/dockerctx.rs"]
+mod dockerctx;
 #[cfg(windows)]
 mod win;
 // The window's USB view, through usbipd-win.
@@ -70,6 +74,7 @@ mod builds;
 // and Linux's own crates/kiri/src/buildwith.rs.
 #[cfg(windows)]
 #[path = "../../kiri/src/buildwith.rs"]
+#[allow(dead_code)]
 mod buildwith;
 // Kiri's program moved or deleted from where it started: the Mac's and
 // Linux's own crates/kiri/src/appwatch.rs.
@@ -94,10 +99,17 @@ mod daemon {
 #[cfg(windows)]
 mod wslconfig;
 // Kiri Dev's names (the window on Windows is always Kiri) and Share, the
-// Mac's own files: crates/kiri/src/flavor.rs and share.rs.
+// Mac's own files: crates/kiri/src/flavor.rs and share.rs. Share's roots
+// come from crates/kiri-image/src/roots.rs, mounted here directly as
+// crate::roots — the name share.rs reaches it by in kiri, whose main.rs
+// aliases kiri_image::roots — so the same file compiles unchanged.
 #[cfg(windows)]
 #[path = "../../kiri/src/flavor.rs"]
 mod flavor;
+#[cfg(windows)]
+#[path = "../../kiri-image/src/roots.rs"]
+#[allow(dead_code)]
+mod roots;
 #[cfg(windows)]
 #[path = "../../kiri/src/share.rs"]
 #[allow(dead_code)]
@@ -110,6 +122,34 @@ mod update;
 mod wslsync;
 #[cfg(any(windows, test))]
 mod refuse;
+// Opt-in Windows bind-mount watcher (ReadDirectoryChangesW -> /kiri/fs-events):
+// path mapping, buffer decoding and coalescing tested on any host.
+#[cfg(any(windows, test))]
+mod watch;
+// Windows inbound published-port forwarder (UDP and non-loopback host-IP TCP
+// to WSL 2's eth0 IPv4 address): tested on any host.
+#[cfg(any(windows, test))]
+mod ports;
+// Settings → Storage: custom WSL distro location in %LOCALAPPDATA%\Kiri\storage.json.
+#[cfg(any(windows, test))]
+mod storage;
+
+#[cfg(any(windows, test))]
+pub(crate) fn format_try_wait(res: std::io::Result<Option<std::process::ExitStatus>>) -> Option<String> {
+    match res {
+        Ok(None) => None,
+        Ok(Some(status)) => Some(format!("{status}")),
+        Err(e) => Some(format!("{e}")),
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn format_wait_status(res: std::io::Result<std::process::ExitStatus>) -> String {
+    match res {
+        Ok(status) => format!("{status}"),
+        Err(e) => format!("{e}"),
+    }
+}
 // Settings → Import from Docker Desktop: the Mac's and Linux's own
 // crates/kiri/src/import.rs, through the docker CLI's contexts.
 #[cfg(windows)]
@@ -162,6 +202,7 @@ fn main() -> std::process::ExitCode {
     // distro (--distro) is for development and skips it.
     let setup = !std::env::args().any(|a| a == "--distro") && setup::needed();
     serve::set_setup_pending(setup);
+    serve::init_stopped();
     if let Err(e) = serve::start(cfg.clone()) {
         // Another kiri-win already serves the pipe: show its window instead.
         if app::running() {
@@ -178,10 +219,15 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     client::set_pipe(&cfg.pipe);
+    if !setup {
+        engine::heal_docker_config(&cfg.pipe);
+    }
+    ports::start();
     if let Err(e) = dns::start() {
         serve::log(&format!("dns on 127.0.0.1:53: {e}"));
     }
     engine::start(engine::Env { distro: cfg.distro.clone(), pipe: cfg.pipe.clone() });
+    watch::start_if_enabled();
     // Its folder renamed, moved or deleted around it (Windows won't delete
     // a running program itself): docker build handed back as it was before
     // Kiri took it, the choice kept for when Kiri runs again, and Kiri quits.
@@ -234,4 +280,34 @@ fn main() -> std::process::ExitCode {
 fn main() -> std::process::ExitCode {
     eprintln!("kiri-win runs on Windows only");
     std::process::ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod exit_status_tests {
+    #[test]
+    fn formats_exit_status_with_display_instead_of_nested_debug() {
+        let run = |code: i32| {
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut c = std::process::Command::new("cmd");
+                c.args(["/C", &format!("exit {code}")]);
+                c
+            };
+            #[cfg(not(windows))]
+            let mut cmd = {
+                let mut c = std::process::Command::new("sh");
+                c.args(["-c", &format!("exit {code}")]);
+                c
+            };
+            cmd.status().unwrap()
+        };
+        let status = run(15);
+        let waited = super::format_wait_status(Ok(status));
+        assert!(!waited.contains("Ok(") && !waited.contains("ExitStatus("), "nested Debug leaked: {waited}");
+        assert!(waited.contains("15"), "{waited}");
+        let polled = super::format_try_wait(Ok(Some(status))).unwrap();
+        assert_eq!(polled, waited);
+        assert_eq!(super::format_try_wait(Ok(None)), None);
+        assert_eq!(super::format_wait_status(Err(std::io::Error::other("wait failed"))), "wait failed");
+    }
 }

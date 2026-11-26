@@ -122,21 +122,29 @@ fn relay_one(stream: &kiri_vmm::VsockStream) {
     if conn.read_exact(&mut len).is_err() {
         return;
     }
-    let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
-    if conn.read_exact(&mut query).is_err() || !is_query(&query) {
+    let qlen = usize::from(u16::from_be_bytes(len));
+    if !(12..=4096).contains(&qlen) {
+        return;
+    }
+    let mut qbuf = [0u8; 4096];
+    let query = &mut qbuf[..qlen];
+    if conn.read_exact(query).is_err() || !is_query(query) {
         return;
     }
     static SAID: AtomicBool = AtomicBool::new(false);
-    if !SAID.swap(true, Ordering::Relaxed) {
+    if should_warn_gateway_dns(super::ports::shared_nat_active(), &SAID) {
         crate::diag::warn!("the VM's DNS at its gateway did not answer; container lookups go through the Mac");
     }
-    let name = question_name(&query).unwrap_or_default();
+    let name = question_name(query).unwrap_or_default();
     let servers = mac_resolvers(&name, Path::new("/etc/resolv.conf"), Path::new("/etc/resolver"));
-    let reply = relay_query(&query, &servers).unwrap_or_else(|| servfail(&query));
-    let mut out = Vec::with_capacity(2 + reply.len());
-    out.extend_from_slice(&(reply.len().min(u16::MAX as usize) as u16).to_be_bytes());
-    out.extend_from_slice(&reply[..reply.len().min(u16::MAX as usize)]);
-    let _ = conn.write_all(&out);
+    let reply = relay_query(query, &servers).unwrap_or_else(|| servfail(query));
+    let rlen = reply.len().min(usize::from(u16::MAX));
+    let hdr = (rlen as u16).to_be_bytes();
+    let _ = conn.write_all(&hdr).and_then(|()| conn.write_all(&reply[..rlen]));
+}
+
+fn should_warn_gateway_dns(shared_nat_active: bool, said: &AtomicBool) -> bool {
+    shared_nat_active && !said.swap(true, Ordering::Relaxed)
 }
 
 /// Whether `q` is a standard DNS query with one well-formed question: the
@@ -183,11 +191,39 @@ fn relay_query(query: &[u8], servers: &[SocketAddr]) -> Option<Vec<u8>> {
             let Ok(n) = sock.recv(&mut buf) else { break };
             let r = &buf[..n];
             if n >= 12 && r[..2] == query[..2] && r[2] & 0x80 != 0 {
+                if r[2] & 0x02 != 0
+                    && let Some(full) = relay_tcp(query, *server, until.saturating_duration_since(Instant::now()))
+                {
+                    return Some(full);
+                }
                 return Some(r.to_vec());
             }
         }
     }
     None
+}
+
+/// Retries a truncated (`TC=1`) UDP reply over TCP so large responses arrive whole.
+fn relay_tcp(query: &[u8], server: SocketAddr, wait: Duration) -> Option<Vec<u8>> {
+    if wait.is_zero() {
+        return None;
+    }
+    let mut stream = std::net::TcpStream::connect_timeout(&server, wait).ok()?;
+    let _ = stream.set_read_timeout(Some(wait));
+    let _ = stream.set_write_timeout(Some(wait));
+    let len = u16::try_from(query.len()).ok()?.to_be_bytes();
+    stream.write_all(&len).ok()?;
+    stream.write_all(query).ok()?;
+    let mut rlen = [0u8; 2];
+    stream.read_exact(&mut rlen).ok()?;
+    let n = usize::from(u16::from_be_bytes(rlen));
+    if !(12..=65_535).contains(&n) {
+        return None;
+    }
+    let mut buf = vec![0u8; 65_535];
+    stream.read_exact(&mut buf[..n]).ok()?;
+    buf.truncate(n);
+    (buf[..2] == query[..2] && buf[2] & 0x80 != 0).then_some(buf)
 }
 
 /// SERVFAIL for `query`: no resolver on the Mac answered either.
@@ -242,6 +278,8 @@ fn question_name(q: &[u8]) -> Option<String> {
     }
 }
 
+static SELF_LOOP_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Where the Mac would send a lookup for `name`: the servers of the
 /// `/etc/resolver/<domain>` file with the longest domain that `name` is in
 /// (VPNs and tools such as dnsmasq set these up), else `/etc/resolv.conf`'s,
@@ -250,6 +288,16 @@ fn question_name(q: &[u8]) -> Option<String> {
 /// skipped: its server answers 127.0.0.1, the Mac's loopback, which means
 /// nothing in a container.
 fn mac_resolvers(name: &str, resolv_conf: &Path, resolver_dir: &Path) -> Vec<SocketAddr> {
+    mac_resolvers_with(name, resolv_conf, resolver_dir, super::ports::host_port_53_published(), Some(&SELF_LOOP_WARNED))
+}
+
+fn mac_resolvers_with(
+    name: &str,
+    resolv_conf: &Path,
+    resolver_dir: &Path,
+    skip_loopback_53: bool,
+    warn_once: Option<&AtomicBool>,
+) -> Vec<SocketAddr> {
     let mut best: Option<(usize, Vec<SocketAddr>)> = None;
     for entry in std::fs::read_dir(resolver_dir).into_iter().flatten().flatten() {
         let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
@@ -271,7 +319,20 @@ fn mac_resolvers(name: &str, resolv_conf: &Path, resolver_dir: &Path) -> Vec<Soc
             best = Some((domain.len(), servers));
         }
     }
-    best.map(|(_, s)| s).unwrap_or_else(|| parse_servers(&std::fs::read_to_string(resolv_conf).unwrap_or_default()))
+    let mut servers = best.map(|(_, s)| s).unwrap_or_else(|| parse_servers(&std::fs::read_to_string(resolv_conf).unwrap_or_default()));
+    if skip_loopback_53 {
+        let before = servers.len();
+        servers.retain(|s| !(s.port() == 53 && s.ip().to_canonical().is_loopback()));
+        if servers.len() < before
+            && let Some(said) = warn_once
+            && !said.swap(true, Ordering::Relaxed)
+        {
+            crate::diag::warn!(
+                "skipping Mac loopback DNS (127.0.0.1:53 / [::1]:53) while a container publishes host port 53 to prevent a DNS relay loop; pass an explicit --dns (or DoH/DoT) on the DNS container"
+            );
+        }
+    }
+    servers
 }
 
 /// `nameserver` lines (and a `port` line) of a resolv.conf-style file.
@@ -353,6 +414,39 @@ mod tests {
     }
 
     #[test]
+    fn a_truncated_udp_reply_is_retried_over_tcp() {
+        use std::io::{Read, Write};
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = udp.local_addr().unwrap();
+        let tcp = std::net::TcpListener::bind(addr).unwrap();
+        let udp_srv = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (n, from) = udp.recv_from(&mut buf).unwrap();
+            buf[2] |= 0x82; // QR=1, TC=1
+            udp.send_to(&buf[..n], from).unwrap();
+        });
+        let tcp_srv = std::thread::spawn(move || {
+            let (mut s, _) = tcp.accept().unwrap();
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).unwrap();
+            let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut q).unwrap();
+            q[2] = 0x81;
+            q[3] = 0x80;
+            q[6..8].copy_from_slice(&1u16.to_be_bytes());
+            q.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 104, 16, 1, 2]);
+            s.write_all(&(q.len() as u16).to_be_bytes()).unwrap();
+            s.write_all(&q).unwrap();
+        });
+        let q = query("registry.npmjs.org", 1);
+        let r = super::relay_query(&q, &[addr]).expect("retried over TCP");
+        udp_srv.join().unwrap();
+        tcp_srv.join().unwrap();
+        assert_eq!(r[2] & 0x02, 0, "full TCP reply has TC=0");
+        assert_eq!(&r[r.len() - 4..], &[104, 16, 1, 2]);
+    }
+
+    #[test]
     fn only_standard_queries_are_relayed() {
         let q = query("registry-1.docker.io", 1);
         assert!(super::is_query(&q));
@@ -377,5 +471,62 @@ mod tests {
         assert_eq!((&r[..2], r[2] & 0x80, r[3] & 0x0f), (&q[..2], 0x80, 2));
         assert_eq!((&r[4..12], &r[12..]), (&[0, 1, 0, 0, 0, 0, 0, 0][..], &q[12..]));
         assert_eq!(super::servfail(&[0x12, 0x34, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])[3], 0x82);
+    }
+
+    #[test]
+    fn gateway_dns_warning_suppressed_when_shared_nat_is_disabled() {
+        use std::sync::atomic::AtomicBool;
+        let said = AtomicBool::new(false);
+        assert!(!super::should_warn_gateway_dns(false, &said));
+        assert!(!super::should_warn_gateway_dns(false, &said));
+        assert!(super::should_warn_gateway_dns(true, &said), "still warns once when shared NAT is active");
+        assert!(!super::should_warn_gateway_dns(true, &said), "only once per run");
+    }
+
+    #[test]
+    fn mac_resolvers_skips_loopback_port_53_when_container_publishes_dns() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("kiri-dns-loop-guard-{}", std::process::id()));
+        let resolvers = dir.join("resolver");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&resolvers).unwrap();
+        let conf = dir.join("resolv.conf");
+
+        std::fs::write(&conf, "nameserver 127.0.0.1\nnameserver ::1\nnameserver 192.168.1.1\n").unwrap();
+        std::fs::write(resolvers.join("loop53.example"), "nameserver 127.0.0.1\n").unwrap();
+        std::fs::write(resolvers.join("highport.example"), "nameserver 127.0.0.1\nport 5353\n").unwrap();
+
+        let strs = |list: Vec<std::net::SocketAddr>| list.into_iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // When no container publishes port 53, loopback :53 resolvers are preserved.
+        assert_eq!(
+            strs(super::mac_resolvers_with("example.com", &conf, &resolvers, false, None)),
+            ["127.0.0.1:53", "[::1]:53", "192.168.1.1:53"]
+        );
+        assert_eq!(
+            strs(super::mac_resolvers_with("a.loop53.example", &conf, &resolvers, false, None)),
+            ["127.0.0.1:53"]
+        );
+
+        // When a container publishes port 53, 127.0.0.1:53 and [::1]:53 are skipped
+        // while non-loopback :53 and loopback high-port resolvers stay usable.
+        let warned = AtomicBool::new(false);
+        assert_eq!(
+            strs(super::mac_resolvers_with("example.com", &conf, &resolvers, true, Some(&warned))),
+            ["192.168.1.1:53"]
+        );
+        assert!(warned.load(Ordering::Relaxed), "warns once when loopback :53 is filtered");
+        assert!(super::mac_resolvers_with("a.loop53.example", &conf, &resolvers, true, Some(&warned)).is_empty());
+        assert_eq!(
+            strs(super::mac_resolvers_with("a.highport.example", &conf, &resolvers, true, Some(&warned))),
+            ["127.0.0.1:5353"]
+        );
+
+        // With only loopback :53 in resolv.conf, filtering returns empty (SERVFAIL) instead of looping.
+        std::fs::write(&conf, "nameserver 127.0.0.1\nnameserver ::1\n").unwrap();
+        assert!(super::mac_resolvers_with("example.com", &conf, &resolvers, true, None).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

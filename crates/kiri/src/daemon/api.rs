@@ -13,16 +13,26 @@ use serde_json::{Value, json};
 use kiri_image::{Client, Platform, Progress, Reference};
 use kiri_proto::Stream;
 
+use super::caller::Caller;
 use super::engine::{Container, Engine, Error, ExecConfig, RestartPolicy, Spec, Status};
 use super::filters::Filters;
 use super::http::{self, Request};
 use super::time;
 
-/// Serves one client connection until it closes.
-pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
+/// Serves one client connection until it closes. `caller`: where it
+/// arrived (caller.rs), which decides whether Kiri's settings are open to it.
+pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Result<()> {
     let mut w = stream.try_clone()?;
     let mut r = BufReader::new(stream);
-    while let Some(req) = http::read_request(&mut r, streams_body)? {
+    loop {
+        let req = match http::read_request_with_timeout(&mut r, http::HEADER_TIMEOUT, streams_body) {
+            Ok(Some(req)) => req,
+            Ok(None) => break,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                return http::refuse_bad_request(&mut w, &mut r, &e.to_string()).or(Ok(()));
+            }
+            Err(e) => return Err(e),
+        };
         // A body too large to hold: answered and ended, never routed.
         if req.too_large() {
             return http::refuse_too_large(&req, &mut w, &mut r).or(Ok(()));
@@ -36,7 +46,7 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
         if req.header("X-Kiri-Background").is_none() {
             engine.touch();
         }
-        match route(&req, &engine, &mut w, &mut r) {
+        match route(&req, &engine, &caller, &mut w, &mut r) {
             // `Connection: close` or HTTP/1.0: the client reads to the end of
             // the stream (a 204 has no length to read by), which `close`
             // gives it cleanly.
@@ -76,7 +86,9 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
 /// (`/images/create` is `docker import`'s; a pull's, when a client sends
 /// one, is read out after it, by `http::finish_body`).
 fn streams_body(method: &str, path: &str) -> bool {
-    matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive")) || (method == "POST" && matches!(path, "/images/load" | "/images/create" | "/build"))
+    matches!((method, path), ("PUT", p) if p.starts_with("/containers/") && p.ends_with("/archive"))
+        || matches!((method, path), ("POST", p) if p.starts_with("/kiri/containers/") && p.ends_with("/upper"))
+        || (method == "POST" && matches!(path, "/images/load" | "/images/create" | "/build"))
 }
 
 pub(super) enum Next {
@@ -113,27 +125,54 @@ fn status_of(e: Error) -> (u16, String) {
         Error::Conflict(m) => (409, m),
         Error::BadRequest(m) => (400, m),
         Error::Unauthorized(m) => (401, m),
+        Error::Forbidden(m) => (403, m),
         Error::Io(e) => (500, e.to_string()),
     }
 }
 
-fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+/// Kiri's own endpoints (`/kiri/…`) that change something and that a
+/// container given the engine's socket may still call: starting the VM it
+/// already runs in (`kiri start` in a container's shell). Every other one
+/// that is not a GET (the settings, Stop, Sleep, ports, USB, the builder's
+/// limits, and any added later) is for this machine's programs only, as
+/// Docker's API has nothing that changes the engine's own settings.
+const CONTAINER_MAY: &[(&str, &str)] = &[("POST", "/kiri/wake")];
+
+/// Whether a container's connection may make this request.
+fn container_may(method: &str, path: &str) -> bool {
+    let kiri = path == "/kiri" || path.starts_with("/kiri/");
+    !kiri || matches!(method, "GET" | "HEAD") || CONTAINER_MAY.contains(&(method, path))
+}
+
+fn route(req: &Request, engine: &Arc<Engine>, caller: &Caller, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     if req.api_version.is_some_and(|v| v < http::MIN_API_VERSION) {
         let (major, minor) = req.api_version.unwrap_or_default();
         let (min_major, min_minor) = http::MIN_API_VERSION;
         return reply(w, Err(Error::BadRequest(format!("client version {major}.{minor} is too old. Minimum supported API version is {min_major}.{min_minor}, please upgrade your client to a newer version"))), 200);
     }
-    if let Some(done) = super::ops::route(req, engine, w) {
-        return done;
-    }
     let p = req.path.as_str();
     let m = req.method.as_str();
+    // Kiri's own endpoints that change something are for this machine's
+    // programs (caller.rs), not for a container given the socket.
+    if *caller == Caller::Container && !container_may(m, p) {
+        // Closed after the answer: a body the request carried is not left
+        // on the connection to be read as the next request.
+        http::error(w, 403, "this is changed in Kiri's window or with the kiri command on this machine, not from a container")?;
+        return Ok(Next::Close);
+    }
+    // While Settings → Storage moves the data, nothing may change it.
+    if super::storage::moving() && !matches!(m, "GET" | "HEAD") {
+        super::storage::refuse_while_moving(w)?;
+        return Ok(Next::Close);
+    }
+    if let Some(done) = super::ops::route(req, engine, caller, w) {
+        return done;
+    }
     match (m, p) {
         ("GET" | "HEAD", "/_ping") => {
-            // Builder-Version 1: the classic POST /build, which Kiri serves
-            // with its managed BuildKit (builder.rs). "2" would tell older
-            // CLIs and Compose to use BuildKit inside the engine (/session,
-            // /grpc), which Kiri doesn't have.
+            // Builder-Version 1 keeps classic CLIs, older Compose and SDKs
+            // without buildx on POST /build (served by builder.rs), while
+            // buildx probes POST /grpc directly and uses the docker driver.
             http::respond_with(w, 200, "text/plain; charset=utf-8", "Builder-Version: 1\r\n", if m == "HEAD" { b"" } else { b"OK" })?;
             return Ok(Next::KeepAlive);
         }
@@ -151,12 +190,21 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
+        // kiri-win's Windows roots, for the engine in WSL (#303).
+        #[cfg(target_os = "linux")]
+        ("PUT", "/kiri/roots/host") => return reply(w, set_host_roots(req, caller), 200),
+        // daemon.json's registry keys: Settings → Registries, `kiri registry`.
+        ("GET", "/kiri/registries") => return reply(w, Ok(super::daemon_json::report()), 200),
+        ("POST", "/kiri/registries") => return reply(w, set_registries(req, engine), 200),
         ("GET", "/kiri/resources") => return reply(w, Ok(resources(engine)), 200),
         // Settings → Domains: the container-domain routers' ports.
         ("GET", "/kiri/domains") => return reply(w, Ok(super::domains::report()), 200),
         ("POST", "/kiri/domains") => return reply(w, set_domain_ports(req, engine), 200),
         // Back to the ports a start gives (a test copy's routers stop).
         ("DELETE", "/kiri/domains") => return reply(w, super::domains::reset(engine).map_err(Error::Conflict), 200),
+        // Settings → Resources → WSL integration: per-distro sockets in /mnt/wsl/kiri.
+        ("GET", "/kiri/wsl") => return reply(w, Ok(super::wsl_report()), 200),
+        ("POST", "/kiri/wsl") => return reply(w, set_wsl(req, caller), 200),
         // USB passthrough (macOS: the root helper `kiri usb serve` connects here).
         #[cfg(target_os = "macos")]
         ("POST", "/kiri/usb") => return super::usb::attach(req, engine, w, r),
@@ -192,6 +240,12 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
             let id = p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/env")).unwrap_or_default();
             return reply(w, set_env(req, engine, id), 204);
         }
+        // `kiri import`: the writable layer a container had on the engine
+        // it came from (an OCI layer tar), before it first runs here.
+        ("POST", p) if p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/upper")).is_some_and(|id| !id.is_empty()) => {
+            let id = p.strip_prefix("/kiri/containers/").and_then(|r| r.strip_suffix("/upper")).unwrap_or_default();
+            return upper_put(req, engine, id, w, r);
+        }
         // An image's page for kiri-win, whose window can't read the store
         // inside WSL: its layers and its Grype scans (crate::scan), as the
         // Mac's window reads them itself.
@@ -214,8 +268,21 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("POST", "/build") => return super::builder::build(req, engine, w, r),
         ("POST", "/build/cancel") => return reply(w, super::builder::cancel(req, engine), 200),
         ("POST", "/build/prune") => return reply(w, super::builder::prune(req, engine), 200),
+        ("POST", "/grpc") => return super::grpc::grpc(req, engine, w, r),
+        ("POST", "/session") => return super::grpc::session(req, engine, w, r),
+        // Settings → Storage: where the data is, and moving it (storage.rs).
+        ("GET", "/kiri/storage") => return reply(w, Ok(super::storage::report(engine)), 200),
+        ("POST", "/kiri/storage/check") => return reply(w, super::storage::check_request(req, engine), 200),
+        ("POST", "/kiri/storage") => return reply(w, super::storage::start(req, engine), 202),
+        ("POST", "/kiri/storage/reset") => return reply(w, super::storage::start_reset(engine), 202),
+        ("POST", "/kiri/storage/reclaim") => return reply(w, super::storage::reclaim(engine), 200),
+        ("DELETE", "/kiri/storage/old") => return reply(w, super::storage::remove_old(engine), 200),
         ("GET", "/kiri/builder") => return reply(w, Ok(super::builder::settings_report(engine)), 200),
         ("POST", "/kiri/builder") => return reply(w, super::builder::set_settings(req).map(|()| super::builder::settings_report(engine)), 200),
+        ("GET", "/kiri/watch-roots") => return reply(w, Ok(watch_roots(engine)), 200),
+        ("POST", "/kiri/fs-events") => return reply(w, fs_events(req, engine), 204),
+        ("GET", "/kiri/win-ports") => return reply(w, Ok(win_ports(engine)), 200),
+        ("POST", "/kiri/win-ports") => return reply(w, sync_win_ports(req, engine), 200),
         ("GET", "/images/json") => return reply(w, images(req, engine), 200),
         ("POST", "/images/create") if req.query("fromSrc").is_some_and(|s| !s.is_empty()) => return image_import(req, engine, w, r),
         ("POST", "/images/create") => return pull(req, engine, w),
@@ -225,10 +292,10 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
             return image_save(engine, &names, w);
         }
         ("POST", "/containers/create") => {
-            if let Some(made) = super::builder::create_for_buildx(engine, req.query("name")) {
+            if let Some(made) = super::builder::create_for_buildx(engine, req) {
                 return reply(w, made, 201);
             }
-            return reply(w, create(req, engine), 201);
+            return reply(w, create_by(req, engine, caller), 201);
         }
         ("GET", "/containers/json") => return reply(w, list(req, engine), 200),
         ("GET", "/networks") => return reply(w, networks(req, engine), 200),
@@ -281,8 +348,8 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
                     Err(e) => return reply(w, Err(e), 204),
                     _ => {}
                 }
-                super::builder::before_start(engine, id);
-                return reply(w, engine.start(id).map(|()| Value::Null), 204);
+                let started = super::builder::start(engine, id).unwrap_or_else(|| engine.start(id));
+                return reply(w, started.map(|()| Value::Null), 204);
             }
             ("POST", "stop") => {
                 let t = stop_timeout(req, engine, id);
@@ -301,8 +368,7 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
                 let r = engine.stop(id, t).and_then(|_| {
                     // Wait for the exit to be recorded before starting again.
                     engine.wait(id, "not-running")?;
-                    super::builder::before_start(engine, id);
-                    engine.start(id)
+                    super::builder::start(engine, id).unwrap_or_else(|| engine.start(id))
                 });
                 return reply(w, r.map(|()| Value::Null), 204);
             }
@@ -314,8 +380,11 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
             ("POST", "attach") => return attach(req, engine, id, w, r),
             ("GET", "logs") => return logs(req, engine, id, w),
             ("POST", "resize") => return reply(w, resize(req, engine, id).map(|()| json!({})), 200),
-            ("POST", "exec") => return reply(w, exec_create(req, engine, id), 201),
-            ("HEAD" | "GET", "archive") => return archive_get(req, engine, id, w),
+            ("POST", "exec") => {
+                super::builder::before_exec(engine, id);
+                return reply(w, exec_create(req, engine, id), 201);
+            }
+            ("HEAD" | "GET", "archive") => return archive_get(req, engine, id, caller, w),
             ("PUT", "archive") => return archive_put(req, engine, id, w, r),
             ("DELETE", "") => return reply(w, engine.remove(id, req.flag("force"), req.flag("v")).map(|()| Value::Null), 204),
             _ => {}
@@ -424,7 +493,7 @@ fn parse_release(raw: &str) -> Option<String> {
 /// `KiriVersion`, and a component named "Kiri". Moves with `API_VERSION`.
 pub const ENGINE_VERSION: &str = "27.5.1";
 
-fn version() -> Value {
+pub(super) fn version() -> Value {
     let kiri = env!("CARGO_PKG_VERSION");
     json!({
         "Platform": {"Name": "Kiri"},
@@ -477,8 +546,13 @@ fn info(engine: &Engine) -> Value {
         // Not in Docker's /info (the ping's Builder-Version header is), but
         // tools print it: the classic builder API, served by builder.rs.
         "BuilderVersion": "1",
+        // `docker info`'s Registry, Insecure Registries and Registry Mirrors:
+        // daemon.json's, as Docker reports its own.
+        "IndexServerAddress": "https://index.docker.io/v1/",
+        "RegistryConfig": super::daemon_json::info(),
         "KiriAgentMemory": engine.agent_rss().unwrap_or(0),
         "KiriVmAwake": engine.is_awake(),
+        "KiriVmUplink": engine.uplink_info(),
         "KiriStopped": engine.is_stopped(),
         "KiriMemoryCeiling": engine.memory().0,
         "KiriMemoryTarget": engine.memory().1,
@@ -486,7 +560,9 @@ fn info(engine: &Engine) -> Value {
         "KiriMemoryStall": engine.memory_trouble().0,
         "KiriOomKills": engine.memory_trouble().1,
         "KiriCpuPercent": engine.cpu_percent(),
-        "Warnings": engine.records_damage().into_iter().chain(engine.image_damage()).collect::<Vec<_>>(),
+        "KiriStorageReadOnly": engine.storage_readonly(),
+        "KiriStorageZfs": engine.storage_zfs(),
+        "Warnings": engine.records_damage().into_iter().chain(engine.image_damage()).chain(engine.host_warnings()).collect::<Vec<_>>(),
     })
 }
 
@@ -635,7 +711,7 @@ fn image_list_dangling(f: &Filters) -> Result<Option<bool>, Error> {
 }
 
 fn image_inspect(engine: &Engine, name: &str) -> Result<Value, Error> {
-    let i = engine.image(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
+    let (i, _blob_pins) = engine.image_pinned(name)?.ok_or_else(|| Error::NotFound(format!("No such image: {name}")))?;
     let cfg = image_config_json(engine, &i.config_digest);
     // Docker's RootFS.Layers are the image config's uncompressed diff_ids,
     // not the manifest's compressed blob digests (scanners like Trivy match
@@ -690,13 +766,14 @@ fn image_remove(engine: &Engine, name: &str, force: bool) -> Result<Value, Error
     if other_tags {
         return Ok(json!([{"Untagged": i.name}]));
     }
+    engine.prune_layers();
     engine.emit_image("delete", &i.config_digest, &i.name);
     Ok(json!([{"Untagged": i.name}, {"Deleted": i.config_digest}]))
 }
 
 /// `docker tag SOURCE TARGET`: another name for the same image.
 fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> {
-    let i = engine.image(source)?.ok_or_else(|| Error::NotFound(format!("No such image: {source}")))?;
+    let (i, _blob_pins) = engine.image_pinned(source)?.ok_or_else(|| Error::NotFound(format!("No such image: {source}")))?;
     let repo = req.query("repo").unwrap_or_default();
     if repo.is_empty() {
         return Err(Error::BadRequest("repository name must have at least one component".into()));
@@ -705,8 +782,40 @@ fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> 
     let full = format!("{repo}:{tag}");
     let name = Reference::parse(&full).map(|r| r.short()).map_err(|e| Error::BadRequest(format!("invalid reference format: {e}")))?;
     engine.store.put_image(i.tagged(name.clone()))?;
+    engine.prune_layers();
     engine.emit_image("tag", &i.config_digest, &name);
     Ok(())
+}
+
+fn platform_value(v: &Value) -> Option<Platform> {
+    if let Some(s) = v.as_str() {
+        return Platform::parse(s);
+    }
+    let arch = v["architecture"].as_str().filter(|s| !s.is_empty())?;
+    let os = v["os"].as_str().filter(|s| !s.is_empty()).unwrap_or("linux");
+    Platform::parse(&format!("{os}/{arch}"))
+}
+
+/// Platforms asked for by `POST /images/load?platform=...`, accepting both
+/// Kiri/plain `os/arch` strings and Docker API v1.48 JSON `ocispec.Platform`
+/// objects or arrays.
+fn parse_load_platforms(req: &Request) -> Result<Vec<Platform>, Error> {
+    let mut out = Vec::new();
+    for raw in req.queries("platform").filter(|p| !p.is_empty()) {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') {
+            let list: Vec<Value> = serde_json::from_str(trimmed).map_err(|_| Error::BadRequest(format!("invalid platform: {raw}")))?;
+            for item in list {
+                out.push(platform_value(&item).ok_or_else(|| Error::BadRequest(format!("invalid platform: {raw}")))?);
+            }
+        } else if trimmed.starts_with('{') {
+            let v: Value = serde_json::from_str(trimmed).map_err(|_| Error::BadRequest(format!("invalid platform: {raw}")))?;
+            out.push(platform_value(&v).ok_or_else(|| Error::BadRequest(format!("invalid platform: {raw}")))?);
+        } else {
+            out.push(Platform::parse(trimmed).ok_or_else(|| Error::BadRequest(format!("invalid platform: {raw}")))?);
+        }
+    }
+    Ok(out)
 }
 
 /// `docker load`: an image archive, plain or gzip- or zstd-compressed as Docker
@@ -714,9 +823,17 @@ fn image_tag(req: &Request, engine: &Engine, source: &str) -> Result<(), Error> 
 fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     use std::io::Read;
     let mut body = http::Body::new(req, r);
+    let platforms = match parse_load_platforms(req) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = io::copy(&mut body, &mut io::sink());
+            error_closing(w, e)?;
+            return Ok(Next::Close);
+        }
+    };
     let mut head = Vec::with_capacity(6);
     (&mut body).take(6).read_to_end(&mut head)?;
-    let loaded = upload_reader(head, &mut body).map(|archive| kiri_image::archive::load(&engine.store, archive));
+    let loaded = upload_reader(head, &mut body).map(|archive| kiri_image::archive::load_platforms(&engine.store, archive, &platforms));
     let loaded = match loaded {
         Ok(loaded) => loaded,
         Err(e) => {
@@ -729,6 +846,7 @@ fn image_load(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufRea
     };
     match loaded {
         Ok(images) => {
+            engine.prune_layers();
             http::begin_stream_with(w, 200, "application/json", http::CLOSE)?;
             for i in &images {
                 engine.emit_image("load", &i.config_digest, &i.name);
@@ -754,9 +872,11 @@ fn image_import(req: &Request, engine: &Engine, w: &mut UnixStream, r: &mut BufR
             http::end(w)?;
         }
         Err(e) => {
-            // The CLI is still sending the archive: read it out, or it gets
-            // a broken pipe instead of the message.
-            let _ = io::copy(&mut body, &mut io::sink());
+            // The CLI may still be sending the archive: read it out unless it
+            // is still waiting on an unsent `100 Continue`.
+            if !req.needs_continue() {
+                let _ = io::copy(&mut body, &mut io::sink());
+            }
             error_closing(w, e)?;
         }
     }
@@ -807,15 +927,16 @@ fn import(req: &Request, engine: &Engine, stdin: &mut dyn io::Read) -> Result<St
     // An uncompressed layer: its digest is its diff id.
     let mut layer = engine.store.ingest()?;
     io::copy(&mut io::Cursor::new(block).chain(tar), &mut layer).map_err(|e| upload_error(gzip, e))?;
-    let (digest, size) = layer.finish()?;
+    let (digest, size, _layer_pin) = layer.finish_pinned()?;
     cfg["rootfs"]["diff_ids"] = json!([digest]);
     let bytes = serde_json::to_vec(&cfg).map_err(|e| Error::Io(io::Error::other(e)))?;
     let mut w = engine.store.ingest()?;
     io::Write::write_all(&mut w, &bytes)?;
-    let (config_digest, _) = w.finish()?;
+    let (config_digest, _, _config_pin) = w.finish_pinned()?;
     let layers = vec![kiri_image::Layer { digest, size, media_type: "application/vnd.oci.image.layer.v1.tar".into() }];
     let name = name.unwrap_or_else(|| config_digest.clone());
     engine.store.put_image(kiri_image::archive::from_config(name.clone(), &config_digest, &cfg, layers))?;
+    engine.prune_layers();
     engine.emit_image("import", &config_digest, &name);
     Ok(config_digest)
 }
@@ -851,9 +972,13 @@ fn tar_header(block: &[u8]) -> bool {
 /// `docker save`: the named images as one archive.
 fn image_save(engine: &Engine, names: &[String], w: &mut UnixStream) -> io::Result<Next> {
     let mut images = Vec::new();
+    let mut _lookup_pins = Vec::new();
     for n in names {
-        match engine.image(n) {
-            Ok(Some(i)) => images.push(i),
+        match engine.image_pinned(n) {
+            Ok(Some((i, pins))) => {
+                images.push(i);
+                _lookup_pins.extend(pins);
+            }
             Ok(None) => return reply(w, Err(Error::NotFound(format!("No such image: {n}"))), 200),
             Err(e) => return reply(w, Err(Error::Io(e)), 200),
         }
@@ -908,16 +1033,68 @@ fn image_scan(req: &Request, w: &mut UnixStream) -> io::Result<Next> {
 /// the limits of this Mac.
 fn resources(engine: &Engine) -> Value {
     use super::engine as e;
-    json!({
-        "cpus": e::vm_cpus(),
-        "memory_mib": e::memory_ceiling() >> 20,
-        "running_cpus": engine.cpus(),
-        "running_memory_mib": engine.memory().0 >> 20,
-        "awake": engine.is_awake(),
-        "max_cpus": e::max_cpus(),
-        "max_memory_mib": e::physical_memory_bytes() >> 20,
-        "overridden": std::env::var_os("KIRI_CPUS").is_some() || std::env::var_os("KIRI_MEMORY_MIB").is_some(),
-    })
+    #[cfg(target_os = "macos")]
+    let disk = Some((crate::guest::disk::current_gb(), e::vm_disk_gb(), engine.disk_gb()));
+    #[cfg(not(target_os = "macos"))]
+    let disk: Option<(u64, u64, u64)> = None;
+    let overridden = std::env::var_os("KIRI_CPUS").is_some()
+        || std::env::var_os("KIRI_MEMORY_MIB").is_some()
+        || (cfg!(target_os = "macos") && (std::env::var_os("KIRI_DISK_GB").is_some() || std::env::var_os("KIRI_SWAP_MIB").is_some()));
+    let mut v = resources_payload(
+        e::vm_cpus(),
+        e::memory_ceiling() >> 20,
+        engine.cpus(),
+        engine.memory().0 >> 20,
+        engine.is_awake(),
+        e::max_cpus(),
+        e::physical_memory_bytes() >> 20,
+        overridden,
+        disk,
+    );
+    // Swap is the VM's, on its data disk: a Linux host has its own.
+    if cfg!(target_os = "macos") {
+        swap_payload(&mut v, e::vm_swap_mib(), engine.swap_mib());
+    }
+    v
+}
+
+/// The swap the VM boots with next, what it has now, and the most it may have.
+fn swap_payload(v: &mut Value, swap_mib: u64, running_swap_mib: u64) {
+    v["swap_mib"] = json!(swap_mib);
+    v["running_swap_mib"] = json!(running_swap_mib);
+    v["max_swap_mib"] = json!(super::engine::MAX_SWAP_MIB);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resources_payload(
+    cpus: usize,
+    memory_mib: u64,
+    running_cpus: usize,
+    running_memory_mib: u64,
+    awake: bool,
+    max_cpus: usize,
+    max_memory_mib: u64,
+    overridden: bool,
+    disk: Option<(u64, u64, u64)>,
+) -> Value {
+    let mut v = json!({
+        "cpus": cpus,
+        "memory_mib": memory_mib,
+        "running_cpus": running_cpus,
+        "running_memory_mib": running_memory_mib,
+        "awake": awake,
+        "max_cpus": max_cpus,
+        "max_memory_mib": max_memory_mib,
+        "overridden": overridden,
+    });
+    if let Some((current_disk_gb, disk_gb, running_disk_gb)) = disk {
+        let (min_disk_gb, max_disk_gb) = crate::guest::disk::ui_bounds(current_disk_gb, disk_gb);
+        v["disk_gb"] = json!(disk_gb);
+        v["running_disk_gb"] = json!(running_disk_gb);
+        v["min_disk_gb"] = json!(min_disk_gb);
+        v["max_disk_gb"] = json!(max_disk_gb);
+    }
+    v
 }
 
 /// The host's system proxy, from kiri-win on Windows: `{http, https,
@@ -935,6 +1112,22 @@ fn set_host_proxy(req: &Request) -> Result<Value, Error> {
     Ok(super::proxy::report())
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn set_host_roots(req: &Request, caller: &Caller) -> Result<Value, Error> {
+    // Only the Windows host (via kiri-win over the daemon's own socket) may
+    // supply host roots: never a container or an integrated WSL distro (#303).
+    if *caller != Caller::Host {
+        return Err(Error::Forbidden("the Windows roots can only be set from Kiri on Windows".into()));
+    }
+    // Only the engine in WSL takes them: a native Linux daemon has its own
+    // certificate store.
+    if !super::hostroots::in_wsl() {
+        return Err(Error::BadRequest("the Windows roots are for the engine in WSL".into()));
+    }
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    super::hostroots::set(&body).map_err(Error::Io)
+}
+
 fn set_proxy(req: &Request) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let mode = body["mode"].as_str().filter(|m| ["system", "custom", "none"].contains(m)).ok_or_else(|| Error::BadRequest("mode must be system, custom or none".into()))?;
@@ -950,21 +1143,117 @@ fn set_proxy(req: &Request) -> Result<Value, Error> {
     Ok(super::proxy::report())
 }
 
+fn set_registries(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    set_registries_with(req, super::daemon_json::set, || super::builder::refresh(engine))
+}
+
+fn set_registries_with(
+    req: &Request,
+    save: impl FnOnce(&Value) -> Result<(Value, bool), String>,
+    refresh: impl FnOnce(),
+) -> Result<Value, Error> {
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let (report, changed) = save(&body).map_err(Error::BadRequest)?;
+    // BuildKit reads its registries from buildkitd.toml at each start; an
+    // unchanged save leaves the builder alone. A stopped builder gets the
+    // new file now if nothing holds ENSURE; a running one is left to the
+    // next build or the idle watch rather than stopped from a detached
+    // thread after this save has answered.
+    if changed {
+        refresh();
+    }
+    Ok(report)
+}
+
 fn set_domain_ports(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let port = |k: &str| body[k].as_u64().and_then(|p| u16::try_from(p).ok()).filter(|&p| p != 0).ok_or_else(|| Error::BadRequest(format!("{k} must be a port from 1 to 65535")));
     super::domains::set_ports(engine, port("http")?, port("https")?).map_err(Error::Conflict)
 }
 
+fn set_wsl(req: &Request, caller: &Caller) -> Result<Value, Error> {
+    if caller.wsl_distro().is_some() {
+        return Err(Error::Forbidden("WSL integration settings can only be changed from Kiri on Windows".into()));
+    }
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let mut distros = Vec::new();
+    for item in body["distros"].as_array().ok_or_else(|| Error::BadRequest("distros must be an array".into()))? {
+        let name = item["name"].as_str().unwrap_or_default();
+        if !super::binds::valid_distro_name(name) {
+            return Err(Error::BadRequest(format!("invalid WSL distro name: {name}")));
+        }
+        let gid = item["gid"]
+            .as_u64()
+            .and_then(|g| u32::try_from(g).ok())
+            .ok_or_else(|| Error::BadRequest(format!("invalid gid for WSL distro {name}")))?;
+        distros.push(super::WslDistroConfig { name: name.to_owned(), gid });
+    }
+    super::sync_wsl_sockets(&distros).map_err(Error::Io)?;
+    Ok(super::wsl_report())
+}
+
 fn set_resources(req: &Request) -> Result<(), Error> {
     use super::engine as e;
-    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
-    let max_mem = e::physical_memory_bytes() >> 20;
-    let cpus = body["cpus"].as_u64().filter(|c| (1..=e::max_cpus() as u64).contains(c)).ok_or_else(|| Error::BadRequest(format!("cpus must be 1 to {}", e::max_cpus())))?;
-    let mem = body["memory_mib"].as_u64().filter(|m| (1024..=max_mem).contains(m)).ok_or_else(|| Error::BadRequest(format!("memory_mib must be 1024 to {max_mem}")))?;
     let path = e::resources_path().ok_or_else(|| Error::Io(io::Error::other("HOME is not set")))?;
+    let current_disk = cfg!(target_os = "macos").then(crate::guest::disk::current_gb);
+    save_resources(
+        &req.body,
+        &path,
+        e::max_cpus() as u64,
+        e::physical_memory_bytes() >> 20,
+        current_disk,
+        e::vm_disk_gb_config(),
+        e::vm_shared_nat_config(),
+    )
+}
+
+fn save_resources(
+    raw_body: &[u8],
+    path: &std::path::Path,
+    max_cpus: u64,
+    max_mem: u64,
+    current_disk_gb: Option<u64>,
+    existing_disk_gb: Option<u64>,
+    existing_shared_nat: Option<bool>,
+) -> Result<(), Error> {
+    let body: Value = serde_json::from_slice(raw_body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let cpus = body["cpus"].as_u64().filter(|c| (1..=max_cpus).contains(c)).ok_or_else(|| Error::BadRequest(format!("cpus must be 1 to {max_cpus}")))?;
+    let mem = body["memory_mib"].as_u64().filter(|m| (1024..=max_mem).contains(m)).ok_or_else(|| Error::BadRequest(format!("memory_mib must be 1024 to {max_mem}")))?;
+    let mut out = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    out["cpus"] = json!(cpus);
+    out["memory_mib"] = json!(mem);
+    // Left out, the saved swap stays (#326).
+    if let Some(val) = body.get("swap_mib").filter(|v| !v.is_null()) {
+        let max = super::engine::MAX_SWAP_MIB;
+        let swap = val.as_u64().filter(|s| *s <= max).ok_or_else(|| Error::BadRequest(format!("swap_mib must be 0 to {max}")))?;
+        out["swap_mib"] = json!(swap);
+    }
+    if let Some(val) = body.get("disk_gb").filter(|v| !v.is_null()) {
+        let current = current_disk_gb.unwrap_or(crate::guest::disk::DEFAULT_GB);
+        let (min_disk, max_disk) = crate::guest::disk::ui_bounds(current, existing_disk_gb.unwrap_or(current));
+        let disk_gb = val
+            .as_u64()
+            .filter(|d| (min_disk..=max_disk).contains(d))
+            .ok_or_else(|| Error::BadRequest(format!("disk_gb must be {min_disk} to {max_disk}")))?;
+        out["disk_gb"] = json!(disk_gb);
+    } else if let Some(prev) = existing_disk_gb {
+        out["disk_gb"] = json!(prev);
+    }
+    if let Some(val) = body.get("shared_nat").filter(|v| !v.is_null()) {
+        let shared_nat = val.as_bool().ok_or_else(|| Error::BadRequest("shared_nat must be a boolean".into()))?;
+        out["shared_nat"] = json!(shared_nat);
+    } else if let Some(prev) = existing_shared_nat {
+        out["shared_nat"] = json!(prev);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(Error::Io)?;
+    }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json!({"cpus": cpus, "memory_mib": mem}).to_string()).and_then(|()| std::fs::rename(&tmp, &path)).map_err(Error::Io)
+    std::fs::write(&tmp, out.to_string()).and_then(|()| std::fs::rename(&tmp, path)).map_err(Error::Io)
 }
 
 fn set_ports(req: &Request, engine: &Engine, id: &str) -> Result<Value, Error> {
@@ -1006,6 +1295,73 @@ fn set_env(req: &Request, engine: &Engine, id: &str) -> Result<Value, Error> {
     Ok(Value::Null)
 }
 
+/// Active WSL drive bind sources of running containers, for `kiri-win`'s
+/// opt-in bind-mount watcher.
+fn watch_roots(engine: &Engine) -> Value {
+    let root = super::binds::wsl().map_or("/mnt/", |w| w.root.as_str());
+    json!({
+        "automount_root": root,
+        "roots": engine.wsl_bind_sources(root),
+    })
+}
+
+/// Parses `POST /kiri/fs-events` (`{"events": ["OP\tPATH", ...]}` or newline-
+/// separated `OP\tPATH` text), filters to valid WSL automount paths under
+/// `automount_root` with no `..` traversal, and caps per-request volume. OP is
+/// a change (`C`, `M`, `A`, `D`) or a watched root's pin (`P`) or unpin (`U`).
+fn parse_fs_events(body: &[u8], automount_root: &str) -> Result<Vec<String>, Error> {
+    const MAX_EVENTS: usize = 4096;
+    let raw: Vec<String> = if body.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') {
+        let v: Value = serde_json::from_slice(body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+        strings(&v["events"]).ok_or_else(|| Error::BadRequest("events must be a list of OP\\tPATH lines".into()))?
+    } else {
+        let text = std::str::from_utf8(body).map_err(|_| Error::BadRequest("invalid UTF-8 body".into()))?;
+        text.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()
+    };
+    if raw.len() > MAX_EVENTS {
+        return Err(Error::BadRequest(format!("too many events ({}, limit is {MAX_EVENTS})", raw.len())));
+    }
+    Ok(raw
+        .into_iter()
+        .filter(|line| {
+            let Some((op, path)) = line.split_once('\t') else { return false };
+            matches!(op, "C" | "M" | "A" | "D" | "P" | "U") && super::binds::is_wsl_drive_path(path, automount_root, false)
+        })
+        .collect())
+}
+
+fn fs_events(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    let root = super::binds::wsl().map_or("/mnt/", |w| w.root.as_str());
+    let lines = parse_fs_events(&req.body, root)?;
+    engine.send_fs_events(&lines);
+    Ok(Value::Null)
+}
+
+/// Active published ports and WSL's internal `eth0` IPv4 address for
+/// `kiri-win`'s Windows UDP and host-IP port forwarder.
+fn win_ports(engine: &Engine) -> Value {
+    let wsl_ip = super::ports::wsl_ipv4().map(|ip| ip.to_string());
+    let ports: Vec<Value> = engine
+        .published_ports()
+        .into_iter()
+        .map(|p| json!({"proto": p.proto, "host_ip": p.host_ip, "host_port": p.host_port}))
+        .collect();
+    json!({
+        "wsl_ip": wsl_ip,
+        "ports": ports,
+    })
+}
+
+fn sync_win_ports(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    if !req.body.is_empty() {
+        let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+        if let Some(ips) = strings(&body["host_ips"]) {
+            super::ports::set_windows_host_ips(&ips);
+        }
+    }
+    Ok(win_ports(engine))
+}
+
 /// A registry client with the credentials the CLI sent, if any.
 fn client_for(req: &Request) -> Client {
     Client::new().with_credentials(req.header("x-registry-auth").and_then(kiri_image::Credentials::from_header))
@@ -1041,8 +1397,8 @@ fn auth(req: &Request) -> Result<Value, Error> {
 fn push(req: &Request, engine: &Engine, name: &str, w: &mut UnixStream) -> io::Result<Next> {
     let tag = req.query("tag").unwrap_or_default();
     let full = if tag.is_empty() { name.to_owned() } else { format!("{name}:{tag}") };
-    let (image, target) = match (engine.image(&full), Reference::parse(&full)) {
-        (Ok(Some(i)), Ok(r)) => (i, r),
+    let (image, _blob_pins, target) = match (engine.image_pinned(&full), Reference::parse(&full)) {
+        (Ok(Some((i, pins))), Ok(r)) => (i, pins, r),
         (Ok(None), _) => return reply(w, Err(Error::NotFound(format!("An image does not exist locally with the tag: {full}"))), 200),
         (Err(e), _) => return reply(w, Err(Error::Io(e)), 200),
         (_, Err(e)) => return reply(w, Err(Error::BadRequest(e.to_string())), 200),
@@ -1127,6 +1483,12 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
     let client = client_for(req);
     let on_progress = |p: Progress| match p {
         Progress::Resolved { .. } | Progress::Layer { cached: true, .. } => {}
+        // A mirror that did not have the image: say which, and carry on.
+        Progress::MirrorFallback { mirror, reason } => {
+            let reason: String = reason.chars().take(120).collect();
+            line(json!({"status": format!("{mirror}: {reason}; trying the next registry")}));
+        }
+        Progress::FromMirror { mirror } => line(json!({"status": format!("Pulled from the mirror {mirror}")})),
         // Docker's own lines, so `docker pull` draws its bars; `size` is
         // extra, for the window's overall bar, and the CLI ignores it.
         Progress::Layer { digest, size, .. } => line(json!({"status": "Pulling fs layer", "progressDetail": {}, "id": short(&digest), "size": size})),
@@ -1151,6 +1513,7 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
     }
     match result {
         Ok(image) => {
+            engine.prune_layers();
             // Docker reports the digest it was asked for: the index's, if any.
             line(json!({"status": format!("Digest: {}", image.index_digest.as_ref().unwrap_or(&image.digest))}));
             line(json!({"status": format!("Status: Downloaded newer image for {}", image.name)}));
@@ -1255,14 +1618,19 @@ fn pull_hint(e: &kiri_image::registry::Error, registry: &str, proxy: Option<&str
 
 /// `-p` (`HostConfig.PortBindings`) and `-P` (`PublishAllPorts`: every port
 /// the image or `--expose` declares, on a free host port).
-fn port_bindings(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Vec<super::ports::Binding>, Error> {
+fn port_bindings(body: &Value, exposed: &[String]) -> Result<Vec<super::ports::Binding>, Error> {
     let parse = |key: &str| -> Result<(u16, String), Error> {
         let (port, proto) = key.split_once('/').unwrap_or((key, "tcp"));
-        let port = port.parse().map_err(|_| Error::BadRequest(format!("invalid port {key}")))?;
+        let port: u16 = port
+            .parse()
+            .ok()
+            .filter(|&p| p > 0 && port.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(|| Error::BadRequest(format!("invalid port {key}")))?;
+        let proto = proto.to_ascii_lowercase();
         if proto != "tcp" && proto != "udp" {
             return Err(Error::BadRequest(format!("Kiri forwards TCP and UDP ports, not {key}")));
         }
-        Ok((port, proto.to_owned()))
+        Ok((port, proto))
     };
     let mut out = Vec::new();
     if let Some(map) = body["HostConfig"]["PortBindings"].as_object() {
@@ -1283,17 +1651,8 @@ fn port_bindings(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Re
         }
     }
     if body["HostConfig"]["PublishAllPorts"].as_bool() == Some(true) {
-        let mut exposed: Vec<String> = body["ExposedPorts"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
-        // The image's own EXPOSE lines live in its config blob.
-        if let Ok(bytes) = engine.store.read_config(&image.config_digest) {
-            if let Ok(cfg) = serde_json::from_slice::<Value>(&bytes) {
-                if let Some(m) = cfg["config"]["ExposedPorts"].as_object() {
-                    exposed.extend(m.keys().cloned());
-                }
-            }
-        }
         for key in exposed {
-            let Ok((container_port, proto)) = parse(&key) else { continue };
+            let Ok((container_port, proto)) = parse(key) else { continue };
             if !out.iter().any(|b| b.container_port == container_port && b.proto == proto) {
                 out.push(super::ports::Binding { container_port, proto, host_ip: String::new(), host_port: 0 });
             }
@@ -1305,6 +1664,99 @@ fn port_bindings(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Re
 /// The VM path containers mount to reach the Mac's SSH agent (Docker
 /// Desktop's and OrbStack's name for it).
 const SSH_AGENT_SOCK: &str = "/run/host-services/ssh-auth.sock";
+const HOST_SSH_AGENT_SOCK: &str = "/run/kiri/host-services/ssh-auth.sock";
+
+/// What the guest is given for that bind: the VM's path, or on a Linux host
+/// where the agent listens, under Kiri's own /run/kiri. The host's
+/// /run/host-services belongs to Docker Desktop for Linux, and the agent
+/// never creates it there (#420). Inspect still shows the path asked for.
+fn ssh_agent_source() -> &'static str {
+    ssh_agent_source_for(cfg!(target_os = "linux"))
+}
+
+fn ssh_agent_source_for(linux: bool) -> &'static str {
+    if linux { HOST_SSH_AGENT_SOCK } else { SSH_AGENT_SOCK }
+}
+
+fn is_ssh_agent_sock(src: &str) -> bool {
+    src.starts_with('/') && lexical_path(src) == SSH_AGENT_SOCK
+}
+
+/// Classification of a container bind mount source that should be backed by
+/// Kiri's SSH agent relay socket instead of a plain filesystem bind.
+#[derive(Debug, PartialEq, Eq)]
+enum SshAgentBind {
+    /// Docker Desktop / OrbStack's virtual `/run/host-services/ssh-auth.sock`.
+    Virtual,
+    /// A macOS host SSH agent Unix socket (virtiofs cannot forward host Unix
+    /// domain sockets into the Linux VM). Holds `Some(canonical_path)` when a
+    /// live, current-UID-owned socket exists on disk; `None` when a well-known
+    /// agent socket path does not exist yet.
+    MacHost(Option<std::path::PathBuf>),
+}
+
+fn ssh_agent_bind_for(src: &str, mac: bool) -> Option<SshAgentBind> {
+    if is_ssh_agent_sock(src) {
+        return Some(SshAgentBind::Virtual);
+    }
+    if !mac || !src.starts_with('/') {
+        return None;
+    }
+    let p = std::path::Path::new(src);
+    match std::fs::symlink_metadata(p) {
+        Ok(_) => {
+            // Resolve symlinks first so a link named `S.gpg-agent.ssh` pointing
+            // to `docker.sock` or another socket is judged by its real target.
+            let canon = std::fs::canonicalize(p).ok()?;
+            if !super::ports::is_owned_unix_socket(&canon) || super::ports::is_kiri_socket_path(&canon) {
+                return None;
+            }
+            if super::ports::is_known_mac_ssh_agent_sock_path(&canon)
+                || super::ports::matches_default_ssh_auth_sock(&canon)
+            {
+                Some(SshAgentBind::MacHost(Some(canon)))
+            } else {
+                None
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Not on disk yet (e.g. gpg-agent not started): still translate
+            // well-known Mac agent socket paths to the guest relay so `-v` does
+            // not create a directory over `S.gpg-agent.ssh`.
+            let clean = std::path::PathBuf::from(lexical_path(src));
+            if !super::ports::is_kiri_socket_path(&clean)
+                && super::ports::is_known_mac_ssh_agent_sock_path(&clean)
+            {
+                Some(SshAgentBind::MacHost(None))
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Restores a strict host SSH agent bind mount as the preferred upstream on
+/// container start (macOS only), so restarting a container after a daemon
+/// reboot keeps reaching the agent it mounted without allowing container-created
+/// specs to point `serve_ssh_agent` at arbitrary sockets.
+pub(super) fn refresh_ssh_agent_mounts(info: &[Value]) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    for m in info {
+        if m["Type"] != "bind" {
+            continue;
+        }
+        let Some(src) = m["Source"].as_str() else { continue };
+        if super::binds::engine_socket(src).is_some() {
+            continue;
+        }
+        if let Some(SshAgentBind::MacHost(Some(host_path))) = ssh_agent_bind_for(src, true) {
+            super::ports::set_preferred_ssh_auth_sock_strict(&host_path);
+        }
+    }
+}
 
 /// A container's mounts, worked out at create time.
 struct Mounts {
@@ -1383,18 +1835,42 @@ fn guest_bind_source(src: &str) -> String {
 /// The guest mount lines with each Mac bind source followed again from the
 /// path the person gave (kept in `info`, one entry per line). Links are
 /// resolved when the container is made; this redoes it at start, so a link
-/// re-pointed since then leads to its new target. Lines that aren't a bind
-/// of the Mac's files stay as they are.
+/// re-pointed since then leads to its new target. On a Linux host (and
+/// WSL) only a bind of the engine's socket is looked at again, so a
+/// container made before Kiri gave containers a socket of their own gets
+/// it now: by the path the person gave, or else by the path mounted when
+/// it was made, every line, whether or not `info` has one for it. Other
+/// lines stay as they are.
 pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value]) -> Vec<String> {
-    if !cfg!(target_os = "macos") || guest.len() != info.len() {
+    fresh_bind_sources_with(guest, info, super::binds::engine_socket, cfg!(target_os = "macos"))
+}
+
+fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl Fn(&str) -> Option<String>, mac: bool) -> Vec<String> {
+    let paired = guest.len() == info.len();
+    if mac && !paired {
         return guest.to_vec();
     }
     guest
         .iter()
-        .zip(info)
-        .map(|(line, i)| {
-            let (Some(src), Some((old, rest))) = (i["Source"].as_str().filter(|_| i["Type"] == "bind"), line.split_once('\t')) else { return line.clone() };
-            if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) || super::binds::engine_socket(src).is_some() {
+        .enumerate()
+        .map(|(idx, line)| {
+            let Some((old, rest)) = line.split_once('\t') else { return line.clone() };
+            let src = info.get(idx).filter(|i| paired && i["Type"] == "bind").and_then(|i| i["Source"].as_str());
+            if !mac {
+                if is_ssh_agent_sock(old) || src.is_some_and(is_ssh_agent_sock) {
+                    return format!("{}\t{rest}", ssh_agent_source_for(!mac));
+                }
+                let given = src.and_then(&engine_socket).or_else(|| old.starts_with('/').then(|| engine_socket(old)).flatten());
+                return given.map_or_else(|| line.clone(), |given| format!("{given}\t{rest}"));
+            }
+            let Some(src) = src else { return line.clone() };
+            if engine_socket(src).is_some() {
+                return line.clone();
+            }
+            if ssh_agent_bind_for(src, mac).is_some() {
+                return format!("{}\t{rest}", ssh_agent_source_for(!mac));
+            }
+            if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) {
                 return line.clone();
             }
             format!("{}\t{rest}", guest_bind_source(src))
@@ -1402,12 +1878,39 @@ pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value]) -> Vec<String
         .collect()
 }
 
+/// Parses `--add-host name:ip` entries into `/etc/hosts` lines (`ip\tname`).
+/// `host-gateway` is always stored as `HOST_ADDR` (never baking `192.168.65.254`
+/// into the saved container spec) so `kiri-init`'s `host_etc_target` maps it
+/// dynamically at container start time based on whether the WSL host relay is
+/// live, falling back to the bridge gateway if the relay isn't running later.
+fn extra_hosts_from(raw: &[String]) -> Result<Vec<String>, Error> {
+    let mut extra_hosts = Vec::with_capacity(raw.len());
+    for h in raw {
+        let Some((name, ip)) = h.split_once(':') else { continue };
+        let ip = if ip == "host-gateway" { super::ports::HOST_ADDR } else { ip };
+        if ip.parse::<std::net::IpAddr>().is_err() {
+            return Err(Error::BadRequest(format!("invalid IP address: {ip}")));
+        }
+        if !valid_hosts_name(name) {
+            return Err(Error::BadRequest(format!("invalid host name ({name})")));
+        }
+        extra_hosts.push(format!("{ip}\t{name}"));
+    }
+    Ok(extra_hosts)
+}
+
 /// An NFS or CIFS server name as an address the guest kernel can use.
-/// `host.docker.internal` is the Mac, as it is for containers.
+/// `host.docker.internal` is the Mac (or the Windows host under WSL 2),
+/// as it is for containers.
 fn resolve_server(host: &str) -> Option<String> {
     use std::net::ToSocketAddrs;
-    if cfg!(target_os = "macos") && matches!(host, "host.docker.internal" | "host.kiri.internal") {
-        return Some(super::ports::HOST_ADDR.to_owned());
+    if matches!(host, "host.docker.internal" | "host.kiri.internal") {
+        if cfg!(target_os = "macos") {
+            return Some(super::ports::HOST_ADDR.to_owned());
+        }
+        if crate::hostrelay::wsl_host_active() {
+            return Some(crate::hostrelay::WSL_HOST_ADDR_STR.to_owned());
+        }
     }
     let addrs: Vec<std::net::SocketAddr> = (host, 0).to_socket_addrs().ok()?.collect();
     addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).map(|a| a.ip().to_string())
@@ -1537,9 +2040,66 @@ fn volumes_from_mounts(guest: &[String], info: &[Value], ro: bool) -> Vec<(Strin
         .collect()
 }
 
+/// Prepares a host bind-mount source path before adding it to a container spec.
+/// On Linux/WSL, `/etc/localtime` and `/etc/timezone` are never created as
+/// directories: if missing (for `-v`) or an empty directory (left by an earlier
+/// version before #938), they are created/repaired as valid timezone files.
+fn prepare_bind_source(src: &str, here: &str, create_missing: bool) -> Result<(), Error> {
+    let tz = std::env::var("TZ").ok();
+    prepare_bind_source_at(std::path::Path::new("/"), src, here, create_missing, !cfg!(target_os = "macos"), tz.as_deref())
+}
+
+fn prepare_bind_source_at(
+    root: &std::path::Path,
+    src: &str,
+    here: &str,
+    create_missing: bool,
+    linux_tz_guard: bool,
+    tz_env: Option<&str>,
+) -> Result<(), Error> {
+    let norm = lexical_path(here);
+    let p = if root == std::path::Path::new("/") {
+        std::path::PathBuf::from(here)
+    } else {
+        root.join(norm.trim_start_matches('/'))
+    };
+    if linux_tz_guard && matches!(norm.as_str(), "/etc/localtime" | "/etc/timezone") {
+        let heal = || match norm.as_str() {
+            "/etc/localtime" => super::localtime::ensure_localtime_at(root, tz_env).map_err(Error::Io),
+            _ => super::localtime::ensure_timezone_at(root, tz_env).map_err(Error::Io),
+        };
+        let is_dir = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_dir());
+        if is_dir {
+            return heal();
+        }
+        if !super::localtime::is_valid_timezone_file_at(root, &p) {
+            if !create_missing && !std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) {
+                return Err(Error::BadRequest(format!(
+                    "invalid mount config for type \"bind\": bind source path does not exist: {src}"
+                )));
+            }
+            return heal();
+        }
+        return Ok(());
+    }
+    if !p.exists() {
+        if !create_missing {
+            return Err(Error::BadRequest(format!("invalid mount config for type \"bind\": bind source path does not exist: {src}")));
+        }
+        super::binds::make_source(&p).map_err(Error::Io)?;
+    }
+    Ok(())
+}
+
 /// `-v`, `--mount`, `--tmpfs`, `--volumes-from`, `-v /path` and the image's
 /// VOLUME lines.
+#[cfg(test)]
 fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mounts, Error> {
+    mounts_for(body, engine, image, &super::caller::Caller::Host)
+}
+
+fn mounts_for(body: &Value, engine: &Engine, image: &kiri_image::Image, caller: &super::caller::Caller) -> Result<Mounts, Error> {
+    let wsl_distro = caller.wsl_distro();
     let host = &body["HostConfig"];
     let mut out = Mounts { guest: Vec::new(), info: Vec::new(), volumes: Vec::new(), anon: Vec::new() };
     let check_target = |t: &str| -> Result<(), Error> {
@@ -1573,14 +2133,24 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
         };
         // The engine's own socket (Testcontainers' Ryuk, CI runners): the VM's
         // relay to this daemon on a Mac, or Kiri's socket on a Linux host.
-        let engine_sock = if kind == "bind" { super::binds::engine_socket(src) } else { None };
+        let engine_sock = if kind == "bind" { super::binds::engine_socket_for_distro(src, wsl_distro) } else { None };
+        let ssh_sock = if kind == "bind" && engine_sock.is_none() {
+            ssh_agent_bind_for(src, cfg!(target_os = "macos"))
+        } else {
+            None
+        };
         match kind {
             "bind" if engine_sock.is_some() => {
                 out.guest.push(format!("{}\t{dst}\t{}", engine_sock.as_deref().unwrap_or_default(), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
-            "bind" if src == SSH_AGENT_SOCK => {
-                out.guest.push(format!("{src}\t{dst}\t{}", flag("")));
+            "bind" if ssh_sock.is_some() => {
+                if let Some(SshAgentBind::MacHost(Some(ref host_path))) = ssh_sock
+                    && *caller == super::caller::Caller::Host
+                {
+                    super::ports::set_preferred_ssh_auth_sock(host_path);
+                }
+                out.guest.push(format!("{}\t{dst}\t{}", ssh_agent_source(), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
             }
             "bind" => {
@@ -1596,13 +2166,7 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
                     out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
                     return Ok(());
                 };
-                let p = std::path::Path::new(&here);
-                if !p.exists() {
-                    if !create_missing {
-                        return Err(Error::BadRequest(format!("invalid mount config for type \"bind\": bind source path does not exist: {src}")));
-                    }
-                    super::binds::make_source(p).map_err(Error::Io)?;
-                }
+                prepare_bind_source(src, &here, create_missing)?;
                 // After a missing source was made, so its links are followed too.
                 out.guest.push(format!("{}\t{dst}\t{}", guest_bind_source(src), flag("")));
                 out.info.push(json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}));
@@ -1642,10 +2206,11 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
         }
         Ok(())
     };
-    // From the docker CLI on Windows (into WSL), `C:\src:/app` and the like.
+    // From the docker CLI on Windows (into WSL), `C:\src:/app` and the like,
+    // or from an integrated WSL distro (`wsl_distro`).
     let wsl = super::binds::wsl();
     for b in strings(&host["Binds"]).unwrap_or_default() {
-        let (src, dst, opts) = super::binds::split(&b, wsl)?;
+        let (src, dst, opts) = super::binds::split_for(&b, wsl, wsl_distro)?;
         let (src, dst, opts) = (src.as_str(), dst.as_str(), opts.as_str());
         let ro = opts.split(',').any(|o| o == "ro");
         let kind = if src.starts_with('/') { "bind" } else { "volume" };
@@ -1655,8 +2220,9 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
     for m in host["Mounts"].as_array().into_iter().flatten() {
         let kind = m["Type"].as_str().unwrap_or("bind");
         let src = m["Source"].as_str().unwrap_or("");
-        let src = match wsl {
-            Some(w) if kind == "bind" => super::binds::source(src, w)?,
+        let src = match (wsl, wsl_distro) {
+            (_, Some(d)) if kind == "bind" => super::binds::distro_source(src, d, wsl)?,
+            (Some(w), None) if kind == "bind" => super::binds::source(src, w)?,
             _ => src.to_owned(),
         };
         let src = src.as_str();
@@ -1746,6 +2312,80 @@ fn mounts(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Result<Mo
     Ok(out)
 }
 
+/// What inspect gives back of a create's mounts: HostConfig's `Binds`,
+/// `Mounts` and `Tmpfs` as they came, and `Volumes` (`-v /path`) with the
+/// image's VOLUME lines, as Docker's Config has them. Tools that recreate a
+/// container from its inspect (Watchtower, Portainer, Arcane) copy these (#610).
+fn mount_request(body: &Value, image_cfg: &Value) -> Value {
+    let host = &body["HostConfig"];
+    let mut volumes = serde_json::Map::new();
+    for given in [&body["Volumes"], &image_cfg["config"]["Volumes"]] {
+        for path in given.as_object().into_iter().flat_map(|m| m.keys()) {
+            volumes.entry(path.clone()).or_insert_with(|| json!({}));
+        }
+    }
+    json!({
+        "Binds": host["Binds"],
+        "Mounts": host["Mounts"],
+        "Tmpfs": host["Tmpfs"],
+        "Volumes": if volumes.is_empty() { Value::Null } else { Value::Object(volumes) },
+    })
+}
+
+/// [`mount_request`] for inspect. A container saved before it was kept has
+/// only Docker's `Mounts` entries, so they are made from those: a bind or a
+/// named volume as a `Binds` line, a tmpfs in `Tmpfs` (or `Mounts` when
+/// read-only), an anonymous volume in `Volumes` (or `Mounts` when read-only),
+/// never leaking generated anonymous volume IDs or internal paths.
+fn inspect_mounts(spec: &Spec, is_anon_volume: impl Fn(&str) -> bool) -> Value {
+    if !spec.mount_request.is_null() {
+        return spec.mount_request.clone();
+    }
+    let (mut binds, mut mounts, mut tmpfs, mut volumes) = (Vec::new(), Vec::new(), serde_json::Map::new(), serde_json::Map::new());
+    let mut seen = std::collections::HashSet::new();
+    for m in &spec.mount_info {
+        let dst = m["Destination"].as_str().unwrap_or_default();
+        if dst.is_empty() || !seen.insert(dst.trim_end_matches('/').to_owned()) {
+            continue;
+        }
+        let rw = m["RW"] != false;
+        let ro = if rw { "" } else { ":ro" };
+        match (m["Type"].as_str(), m["Name"].as_str()) {
+            (Some("bind"), _) => {
+                let src = m["Source"].as_str().unwrap_or_default();
+                if !src.is_empty() {
+                    binds.push(format!("{src}:{dst}{ro}"));
+                }
+            }
+            (Some("volume"), Some(name)) if spec.anon_volumes.iter().any(|a| a == name) || is_anon_volume(name) => {
+                if rw {
+                    volumes.insert(dst.to_owned(), json!({}));
+                } else {
+                    mounts.push(json!({"Type": "volume", "Target": dst, "ReadOnly": true}));
+                }
+            }
+            (Some("volume"), Some(name)) if !name.is_empty() => {
+                binds.push(format!("{name}:{dst}{ro}"));
+            }
+            (Some("tmpfs"), _) => {
+                if rw {
+                    tmpfs.insert(dst.to_owned(), json!(""));
+                } else {
+                    mounts.push(json!({"Type": "tmpfs", "Target": dst, "ReadOnly": true}));
+                }
+            }
+            _ => {}
+        }
+    }
+    let or_null = |v: Value, empty: bool| if empty { Value::Null } else { v };
+    json!({
+        "Binds": or_null(json!(binds), binds.is_empty()),
+        "Mounts": or_null(json!(mounts), mounts.is_empty()),
+        "Tmpfs": or_null(json!(tmpfs), tmpfs.is_empty()),
+        "Volumes": or_null(json!(volumes), volumes.is_empty()),
+    })
+}
+
 fn volume_json(v: &super::volumes::Volume) -> Value {
     json!({
         "Name": v.name,
@@ -1822,17 +2462,16 @@ fn volumes(req: &Request, engine: &Engine) -> Result<Value, Error> {
     Ok(json!({"Volumes": list, "Warnings": []}))
 }
 
-/// The TCP ports an image declares (EXPOSE) plus `--expose`.
-fn exposed_ports(body: &Value, engine: &Engine, image: &kiri_image::Image) -> Vec<u16> {
-    let mut keys: Vec<String> = body["ExposedPorts"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
-    if let Ok(bytes) = engine.store.read_config(&image.config_digest) {
-        if let Ok(cfg) = serde_json::from_slice::<Value>(&bytes) {
-            if let Some(m) = cfg["config"]["ExposedPorts"].as_object() {
-                keys.extend(m.keys().cloned());
+/// The image's and create request's ExposedPorts keys; a bare port means TCP.
+fn exposed_ports(body: &Value, image_cfg: &Value) -> Vec<String> {
+    let mut ports = Vec::new();
+    for map in [body["ExposedPorts"].as_object(), image_cfg["config"]["ExposedPorts"].as_object()].into_iter().flatten() {
+        for key in map.keys() {
+            if let Some(norm) = super::engine::normalize_exposed_key(key) {
+                ports.push(norm);
             }
         }
     }
-    let mut ports: Vec<u16> = keys.iter().filter(|k| k.ends_with("/tcp") || !k.contains('/')).filter_map(|k| k.split('/').next()?.parse().ok()).collect();
     ports.sort_unstable();
     ports.dedup();
     ports
@@ -1866,13 +2505,13 @@ fn inspect_bindings(ports: &[super::ports::Binding]) -> Value {
 /// Config.ExposedPorts: the image's and `--expose`'s ports, and every
 /// published one, as Docker lists them (`"80/tcp": {}`); null with none,
 /// as Docker leaves it out.
-fn inspect_exposed(ports: &[super::ports::Binding], exposed: &[u16]) -> Value {
+fn inspect_exposed(ports: &[super::ports::Binding], exposed: &[String]) -> Value {
     let mut m = serde_json::Map::new();
     for b in ports {
         m.insert(format!("{}/{}", b.container_port, b.proto), json!({}));
     }
-    for p in exposed {
-        m.entry(format!("{p}/tcp")).or_insert_with(|| json!({}));
+    for key in exposed {
+        m.entry(key.clone()).or_insert_with(|| json!({}));
     }
     if m.is_empty() { Value::Null } else { Value::Object(m) }
 }
@@ -1891,7 +2530,7 @@ fn ports_map(c: &Container) -> Value {
 /// given) every exposed or `-p` port that has none as a key with a null value
 /// (`"80/tcp": null`), as Docker shows them. Traefik's docker provider picks
 /// a container's port from these keys alone.
-fn ports_map_of(bound: &[(super::ports::Binding, String, u16)], exposed: Option<(&[super::ports::Binding], &[u16])>) -> Value {
+fn ports_map_of(bound: &[(super::ports::Binding, String, u16)], exposed: Option<(&[super::ports::Binding], &[String])>) -> Value {
     let mut m = serde_json::Map::new();
     for (b, ip, port) in bound {
         let key = format!("{}/{}", b.container_port, b.proto);
@@ -1904,8 +2543,8 @@ fn ports_map_of(bound: &[(super::ports::Binding, String, u16)], exposed: Option<
         for b in asked {
             m.entry(format!("{}/{}", b.container_port, b.proto)).or_insert(Value::Null);
         }
-        for p in exposed {
-            m.entry(format!("{p}/tcp")).or_insert(Value::Null);
+        for key in exposed {
+            m.entry(key.clone()).or_insert(Value::Null);
         }
     }
     Value::Object(m)
@@ -1940,7 +2579,7 @@ fn command(entry: Option<Vec<String>>, cmd: Option<Vec<String>>, image_entry: &[
     })
 }
 
-/// The primary network when NetworkMode is empty or `default`: the first
+/// The primary network when NetworkMode is empty, `default` or `bridge`: the first
 /// resolved endpoint's name, unless bridge is listed. No match keeps bridge.
 /// Unknown endpoints are left for create to reject. `keys` come from the
 /// request's JSON map, so they are sorted and "first" is the same every time.
@@ -2061,11 +2700,30 @@ pub(super) fn cpu_weight(shares: u64) -> u32 {
     ((w * 1e9).round() / 1e9).ceil() as u32
 }
 
-pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> super::engine::Limits {
+pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> Result<super::engine::Limits, Error> {
     let mut l = base;
+    // Normalize pre-#545 containers (`memory_max > 0, memory_swap == 0`) to
+    // Docker's effective `2 * memory` limit before checking updates against it.
+    l.memory_swap = l.memory_swap();
+    // Docker's checks for `--memory-swap`, in Docker's words.
+    let swap = h["MemorySwap"].as_i64().filter(|s| *s != 0);
     if let Some(m) = h["Memory"].as_u64().filter(|m| *m > 0) {
+        if swap.is_none() && l.memory_swap > 0 && m > l.memory_swap as u64 {
+            return Err(Error::BadRequest("Memory limit should be smaller than already set memoryswap limit, update the memoryswap at the same time".into()));
+        }
         l.memory_max = m;
     }
+    if let Some(s) = swap {
+        if s > 0 && l.memory_max == 0 {
+            return Err(Error::BadRequest("You should always set the Memory limit when using Memoryswap limit, see usage".into()));
+        }
+        if s > 0 && (s as u64) < l.memory_max {
+            return Err(Error::BadRequest("Minimum memoryswap limit should be larger than memory limit, see usage".into()));
+        }
+        l.memory_swap = s.max(-1);
+    }
+    // Only a memory limit: as much swap again, which Docker writes down.
+    l.memory_swap = l.memory_swap();
     if let Some(n) = h["NanoCpus"].as_u64().filter(|n| *n > 0) {
         // --cpus 1.5 → 150 ms of CPU time every 100 ms.
         l.cpu_period = 100_000;
@@ -2073,32 +2731,167 @@ pub(super) fn limits_from(h: &Value, base: super::engine::Limits) -> super::engi
     }
     if let Some(q) = h["CpuQuota"].as_i64().filter(|q| *q > 0) {
         l.cpu_quota = q as u64;
-        l.cpu_period = h["CpuPeriod"].as_u64().filter(|p| *p > 0).unwrap_or(100_000) as u32;
+        l.cpu_period = u32::try_from(h["CpuPeriod"].as_u64().filter(|p| *p > 0).unwrap_or(100_000))
+            .map_err(|_| Error::BadRequest("CpuPeriod is too large".into()))?;
     }
     if let Some(shares) = h["CpuShares"].as_u64().filter(|s| *s > 0) {
         l.cpu_shares = shares;
         l.cpu_weight = cpu_weight(shares);
     }
-    if let Some(p) = h["PidsLimit"].as_i64().filter(|p| *p > 0) {
-        l.pids_max = p as u32;
+    if let Some(p) = h["PidsLimit"].as_u64().filter(|p| *p > 0) {
+        l.pids_max = u32::try_from(p).map_err(|_| Error::BadRequest("PidsLimit is too large".into()))?;
     }
-    l
+    Ok(l)
 }
 
+pub(super) fn restart_policy(v: &Value, creating: bool) -> Result<RestartPolicy, Error> {
+    let name = match v["Name"].as_str() {
+        Some("") | None => "no",
+        Some(n) => n,
+    };
+    if !matches!(name, "no" | "always" | "unless-stopped" | "on-failure") {
+        let message = if creating {
+            format!("invalid restart policy {name}")
+        } else {
+            format!(
+                "invalid restart policy: unknown policy '{name}'; use one of 'no', 'always', 'on-failure', or 'unless-stopped'"
+            )
+        };
+        return Err(Error::BadRequest(message));
+    }
+    if v["MaximumRetryCount"].as_i64().is_some_and(|n| n < 0) {
+        return Err(Error::BadRequest(
+            "invalid restart policy: maximum retry count cannot be negative".into(),
+        ));
+    }
+    let max_retries = v["MaximumRetryCount"].as_u64().unwrap_or(0);
+    if max_retries > 0 && name != "on-failure" {
+        return Err(Error::BadRequest(
+            "invalid restart policy: maximum retry count can only be used with 'on-failure'".into(),
+        ));
+    }
+    let max_retries = u32::try_from(max_retries)
+        .map_err(|_| Error::BadRequest("invalid restart policy: maximum retry count is too large".into()))?;
+    Ok(RestartPolicy {
+        name: name.to_owned(),
+        max_retries,
+    })
+}
+
+/// Returned in `POST /containers/create`'s `Warnings` when the caller asks for
+/// `--security-opt seccomp=unconfined` (or `seccomp:unconfined`). Kiri lifts
+/// the default syscall filter there, but `kiri-init` still installs the host
+/// boundary on both VM and Linux-host containers (no `io_uring`, no `AF_VSOCK`
+/// sockets), so workloads that ask for `seccomp=unconfined` to get `io_uring`
+/// are told up front instead of failing silently with `EPERM` (#516).
+const SECCOMP_UNCONFINED_WARNING: &str =
+    "seccomp=unconfined lifts the default syscall filter, but Kiri keeps its host boundary: io_uring and vsock sockets stay blocked";
+
 pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    create_by(req, engine, &super::caller::Caller::Host)
+}
+
+fn unc_wsl_distro(s: &str) -> Option<String> {
+    if s.bytes().any(|b| b.is_ascii_control()) {
+        return None;
+    }
+    let rest = if let Some(after_q) = s.strip_prefix(r"\\?\") {
+        if s.contains('/') || after_q.len() < 4 || !after_q[..4].eq_ignore_ascii_case(r"UNC\") {
+            return None;
+        }
+        after_q[4..].to_owned()
+    } else {
+        let norm = s.replace('/', "\\");
+        if norm.starts_with(r"\\?\") || norm.starts_with(r"\\.\") {
+            return None;
+        }
+        norm.strip_prefix(r"\\")?.to_owned()
+    };
+    let (host, after_host) = rest.split_once('\\')?;
+    if !(host.eq_ignore_ascii_case("wsl.localhost") || host.eq_ignore_ascii_case("wsl$")) {
+        return None;
+    }
+    let (distro, _) = after_host.split_once('\\').unwrap_or((after_host, ""));
+    super::binds::valid_distro_name(distro).then(|| distro.to_owned())
+}
+
+fn looks_windows_drive_path(s: &str) -> bool {
+    let s = s.strip_prefix(r"\\?\").unwrap_or(s);
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+}
+
+fn created_wsl_distro(caller: &Caller, engine_distro: Option<&str>, labels: &Value) -> Option<String> {
+    match caller {
+        Caller::Wsl(d) if super::binds::valid_distro_name(d) => Some(d.clone()),
+        Caller::Host => {
+            let paths = [
+                "com.docker.compose.project.working_dir",
+                "com.docker.compose.project.config_files",
+                "com.docker.compose.project.environment_file",
+            ]
+            .into_iter()
+            .filter_map(|k| labels[k].as_str())
+            .flat_map(|v| v.split(',').map(str::trim))
+            .filter(|v| !v.is_empty());
+            let mut saw_drive = false;
+            for p in paths {
+                if let Some(d) = unc_wsl_distro(p) {
+                    return Some(d);
+                }
+                if looks_windows_drive_path(p) {
+                    saw_drive = true;
+                }
+            }
+            if saw_drive {
+                None
+            } else {
+                engine_distro.filter(|d| super::binds::valid_distro_name(d)).map(str::to_owned)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn create_by(req: &Request, engine: &Engine, caller: &Caller) -> Result<Value, Error> {
+    let body_labels = serde_json::from_slice::<Value>(&req.body).ok().map(|b| b["Labels"].clone()).unwrap_or(Value::Null);
+    let record_distro = created_wsl_distro(caller, super::binds::wsl().and_then(|w| w.distro.as_deref()), &body_labels);
+    create_inner(req, engine, caller, record_distro)
+}
+
+#[cfg(test)]
+pub(super) fn create_for(req: &Request, engine: &Engine, wsl_distro: Option<&str>) -> Result<Value, Error> {
+    let record_distro = wsl_distro.filter(|d| super::binds::valid_distro_name(d)).map(str::to_owned);
+    let caller = match wsl_distro {
+        Some(d) => Caller::Wsl(d.to_owned()),
+        None => Caller::Host,
+    };
+    create_inner(req, engine, &caller, record_distro)
+}
+
+fn create_inner(req: &Request, engine: &Engine, caller: &Caller, record_wsl_distro: Option<String>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let image_name = body["Image"].as_str().unwrap_or_default();
     if image_name.is_empty() {
         return Err(Error::BadRequest("no image specified".into()));
     }
     let host = &body["HostConfig"];
+    let security_opt = strings(&host["SecurityOpt"]).unwrap_or_default();
     // A seccomp profile Kiri cannot apply fails the create, before anything
     // (volumes) is made for it.
-    if let super::seccomp::Choice::Profile(json) = super::seccomp::choice(&strings(&host["SecurityOpt"]).unwrap_or_default()).map_err(Error::BadRequest)? {
-        super::seccomp::compile(json, profile_caps(caps_from(host)?, host["Privileged"].as_bool().unwrap_or(false))).map_err(Error::BadRequest)?;
-    }
+    let seccomp_unconfined = match super::seccomp::choice(&security_opt).map_err(Error::BadRequest)? {
+        super::seccomp::Choice::Profile(json) => {
+            super::seccomp::compile(json, profile_caps(caps_from(host)?, host["Privileged"].as_bool().unwrap_or(false))).map_err(Error::BadRequest)?;
+            false
+        }
+        super::seccomp::Choice::Unconfined => true,
+        super::seccomp::Choice::Default => false,
+    };
+    // NetworkMode `bridge` too: Docker joins only the endpoints' networks
+    // when there are any, whatever the mode names (k3d sends `bridge` with
+    // its cluster network, #727), unless they list bridge.
     let network_mode = match host["NetworkMode"].as_str().unwrap_or("default") {
-        "" | "default" => body["NetworkingConfig"]["EndpointsConfig"].as_object()
+        "" | "default" | "bridge" => body["NetworkingConfig"]["EndpointsConfig"].as_object()
             .and_then(|eps| endpoints_primary(eps.keys().map(String::as_str), |key| engine.lock_net().find(key).map(|n| (n.name.clone(), n.internal))))
             .unwrap_or_else(|| "bridge".to_owned()),
         m => m.to_owned(),
@@ -2170,29 +2963,23 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     // `--add-host name:ip` arrives as "name:ip"; /etc/hosts wants "ip name".
     // Both are written into the container's /etc/hosts by the guest, so a
     // newline in either would add lines of its own.
-    let mut extra_hosts = Vec::new();
-    for h in strings(&host["ExtraHosts"]).unwrap_or_default() {
-        let Some((name, ip)) = h.split_once(':') else { continue };
-        let ip = if ip == "host-gateway" { super::ports::HOST_ADDR } else { ip };
-        if ip.parse::<std::net::IpAddr>().is_err() {
-            return Err(Error::BadRequest(format!("invalid IP address: {ip}")));
-        }
-        if !valid_hosts_name(name) {
-            return Err(Error::BadRequest(format!("invalid host name ({name})")));
-        }
-        extra_hosts.push(format!("{ip}\t{name}"));
+    let extra_hosts = extra_hosts_from(&strings(&host["ExtraHosts"]).unwrap_or_default())?;
+    let mut warnings: Vec<&str> = Vec::new();
+    if seccomp_unconfined {
+        warnings.push(SECCOMP_UNCONFINED_WARNING);
     }
-    let warnings: Vec<&str> = Vec::new();
     // --ulimit, --sysctl, --device, --device-cgroup-rule, --group-add:
     // refused now with Docker's error rather than at start.
     let host_opts = super::hostopts::from_host(host);
     super::hostopts::guest_lines(&host_opts, network_mode == "host").map_err(Error::BadRequest)?;
     super::hostopts::check_device_requests(host).map_err(Error::BadRequest)?;
+    let limits = super::engine::Limits { shm_size: host["ShmSize"].as_u64().unwrap_or(0), ..limits_from(host, super::engine::Limits::default())? };
     if let Some(s) = body["StopSignal"].as_str().filter(|s| !s.is_empty()) {
         parse_signal(s)?;
     }
 
-    let image = engine.image(image_name)?.ok_or_else(|| Error::NotFound(format!("No such image: {image_name}")))?;
+    let (image, _blob_pins) = engine.image_pinned(image_name)?.ok_or_else(|| Error::NotFound(format!("No such image: {image_name}")))?;
+    let _layer_pin = engine.pin_layers(image.layers.iter().map(|l| l.digest.as_str()));
     if let Some(why) = intel_mac_refusal(image_name, std::slice::from_ref(&image.platform)) {
         return Err(Error::BadRequest(why));
     }
@@ -2208,8 +2995,16 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     // Checked before mounts, which may create volumes.
     let healthcheck = healthcheck_from(&body, &image_cfg)?;
     let (entrypoint, cmd) = command(strings(&body["Entrypoint"]), strings(&body["Cmd"]), &image.config.entrypoint, &image.config.cmd)?;
-    let mounts = mounts(&body, engine, &image)?;
-    let ports = port_bindings(&body, engine, &image)?;
+    let restart = restart_policy(&host["RestartPolicy"], true)?;
+    let auto_remove = host["AutoRemove"].as_bool().unwrap_or(false);
+    if auto_remove && restart.name != "no" {
+        return Err(Error::BadRequest(
+            "can't create 'AutoRemove' container with restart policy".into(),
+        ));
+    }
+    let mounts = mounts_for(&body, engine, &image, caller)?;
+    let exposed = exposed_ports(&body, &image_cfg);
+    let ports = port_bindings(&body, &exposed)?;
     if !ports.is_empty() && network_mode == "none" {
         return Err(Error::BadRequest("a container with --network none cannot publish ports".into()));
     }
@@ -2244,13 +3039,13 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         env,
         cwd: pick("WorkingDir", &image.config.working_dir),
         user: pick("User", &image.config.user),
-        auto_remove: host["AutoRemove"].as_bool().unwrap_or(false),
+        auto_remove,
         privileged: host["Privileged"].as_bool().unwrap_or(false),
-        limits: super::engine::Limits { shm_size: host["ShmSize"].as_u64().unwrap_or(0), ..limits_from(host, super::engine::Limits::default()) },
+        limits,
         caps: caps_from(host)?,
         cap_add: strings(&host["CapAdd"]).unwrap_or_default(),
         cap_drop: strings(&host["CapDrop"]).unwrap_or_default(),
-        security_opt: strings(&host["SecurityOpt"]).unwrap_or_default(),
+        security_opt,
         readonly_rootfs: host["ReadonlyRootfs"].as_bool().unwrap_or(false),
         hostname,
         stop_signal: body["StopSignal"].as_str().filter(|s| !s.is_empty()).map(signal).or_else(|| {
@@ -2279,28 +3074,18 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
         aliases,
         extra_hosts,
         ports,
-        exposed: exposed_ports(&body, engine, &image),
+        exposed,
         host_opts,
         volumes_from: strings(&host["VolumesFrom"]).unwrap_or_default(),
         pid_mode,
+        wsl_distro: record_wsl_distro,
         mounts: mounts.guest,
         mount_info: mounts.info,
+        mount_request: mount_request(&body, &image_cfg),
         volumes: mounts.volumes,
         anon_volumes: mounts.anon,
-        restart: RestartPolicy {
-            name: match host["RestartPolicy"]["Name"].as_str() {
-                Some("") | None => "no".to_owned(),
-                Some(n) => n.to_owned(),
-            },
-            max_retries: host["RestartPolicy"]["MaximumRetryCount"].as_u64().unwrap_or(0) as u32,
-        },
+        restart,
     };
-    if !matches!(spec.restart.name.as_str(), "no" | "always" | "unless-stopped" | "on-failure") {
-        return Err(Error::BadRequest(format!("invalid restart policy {}", spec.restart.name)));
-    }
-    if spec.auto_remove && spec.restart.name != "no" {
-        return Err(Error::BadRequest("can't create 'AutoRemove' container with restart policy".into()));
-    }
     let id = engine.create(req.query("name").map(str::to_owned), spec, &image)?;
     Ok(json!({"Id": id, "Warnings": warnings}))
 }
@@ -2411,14 +3196,7 @@ fn links_from(list: &[String], engine: &Engine) -> Result<Vec<super::engine::Lin
 
 fn status_text(c: &Container) -> String {
     let ago = |t: Option<std::time::SystemTime>| {
-        let s = t.and_then(|t| t.elapsed().ok()).map_or(0, |d| d.as_secs());
-        match s {
-            0..=1 => "Less than a second".to_owned(),
-            2..=59 => format!("{s} seconds"),
-            60..=3599 => format!("{} minutes", s / 60),
-            3600..=86399 => format!("{} hours", s / 3600),
-            _ => format!("{} days", s / 86400),
-        }
+        super::time::human_duration(t.and_then(|t| t.elapsed().ok()).map_or(0, |d| d.as_secs()))
     };
     match c.status {
         Status::Created => "Created".into(),
@@ -2524,11 +3302,13 @@ fn ipam_config(want4: &str, want6: &str) -> Value {
 /// networks and healthcheck state.
 fn container_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
     let id = engine.resolve(key)?;
-    let networks: Vec<super::network::Network> = engine.lock_net().all().to_vec();
     let health = engine.health(&id);
+    let anon_vols: Vec<String> = engine.volume_list().into_iter().filter(|v| v.anonymous).map(|v| v.name).collect();
     engine.with(&id, |c| {
-        let mut v = inspect(c, &networks);
-        v["NetworkSettings"]["Networks"] = endpoints(c, &networks);
+        let net = engine.lock_net();
+        let networks = net.all();
+        let mut v = inspect(c, networks, &anon_vols);
+        v["NetworkSettings"]["Networks"] = endpoints(c, networks);
         // The old top-level fields describe the default bridge only.
         if c.spec.network_mode == "bridge" {
             let ep = v["NetworkSettings"]["Networks"]["bridge"].clone();
@@ -2555,69 +3335,115 @@ fn container_inspect(engine: &Engine, key: &str) -> Result<Value, Error> {
     })
 }
 
+fn spec_wsl_distro(spec: &super::engine::Spec) -> Option<String> {
+    if let Some(d) = spec.wsl_distro.as_deref().filter(|d| super::binds::valid_distro_name(d)) {
+        return Some(d.to_owned());
+    }
+    if spec.mount_info.is_empty() {
+        return None;
+    }
+    let custom = format!("{}/roots/", super::binds::wsl_kiri_dir());
+    for m in &spec.mount_info {
+        let Some(src) = m["Source"].as_str() else { continue };
+        for prefix in [custom.as_str(), "/mnt/wsl/kiri/roots/"] {
+            if let Some(rest) = src.strip_prefix(prefix) {
+                let d = rest.split('/').next().unwrap_or(rest);
+                if super::binds::valid_distro_name(d) {
+                    return Some(d.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn list(req: &Request, engine: &Engine) -> Result<Value, Error> {
     let f = filters(req, &["id", "name", "label", "label!", "status", "ancestor", "network", "exited", "volume", "health"])?;
     if let Some(bad) = f.values("health").and_then(|v| v.iter().find(|v| !super::health::valid_filter(v))) {
         return Err(Error::BadRequest(format!("Unrecognised filter value for health: {bad}")));
     }
+    let limit = match req.query("limit").filter(|v| !v.is_empty()) {
+        Some(v) => {
+            let n = v
+                .parse::<isize>()
+                .map_err(|_| Error::BadRequest(format!("invalid limit: {v}")))?;
+            usize::try_from(n).ok().filter(|n| *n > 0)
+        }
+        None => None,
+    };
     let health = engine.health_statuses();
     // Docker matches the image each `ancestor` value names, by ID (#442).
     let ancestors = f.values("ancestor").map(|v| engine.ancestor_ids(v)).transpose()?;
-    // A status filter lists stopped containers without --all, as Docker does.
-    let all = req.flag("all") || f.values("status").is_some() || f.values("exited").is_some();
-    let networks: Vec<super::network::Network> = engine.lock_net().all().to_vec();
-    let mut rows = engine.each(|c| {
+    // A status filter or a limit lists stopped containers without --all, as Docker does.
+    let all = req.flag("all")
+        || limit.is_some()
+        || f.values("status").is_some()
+        || f.values("exited").is_some();
+    let mut rows = engine.each_with_networks(|c, networks| {
         if !all && c.status != Status::Running {
             return None;
         }
         let labels = if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) };
-        let net = networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge"));
+        let first = (!c.spec.left_all_networks)
+            .then(|| networks.iter().find(|n| n.name == c.spec.network_mode || n.id == c.spec.network_mode || (c.spec.network_mode == "default" && n.name == "bridge")))
+            .flatten();
         let keep = f.any("id", |v| c.id.starts_with(v))
             && f.name(&c.name)
             && f.labels(&labels)
             && f.any("status", |v| v == state_word(c))
             && f.any("exited", |v| c.status == Status::Exited && v.parse() == Ok(c.exit_code))
             && ancestors.as_ref().is_none_or(|ids| ids.contains(&c.spec.image_id))
-            && f.any("network", |v| net.is_some_and(|n| n.name == v || n.id.starts_with(v)))
+            && f.any("network", |v| {
+                first.is_some_and(|n| n.name == v || n.id.starts_with(v))
+                    || c.spec.extra_networks.iter().any(|x| networks.iter().find(|n| n.name == x.name).is_some_and(|n| n.name == v || n.id.starts_with(v)))
+            })
             && f.any("volume", |v| c.spec.volumes.iter().chain(&c.spec.anon_volumes).any(|n| n == v) || c.spec.mount_info.iter().any(|m| m["Destination"] == v || m["Source"] == v))
             && f.any("health", |v| v == health.get(&c.id).map_or("none", |h| h.status.as_str()));
         if !keep {
             return None;
         }
-        Some((
-            time::unix(c.created),
-            json!({
-                "Id": c.id,
-                "Names": [format!("/{}", c.name)],
-                "Image": c.spec.image,
-                "ImageID": c.spec.image_id,
-                "Command": c.argv().join(" "),
-                "Created": time::unix(c.created),
-                "State": state_word(c),
-                "Status": ps_status(c, health.get(&c.id)),
-                // Kiri's own: the window counts "Up 3 s" from these every second.
-                // Docker clients ignore fields they don't know.
-                "KiriStartedAt": c.started.map(time::unix),
-                "KiriFinishedAt": c.finished.map(time::unix),
-                "KiriExitCode": c.exit_code,
-                "KiriOOMKilled": c.oom_killed,
-                "KiriVmStopped": c.vm_stopped,
-                "Ports": ports_list(c),
-                "Labels": if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) },
-                "HostConfig": {"NetworkMode": c.spec.network_mode},
-                "NetworkSettings": {"Networks": endpoints(c, &networks)},
-                "Mounts": c.spec.mount_info,
-            }),
-        ))
+        let mut row = json!({
+            "Id": c.id,
+            "Names": [format!("/{}", c.name)],
+            "Image": c.spec.image,
+            "ImageID": c.spec.image_id,
+            "Command": c.argv().join(" "),
+            "Created": time::unix(c.created),
+            "State": state_word(c),
+            "Status": ps_status(c, health.get(&c.id)),
+            // Kiri's own: the window counts "Up 3 s" from these every second.
+            // Docker clients ignore fields they don't know.
+            "KiriStartedAt": c.started.map(time::unix),
+            "KiriFinishedAt": c.finished.map(time::unix),
+            "KiriExitCode": c.exit_code,
+            "KiriOOMKilled": c.oom_killed,
+            "KiriVmStopped": c.vm_stopped,
+            "KiriStoppedByUser": c.stopped_by_user,
+            "Ports": ports_list(c),
+            "Labels": if c.spec.labels.is_object() { c.spec.labels.clone() } else { json!({}) },
+            "HostConfig": {"NetworkMode": c.spec.network_mode},
+            "NetworkSettings": {"Networks": endpoints(c, networks)},
+            "Mounts": c.spec.mount_info,
+        });
+        if let Some(distro) = spec_wsl_distro(&c.spec) {
+            row["KiriWslDistro"] = json!(distro);
+        }
+        Some((c.created, row))
     });
-    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    rows.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1["Id"].as_str().cmp(&b.1["Id"].as_str()))
+    });
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
     Ok(Value::Array(rows.into_iter().map(|(_, v)| v).collect()))
 }
 
-fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
+fn inspect(c: &Container, nets: &[super::network::Network], anon_vols: &[String]) -> Value {
     let when = |t: Option<std::time::SystemTime>| t.map_or_else(|| time::ZERO.to_owned(), time::rfc3339);
     let argv = c.argv();
-    json!({
+    let mut v = json!({
         "Id": c.id,
         "Created": time::rfc3339(c.created),
         "Path": argv.first().cloned().unwrap_or_default(),
@@ -2697,7 +3523,19 @@ fn inspect(c: &Container, nets: &[super::network::Network]) -> Value {
         },
         "NetworkSettings": network_settings(c, nets),
         "Mounts": c.spec.mount_info,
-    })
+    });
+    for key in ["MaskedPaths", "ReadonlyPaths"] {
+        v["HostConfig"][key] = super::hostopts::system_paths(&c.spec.host_opts, key, c.spec.privileged);
+    }
+    v["HostConfig"]["CgroupnsMode"] = super::hostopts::inspect(&c.spec.host_opts, "CgroupnsMode");
+    // Set apart: more keys in the macro above pass its recursion limit.
+    v["HostConfig"]["MemorySwap"] = json!(c.spec.limits.memory_swap());
+    let mounts = inspect_mounts(&c.spec, |name| anon_vols.iter().any(|a| a == name));
+    v["Config"]["Volumes"] = mounts["Volumes"].clone();
+    for key in ["Binds", "Mounts", "Tmpfs"] {
+        v["HostConfig"][key] = mounts[key].clone();
+    }
+    v
 }
 
 fn network_settings(c: &Container, nets: &[super::network::Network]) -> Value {
@@ -2952,7 +3790,7 @@ fn forward_stdin(engine: Arc<Engine>, id: String, r: &mut BufReader<UnixStream>)
 /// it closely follows data, though the next read would see the end. For
 /// `docker run -i` that was a process waiting forever for the end of its input,
 /// in 1 to 5 runs in 100. poll is woken for it.
-fn wait_readable(stream: &UnixStream) {
+pub(super) fn wait_readable(stream: &UnixStream) {
     let mut fd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
     // SAFETY: one valid pollfd. Any other failure leaves the read to block or to
     // report it, as without this.
@@ -3183,6 +4021,8 @@ pub(super) fn send_chunks(archive: &mut dyn io::Read, to_guest: &mut impl io::Wr
 pub(super) fn copy_error(m: &str) -> Error {
     if let Some(m) = m.strip_prefix("notfound: ") {
         Error::NotFound(m.to_owned())
+    } else if let Some(m) = m.strip_prefix("forbidden: ") {
+        Error::Forbidden(m.to_owned())
     } else if let Some(m) = m.strip_prefix("notdir: ") {
         Error::BadRequest(m.to_owned())
     } else if m.contains("no such container") {
@@ -3222,12 +4062,55 @@ fn path_stat_header(e: &kiri_proto::FsEntry<'_>, link: &str) -> String {
     format!("X-Docker-Container-Path-Stat: {}\r\n", kiri_image::b64::encode(stat.to_string().as_bytes()))
 }
 
+const COPY_OUT_CHUNK: usize = 64 * 1024;
+
+pub(super) fn use_paced_copy(caller: &Caller) -> bool {
+    cfg!(target_os = "macos") && *caller == Caller::Container
+}
+
+/// Streams a `COPY_PORT` archive (`OUT` or `EXPORT`) to an HTTP chunked
+/// response. When `paced` is true, sends a 1-byte credit ack before reading
+/// each `<= 64 KiB` chunk and finishes `f` before `http::chunk` writes to `w`,
+/// so `COPY_PORT` never fills its host buffer while `w` blocks on
+/// `ENGINE_API_PORT` (#874).
+pub(super) fn stream_copy_out(f: &mut (impl io::Read + io::Write), w: &mut impl io::Write, paced: bool) -> io::Result<()> {
+    let mut buf = vec![0u8; COPY_OUT_CHUNK];
+    if paced {
+        let mut hdr = [0u8; 4];
+        loop {
+            f.write_all(&[1])?;
+            f.read_exact(&mut hdr)?;
+            let n = u32::from_le_bytes(hdr) as usize;
+            if n == 0 {
+                return Ok(());
+            }
+            if n > COPY_OUT_CHUNK {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("oversized paced copy chunk {n}")));
+            }
+            f.read_exact(&mut buf[..n])?;
+            http::chunk(w, &buf[..n])?;
+        }
+    }
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        http::chunk(w, &buf[..n])?;
+    }
+}
+
 /// `docker cp` out of a container (GET), or the stat it starts with (HEAD).
-fn archive_get(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> io::Result<Next> {
-    use std::io::Read;
+fn archive_get(req: &Request, engine: &Engine, id: &str, caller: &Caller, w: &mut UnixStream) -> io::Result<Next> {
     let path = req.query("path").unwrap_or("/");
-    let op = if req.method == "HEAD" { kiri_proto::copy_op::STAT } else { kiri_proto::copy_op::OUT };
-    let stream = match engine.copy(id, op, path, 0) {
+    let (op, paced, flags) = if req.method == "HEAD" {
+        (kiri_proto::copy_op::STAT, false, 0)
+    } else {
+        let paced = use_paced_copy(caller);
+        let flags = if paced { kiri_proto::copy_flags::PACED } else { 0 };
+        (kiri_proto::copy_op::OUT, paced, flags)
+    };
+    let stream = match engine.copy(id, op, path, flags) {
         Ok(s) => s,
         Err(e) => return reply(w, Err(e), 200),
     };
@@ -3239,7 +4122,11 @@ fn archive_get(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> 
             // HEAD answers carry no body, so the reason goes nowhere; the CLI
             // reports "no such file" from the status alone.
             if req.method == "HEAD" {
-                let status = match copy_error(m) { Error::NotFound(_) => 404, _ => 400 };
+                let status = match copy_error(m) {
+                    Error::NotFound(_) => 404,
+                    Error::Forbidden(_) => 403,
+                    _ => 400,
+                };
                 http::head_only(w, status, "")?;
                 return Ok(Next::KeepAlive);
             }
@@ -3252,14 +4139,7 @@ fn archive_get(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream) -> 
         return Ok(Next::KeepAlive);
     }
     http::begin_stream_with(w, 200, "application/x-tar", &header)?;
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        http::chunk(w, &buf[..n])?;
-    }
+    stream_copy_out(&mut f, w, paced)?;
     http::end(w)?;
     drop(stream);
     Ok(Next::KeepAlive)
@@ -3366,14 +4246,27 @@ fn upload_reader<'a>(head: Vec<u8>, rest: impl io::Read + 'a) -> Result<Box<dyn 
 
 fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     use kiri_proto::copy_flags;
-    let path = req.query("path").unwrap_or("/");
+    let raw_path = req.query("path").unwrap_or("/");
     let mut flags = copy_flags::CHUNKED;
-    if req.flag("copyUIDGID") {
+    let path = if req.flag("copyUIDGID") {
         flags |= copy_flags::KEEP_OWNERS;
-    }
+        let user = engine.with(id, |c| c.spec.user.clone()).unwrap_or_default();
+        if user.is_empty() { raw_path.to_owned() } else { format!("{raw_path}\0{user}") }
+    } else {
+        raw_path.to_owned()
+    };
     if req.flag("noOverwriteDirNonDir") {
         flags |= copy_flags::NO_OVERWRITE_DIR_NON_DIR;
     }
+    // Resolve the container and open the guest copy session before reading the
+    // body so missing containers fail with 404 without emitting `100 Continue`.
+    let stream = match engine.copy(id, kiri_proto::copy_op::IN, &path, flags) {
+        Ok(s) => s,
+        Err(e) => {
+            error_closing(w, e)?;
+            return Ok(Next::Close);
+        }
+    };
     // Docker takes the archive plain or compressed; the guest unpacks tar.
     use std::io::Read;
     let mut body = http::Body::new(req, r);
@@ -3382,13 +4275,6 @@ fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: 
     let gzip = upload_compression(&head) == Upload::Gzip;
     let mut archive = match upload_reader(head, body) {
         Ok(a) => a,
-        Err(e) => {
-            error_closing(w, e)?;
-            return Ok(Next::Close);
-        }
-    };
-    let stream = match engine.copy(id, kiri_proto::copy_op::IN, path, flags) {
-        Ok(s) => s,
         Err(e) => {
             error_closing(w, e)?;
             return Ok(Next::Close);
@@ -3422,6 +4308,64 @@ fn archive_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: 
         }
         Ok(()) => {
             error_closing(w, Error::BadRequest("the archive could not be read to its end".into()))?;
+            Ok(Next::Close)
+        }
+        Err(e) => {
+            error_closing(w, e)?;
+            Ok(Next::Close)
+        }
+    }
+}
+
+/// `POST /kiri/containers/{id}/upper`: `kiri import`'s copy of the writable
+/// layer a container had on Docker Desktop or OrbStack, an uncompressed OCI
+/// layer tar (whiteouts as `.wh.` files), unpacked by the guest into the
+/// container's own writable layer (copy.rs, `copy_op::UPPER`). Only for a
+/// container that is not running and has no writable layer yet. A
+/// container's connection never gets here (`container_may`).
+fn upper_put(req: &Request, engine: &Engine, id: &str, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+    let refused = match engine.with(id, |c| c.status == Status::Running || c.paused) {
+        Ok(true) => Some(Error::Conflict(format!("container {id} is running: its writable layer can only be brought in before it runs"))),
+        Ok(false) => None,
+        Err(e) => Some(e),
+    };
+    if let Some(e) = refused {
+        error_closing(w, e)?;
+        return Ok(Next::Close);
+    }
+    let mut body = http::Body::new(req, r);
+    let stream = match engine.copy(id, kiri_proto::copy_op::UPPER, "/", kiri_proto::copy_flags::CHUNKED) {
+        Ok(s) => s,
+        Err(e) => {
+            error_closing(w, e)?;
+            return Ok(Next::Close);
+        }
+    };
+    let mut to_guest = std::fs::File::from(stream.fd.try_clone()?);
+    if let Err(e) = send_chunks(&mut body, &mut to_guest) {
+        // Cut short: dropping the stream ends the guest's copy, which then
+        // leaves the container as it was.
+        error_closing(w, Error::BadRequest(format!("the layer could not be read: {e}")))?;
+        return Ok(Next::Close);
+    }
+    let mut from_guest = std::fs::File::from(stream.fd.try_clone()?);
+    let result = match guest_frame(&mut from_guest) {
+        Ok(frame) => match kiri_proto::decode(&frame) {
+            Ok(kiri_proto::Msg::CopyDone) => Ok(()),
+            Ok(kiri_proto::Msg::Error(m)) if m.contains("in use") || m.contains("already has") => Err(Error::Conflict(m.to_owned())),
+            Ok(kiri_proto::Msg::Error(m)) => Err(copy_error(m)),
+            Ok(other) => Err(Error::Io(io::Error::other(format!("unexpected copy reply: {other:?}")))),
+            Err(e) => Err(Error::Io(io::Error::other(format!("bad copy reply: {e:?}")))),
+        },
+        Err(e) => Err(Error::Io(e)),
+    };
+    match result {
+        Ok(()) if io::copy(&mut body, &mut io::sink()).is_ok() => {
+            http::empty(w, 204)?;
+            Ok(Next::KeepAlive)
+        }
+        Ok(()) => {
+            error_closing(w, Error::BadRequest("the layer could not be read to its end".into()))?;
             Ok(Next::Close)
         }
         Err(e) => {
@@ -3485,6 +4429,60 @@ pub(super) fn parse_signal(raw: &str) -> Result<u32, Error> {
 mod tests {
     use super::*;
 
+    /// A loopback registry that takes only `Basic me:pw`.
+    fn basic_registry() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let want = format!("Basic {}", kiri_image::b64::encode(b"me:pw"));
+        std::thread::spawn(move || {
+            for c in listener.incoming() {
+                let Ok(mut c) = c else { break };
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && c.read(&mut b).unwrap_or(0) == 1 {
+                    head.push(b[0]);
+                }
+                let ok = String::from_utf8_lossy(&head).lines().any(|l| l.split_once(':').is_some_and(|(k, v)| k.eq_ignore_ascii_case("authorization") && v.trim() == want));
+                let status = if ok { "200 OK" } else { "401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"kiri\"" };
+                let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        host
+    }
+
+    /// docker-java sends every AuthConfig field, unused ones as JSON null,
+    /// in `X-Registry-Auth` and in `POST /auth`; Docker reads null as empty (#654).
+    #[test]
+    fn registry_auth_with_null_fields_signs_in() {
+        let host = basic_registry();
+        let json = format!(r#"{{"username":"me","password":"pw","serveraddress":"{host}","identitytoken":null,"registrytoken":null,"email":null,"auth":null,"stackOrchestrator":null}}"#);
+        let header = kiri_image::b64::encode(json.as_bytes()).replace('+', "-").replace('/', "_").trim_end_matches('=').to_owned();
+        let pull = Request::internal("POST", "/images/create", &[], Vec::new()).with_header("X-Registry-Auth", &header);
+        client_for(&pull).login(&host).expect("pull client signs in with the header's password");
+        assert!(client_for(&Request::internal("POST", "/images/create", &[], Vec::new())).login(&host).is_err(), "no header is anonymous");
+
+        let login = auth(&Request::internal("POST", "/auth", &[], json.into_bytes())).expect("POST /auth with null fields");
+        assert_eq!(login["Status"], "Login Succeeded");
+        let wrong = format!(r#"{{"username":"me","password":"nope","serveraddress":"{host}","identitytoken":null,"email":null}}"#);
+        assert!(matches!(auth(&Request::internal("POST", "/auth", &[], wrong.into_bytes())), Err(Error::Unauthorized(_))));
+        assert!(matches!(auth(&Request::internal("POST", "/auth", &[], b"not json".to_vec())), Err(Error::BadRequest(_))));
+    }
+
+    /// A null server address, or every field null, in `X-Registry-Auth`.
+    #[test]
+    fn registry_auth_header_with_null_address_or_all_null() {
+        let host = basic_registry();
+        let hdr = |json: String| kiri_image::b64::encode(json.as_bytes()).replace('+', "-").replace('/', "_").trim_end_matches('=').to_owned();
+        let pull = |h: &str| client_for(&Request::internal("POST", "/images/create", &[], Vec::new()).with_header("X-Registry-Auth", h));
+        let null_addr = hdr(r#"{"username":"me","password":"pw","serveraddress":null,"identitytoken":null}"#.into());
+        pull(&null_addr).login(&host).expect("a null server address still signs in");
+        let all_null = hdr(r#"{"username":null,"password":null,"auth":null,"serveraddress":null,"identitytoken":null,"registrytoken":null}"#.into());
+        assert!(pull(&all_null).login(&host).is_err(), "every field null is anonymous");
+        let addr_only = hdr(format!(r#"{{"serveraddress":"{host}","username":null,"password":null,"auth":null,"identitytoken":null,"registrytoken":null}}"#));
+        assert!(pull(&addr_only).login(&host).is_err(), "an address with no credentials is anonymous");
+    }
+
     /// One prune command sends its filters to every prune: volumes and
     /// networks go only when their labels match, as in Docker; a volume
     /// with driver options is never pruned; networks take `until`.
@@ -3545,6 +4543,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn ps_limit_lists_the_latest_containers_in_any_state() {
+        let (root, engine) = engine_in("ps-limit", false);
+        let image = test_image("local:1");
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}
+        })).unwrap();
+        for name in ["first", "second", "third"] {
+            engine
+                .create(Some(name.into()), spec.clone(), &image)
+                .unwrap();
+        }
+        drop(engine);
+
+        // Give the containers distinct creation times within the same second.
+        let records = root.join("containers.json");
+        let mut saved: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&records).unwrap()).unwrap();
+        saved.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        for (i, record) in saved.iter_mut().enumerate() {
+            record["created_ns"] = json!(1_000_000_000 + i);
+        }
+        std::fs::write(&records, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+
+        let names = |query: &[(&str, &str)]| {
+            let req = Request::internal("GET", "/containers/json", query, Vec::new());
+            let rows = list(&req, &engine).unwrap();
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["Names"][0].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&[("limit", "1")]), ["/third"]);
+        assert_eq!(names(&[("limit", "2")]), ["/third", "/second"]);
+        assert!(names(&[]).is_empty());
+        for limit in ["0", "-1"] {
+            assert!(names(&[("limit", limit)]).is_empty(), "limit={limit}");
+        }
+        let bad = Request::internal("GET", "/containers/json", &[("limit", "abc")], Vec::new());
+        assert!(matches!(list(&bad, &engine), Err(Error::BadRequest(_))));
+        assert_eq!(
+            names(&[("all", "1"), ("limit", "2")]),
+            ["/third", "/second"]
+        );
+        assert_eq!(
+            names(&[("limit", "1"), ("filters", r#"{"name":["first"]}"#)]),
+            ["/first"]
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn engine_in(name: &str, damaged: bool) -> (std::path::PathBuf, std::sync::Arc<Engine>) {
         let root = std::env::temp_dir().join(format!("kiri-rm-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -3557,10 +4611,276 @@ mod tests {
     }
 
     fn test_image(name: &str) -> kiri_image::Image {
-        kiri_image::Image {
+        kiri_image::Image { mirror: None,
             name: name.into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         }
+    }
+
+    #[test]
+    fn restart_policies_are_refused_like_docker() {
+        let retry_only =
+            "invalid restart policy: maximum retry count can only be used with 'on-failure'";
+        let negative = "invalid restart policy: maximum retry count cannot be negative";
+        let with_retries = |name, count| json!({"Name": name, "MaximumRetryCount": count});
+        for (policy, expected) in [
+            (
+                json!({"Name": "bogus"}),
+                Err("invalid restart policy bogus"),
+            ),
+            (with_retries("always", 3), Err(retry_only)),
+            (with_retries("on-failure", -1), Err(negative)),
+            (with_retries("always", -1), Err(negative)),
+            (with_retries("no", 1), Err(retry_only)),
+            (with_retries("", 2), Err(retry_only)),
+            (with_retries("", -1), Err(negative)),
+            (with_retries("unless-stopped", 1), Err(retry_only)),
+            (json!({"Name": "always"}), Ok(("always", 0))),
+            (json!({"Name": "unless-stopped"}), Ok(("unless-stopped", 0))),
+            (json!({"Name": "no"}), Ok(("no", 0))),
+            (with_retries("on-failure", 0), Ok(("on-failure", 0))),
+            (with_retries("on-failure", 5), Ok(("on-failure", 5))),
+            (Value::Null, Ok(("no", 0))),
+            (json!({"Name": ""}), Ok(("no", 0))),
+        ] {
+            let result = restart_policy(&policy, true);
+            let actual = match &result {
+                Ok(p) => Ok((p.name.as_str(), p.max_retries)),
+                Err(Error::BadRequest(message)) => Err(message.as_str()),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(actual, expected, "{policy}");
+        }
+    }
+
+    #[test]
+    fn create_restart_policy_is_validated_before_container_creation() {
+        let (root, engine) = engine_in("create-restart", false);
+        let mut image = test_image("restart-create:1");
+        image.platform = format!("linux/{}", go_arch());
+        engine.store.put_image(image).unwrap();
+        let make = |name: &str, auto_remove: bool, policy: Value| {
+            let body = json!({
+                "Image": "restart-create:1", "Cmd": ["true"],
+                "HostConfig": {
+                    "AutoRemove": auto_remove,
+                    "NetworkMode": "none",
+                    "RestartPolicy": policy,
+                }
+            });
+            let req = Request::internal(
+                "POST",
+                "/containers/create",
+                &[("name", name)],
+                serde_json::to_vec(&body).unwrap(),
+            );
+            create(&req, &engine)
+        };
+        for (name, auto_remove, policy, expected_msg) in [
+            (
+                "bad-name",
+                false,
+                json!({"Name": "bogus"}),
+                "invalid restart policy bogus",
+            ),
+            (
+                "invalid-restart",
+                false,
+                json!({"Name": "always", "MaximumRetryCount": 3}),
+                "maximum retry count can only be used with 'on-failure'",
+            ),
+            (
+                "negative-restart",
+                false,
+                json!({"Name": "on-failure", "MaximumRetryCount": -1}),
+                "maximum retry count cannot be negative",
+            ),
+            (
+                "autoremove-always",
+                true,
+                json!({"Name": "always"}),
+                "can't create 'AutoRemove' container with restart policy",
+            ),
+            (
+                "autoremove-unless-stopped",
+                true,
+                json!({"Name": "unless-stopped"}),
+                "can't create 'AutoRemove' container with restart policy",
+            ),
+            (
+                "autoremove-on-failure",
+                true,
+                json!({"Name": "on-failure", "MaximumRetryCount": 2}),
+                "can't create 'AutoRemove' container with restart policy",
+            ),
+        ] {
+            let result = make(name, auto_remove, policy);
+            match &result {
+                Err(Error::BadRequest(msg)) => assert!(msg.contains(expected_msg), "{name}: {msg}"),
+                other => panic!("{name}: {other:?}"),
+            }
+            assert!(engine.with(name, |_| ()).is_err(), "{name} should not exist");
+        }
+        for (name, auto_remove, policy, want) in [
+            (
+                "valid-restart",
+                false,
+                json!({"Name": "on-failure", "MaximumRetryCount": 3}),
+                ("on-failure", 3),
+            ),
+            (
+                "autoremove-no",
+                true,
+                json!({"Name": "no"}),
+                ("no", 0),
+            ),
+            (
+                "autoremove-empty",
+                true,
+                json!({"Name": ""}),
+                ("no", 0),
+            ),
+        ] {
+            make(name, auto_remove, policy).unwrap();
+            let stored = engine
+                .with(name, |c| (c.spec.auto_remove, c.spec.restart.clone()))
+                .unwrap();
+            assert_eq!(
+                (stored.0, stored.1.name.as_str(), stored.1.max_retries),
+                (auto_remove, want.0, want.1)
+            );
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_restart_policy_is_validated_before_it_is_stored() {
+        let (root, engine) = engine_in("update-restart", false);
+        let mut image = test_image("restart-test:1");
+        image.platform = format!("linux/{}", go_arch());
+        engine.store.put_image(image).unwrap();
+        for (name, auto_remove) in [("ordinary", false), ("auto-remove", true)] {
+            let body = json!({
+                "Image": "restart-test:1", "Cmd": ["true"], "HostConfig": {"AutoRemove": auto_remove, "NetworkMode": "none"}
+            });
+            let req = Request::internal(
+                "POST",
+                "/containers/create",
+                &[("name", name)],
+                serde_json::to_vec(&body).unwrap(),
+            );
+            create(&req, &engine).unwrap();
+            assert_eq!(
+                engine
+                    .with(name, |c| (c.spec.auto_remove, c.spec.restart.name.clone()))
+                    .unwrap(),
+                (auto_remove, "no".to_owned())
+            );
+        }
+        let update = |key: &str, body: Value| {
+            use std::io::Read;
+            let req = Request::internal(
+                "POST",
+                &format!("/containers/{key}/update"),
+                &[],
+                serde_json::to_vec(&body).unwrap(),
+            );
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            super::super::ops::route(&req, &engine, &Caller::Host, &mut server)
+                .unwrap()
+                .unwrap();
+            drop(server);
+            let mut result = String::new();
+            client.read_to_string(&mut result).unwrap();
+            result
+        };
+        let stored = |key| engine.with(key, |c| (c.spec.restart.clone(), c.spec.limits.memory_max)).unwrap();
+        let auto_remove =
+            "Restart policy cannot be updated because AutoRemove is enabled for the container";
+        let unknown = "invalid restart policy: unknown policy 'bogus'; use one of 'no', 'always', 'on-failure', or 'unless-stopped'";
+        let retry_only = "maximum retry count can only be used with 'on-failure'";
+        let negative = "maximum retry count cannot be negative";
+        // Give `ordinary` an active policy first so refused updates verify that
+        // neither an existing active policy nor container limits are overwritten.
+        let response = update("ordinary", json!({"RestartPolicy": {"Name": "always"}}));
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert_eq!(
+            stored("ordinary"),
+            (RestartPolicy { name: "always".into(), max_retries: 0 }, 0)
+        );
+        for (key, policy, status, message) in [
+            ("auto-remove", json!({"Name": "always"}), 409, auto_remove),
+            ("auto-remove", json!({"Name": "unless-stopped"}), 409, auto_remove),
+            ("auto-remove", json!({"Name": "on-failure", "MaximumRetryCount": 2}), 409, auto_remove),
+            ("ordinary", json!({"Name": "bogus"}), 400, unknown),
+            (
+                "ordinary",
+                json!({"Name": "always", "MaximumRetryCount": 3}),
+                400,
+                retry_only,
+            ),
+            (
+                "ordinary",
+                json!({"Name": "no", "MaximumRetryCount": 1}),
+                400,
+                retry_only,
+            ),
+            (
+                "ordinary",
+                json!({"Name": "", "MaximumRetryCount": 2}),
+                400,
+                retry_only,
+            ),
+            (
+                "ordinary",
+                json!({"Name": "", "MaximumRetryCount": -1}),
+                400,
+                negative,
+            ),
+            (
+                "ordinary",
+                json!({"Name": "on-failure", "MaximumRetryCount": -1}),
+                400,
+                negative,
+            ),
+        ] {
+            let before = stored(key);
+            let response = update(key, json!({"Memory": 134_217_728, "RestartPolicy": policy}));
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")) && response.contains(message),
+                "{policy}: {response}"
+            );
+            assert_eq!(stored(key), before, "{policy}");
+        }
+        let response = update("auto-remove", json!({"RestartPolicy": {"Name": "no"}}));
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert_eq!(stored("auto-remove").0.name, "no");
+        let response = update(
+            "ordinary",
+            json!({"RestartPolicy": {"Name": "on-failure", "MaximumRetryCount": 3}}),
+        );
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        let expected = RestartPolicy {
+            name: "on-failure".into(),
+            max_retries: 3,
+        };
+        assert_eq!(stored("ordinary"), (expected.clone(), 0));
+        // Partial updates (e.g. `docker update --memory 256m`) omit RestartPolicy
+        // or send `{"Name": "", "MaximumRetryCount": 0}` and must keep the
+        // container's existing restart policy intact.
+        for (body, want_mem) in [
+            (json!({}), 0),
+            (json!({"RestartPolicy": {"Name": ""}}), 0),
+            (json!({"Memory": 268_435_456, "RestartPolicy": {"Name": "", "MaximumRetryCount": 0}}), 268_435_456),
+            (json!({"Memory": 536_870_912}), 536_870_912),
+        ] {
+            let response = update("ordinary", body);
+            assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+            assert_eq!(stored("ordinary"), (expected.clone(), want_mem));
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A container using `volume` and `image`, in the list.
@@ -3584,6 +4904,9 @@ mod tests {
         engine.volume_ensure_with("free", json!({}), Default::default()).unwrap();
         listed_user(&engine, "used", &image);
         assert!(matches!(engine.volume_remove("used", false), Err(Error::Conflict(m)) if m.contains("volume is in use")));
+        // Force doesn't remove a volume in use either, as in Docker (#773).
+        assert!(matches!(engine.volume_remove("used", true), Err(Error::Conflict(m)) if m.contains("volume is in use")));
+        assert!(engine.volume_get("used").is_some(), "the volume in use is kept");
         engine.volume_remove("free", false).unwrap();
         assert!(engine.volume_get("free").is_none());
         assert!(matches!(image_remove(&engine, "used:1", false), Err(Error::Conflict(m)) if m.contains("is using its referenced image")));
@@ -3619,6 +4942,100 @@ mod tests {
         image_remove(&engine, "lost:2", false).unwrap();
         image_remove(&engine, "lost:1", true).unwrap();
         assert!(engine.store.images().unwrap().is_empty(), "forced, it goes");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn delete_volume_http(engine: &Arc<Engine>, target: &str) -> (u16, String) {
+        use std::io::{Read, Write};
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Host)
+        });
+        client.write_all(format!("DELETE /volumes/{target} HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).unwrap();
+        served.join().unwrap().unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+        let code = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse().ok()).unwrap_or(0);
+        (code, body.to_owned())
+    }
+
+    fn create_mounted(engine: &Engine, name: &str, image: &kiri_image::Image, body: Value) -> String {
+        let m = mounts(&body, engine, image).unwrap();
+        let volumes_from = strings(&body["HostConfig"]["VolumesFrom"]).unwrap_or_default();
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}, "volumes": m.volumes, "anon_volumes": m.anon,
+            "mounts": m.guest, "mount_info": m.info, "volumes_from": volumes_from,
+        })).unwrap();
+        engine.create(Some(name.into()), spec, image).unwrap()
+    }
+
+    /// `DELETE /volumes/{name}` matches Docker's exact status codes and errors:
+    /// 404/204 for missing volumes (without/with `force`), and 409 Conflict for
+    /// volumes in use via `-v`, `--mount type=volume`, or `--volumes-from`
+    /// across created/running/stopped containers regardless of `force` (#773).
+    #[test]
+    fn delete_volume_http_status_and_in_use_match_docker() {
+        let (root, engine) = engine_in("vol-http", false);
+        let image = test_image("vol:1");
+        engine.store.put_image(image.clone()).unwrap();
+
+        // Missing volume: 404 without force (or force=0/false), 204 with force=1/true.
+        for path in ["missing", "missing?force=0", "missing?force=false"] {
+            let (code, body) = delete_volume_http(&engine, path);
+            assert_eq!(code, 404, "{path}: {body}");
+            assert!(body.contains("get missing: no such volume"), "{path}: {body}");
+        }
+        for path in ["missing?force=1", "missing?force=true"] {
+            let (code, body) = delete_volume_http(&engine, path);
+            assert_eq!(code, 204, "{path}: {body}");
+            assert!(body.is_empty(), "{path}: {body}");
+        }
+
+        // `-v` bind-style named volume on created and exited container.
+        let c_bind = create_mounted(&engine, "c-bind", &image, json!({"HostConfig": {"Binds": ["v-bind:/d"]}}));
+        for target in ["v-bind", "v-bind?force=1", "v-bind?force=true"] {
+            let (code, body) = delete_volume_http(&engine, target);
+            assert_eq!(code, 409, "{target}: {body}");
+            assert!(body.contains("remove v-bind: volume is in use - [c-bind]"), "{target}: {body}");
+            assert!(engine.volume_get("v-bind").is_some());
+        }
+        engine.set_status(&c_bind, super::super::engine::Status::Exited);
+        assert_eq!(delete_volume_http(&engine, "v-bind?force=1").0, 409);
+
+        // `--mount type=volume` on running container.
+        let c_mount = create_mounted(
+            &engine,
+            "c-mount",
+            &image,
+            json!({"HostConfig": {"Mounts": [{"Type": "volume", "Source": "v-mount", "Target": "/d"}]}}),
+        );
+        engine.set_status(&c_mount, super::super::engine::Status::Running);
+        let (code, body) = delete_volume_http(&engine, "v-mount?force=1");
+        assert_eq!(code, 409, "{body}");
+        assert!(body.contains("remove v-mount: volume is in use - [c-mount]"), "{body}");
+
+        // `--volumes-from` retains the volume even after the source container is removed.
+        let c_vfrom = create_mounted(&engine, "c-vfrom", &image, json!({"HostConfig": {"VolumesFrom": ["c-bind"]}}));
+        engine.remove(&c_bind, false, false).unwrap();
+        let (code, body) = delete_volume_http(&engine, "v-bind?force=1");
+        assert_eq!(code, 409, "{body}");
+        assert!(body.contains("remove v-bind: volume is in use - [c-vfrom]"), "{body}");
+        assert!(engine.volume_get("v-bind").is_some());
+
+        // Removing holders frees the volumes for removal.
+        engine.remove(&c_vfrom, false, false).unwrap();
+        engine.set_status(&c_mount, super::super::engine::Status::Exited);
+        engine.remove(&c_mount, false, false).unwrap();
+        assert_eq!(delete_volume_http(&engine, "v-bind?force=1").0, 204);
+        assert_eq!(delete_volume_http(&engine, "v-mount").0, 204);
+        assert!(engine.volume_get("v-bind").is_none());
+        assert!(engine.volume_get("v-mount").is_none());
+
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3711,6 +5128,165 @@ mod tests {
         engine.remove("dst", true, true).unwrap();
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Both `-v /run/host-services/ssh-auth.sock:...` and `--mount type=bind,source=/run/host-services/ssh-auth.sock,...`
+    /// resolve to `ssh_agent_source()` for the guest while keeping `/run/host-services/ssh-auth.sock`
+    /// in inspect, without needing `/run/host-services` to exist on the host (#420).
+    #[test]
+    fn ssh_agent_mounts_resolve_without_touching_host_run_host_services() {
+        let (root, engine) = engine_in("ssh-agent-mounts", false);
+        let image = test_image("ssh:1");
+        let body = json!({
+            "HostConfig": {
+                "Binds": ["/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock"],
+                "Mounts": [{"Type": "bind", "Source": "/run/host-services/ssh-auth.sock", "Target": "/agent.sock", "ReadOnly": true}],
+            }
+        });
+        let m = mounts(&body, &engine, &image).unwrap();
+        let src = ssh_agent_source();
+        assert_eq!(m.guest, [format!("{src}\t/run/host-services/ssh-auth.sock\t"), format!("{src}\t/agent.sock\tro")]);
+        assert_eq!(m.info[0]["Source"], "/run/host-services/ssh-auth.sock");
+        assert_eq!(m.info[0]["RW"], true);
+        assert_eq!(m.info[1]["Source"], "/run/host-services/ssh-auth.sock");
+        assert_eq!(m.info[1]["Destination"], "/agent.sock");
+        assert_eq!(m.info[1]["RW"], false);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// On macOS, direct bind mounts of host SSH agent sockets (GnuPG's
+    /// `S.gpg-agent.ssh`, 1Password's `agent.sock`, launchd's `Listeners`) map
+    /// the guest source to `/run/host-services/ssh-auth.sock` while keeping
+    /// inspect's `Source` intact — and never treat Kiri's `docker.sock` or
+    /// symlinks to it as an SSH agent socket (#763).
+    #[test]
+    fn mac_host_ssh_agent_bind_mounts_translate_and_never_match_kiri_socket() {
+        use std::os::unix::net::UnixListener;
+
+        // Well-known Mac SSH agent socket paths match only when mac == true.
+        for path in [
+            "/Users/alice/.gnupg/S.gpg-agent.ssh",
+            "/Users/alice/.1password/agent.sock",
+            "/Users/alice/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock",
+            "/private/tmp/com.apple.launchd.abc123/Listeners",
+            "/var/run/com.apple.launchd.abc123/Listeners",
+        ] {
+            assert!(super::ssh_agent_bind_for(path, true).is_some(), "mac should recognize {path}");
+            assert!(super::ssh_agent_bind_for(path, false).is_none(), "linux must leave {path} alone");
+        }
+
+        // Security: Kiri's socket (synthetic or real) is never recognized as an SSH agent socket.
+        assert!(super::ssh_agent_bind_for("/Users/alice/.kiri/run/docker.sock", true).is_none());
+        assert!(super::ssh_agent_bind_for("/var/run/docker.sock", true).is_none());
+        if let Ok(own) = super::super::socket_path() {
+            assert!(super::ssh_agent_bind_for(&own.to_string_lossy(), true).is_none());
+        }
+
+        // Real filesystem checks: live socket vs regular file vs symlink to docker.sock.
+        let dir = std::env::temp_dir().join(format!("kiri-api-ssh-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::create_dir_all(dir.join("fake")).unwrap();
+        std::fs::create_dir_all(dir.join("link")).unwrap();
+
+        let live_gpg = dir.join("real/S.gpg-agent.ssh");
+        let _gpg_listener = UnixListener::bind(&live_gpg).unwrap();
+        let live_gpg_str = live_gpg.to_str().unwrap();
+        assert_eq!(
+            super::ssh_agent_bind_for(live_gpg_str, true),
+            Some(super::SshAgentBind::MacHost(Some(std::fs::canonicalize(&live_gpg).unwrap())))
+        );
+        assert_eq!(super::ssh_agent_bind_for(live_gpg_str, false), None);
+
+        // Regular file with the same name is not intercepted.
+        let regular_file = dir.join("fake/S.gpg-agent.ssh");
+        std::fs::write(&regular_file, b"plain file").unwrap();
+        assert_eq!(super::ssh_agent_bind_for(regular_file.to_str().unwrap(), true), None);
+
+        // Symlink named S.gpg-agent.ssh pointing to docker.sock is rejected after canonicalize.
+        let docker_sock = dir.join("docker.sock");
+        let _docker_listener = UnixListener::bind(&docker_sock).unwrap();
+        let evil_link = dir.join("link/S.gpg-agent.ssh");
+        std::os::unix::fs::symlink(&docker_sock, &evil_link).unwrap();
+        assert_eq!(super::ssh_agent_bind_for(evil_link.to_str().unwrap(), true), None);
+
+        // fresh_bind_sources_with on macOS preserves /run/host-services/ssh-auth.sock on
+        // restart and upgrades legacy /mnt/mac/.../S.gpg-agent.ssh mounts while keeping
+        // engine socket binds untouched.
+        let gpg_info = vec![
+            json!({"Type": "bind", "Source": "/Users/alice/.gnupg/S.gpg-agent.ssh"}),
+            json!({"Type": "bind", "Source": "/Users/alice/.kiri/run/docker.sock"}),
+        ];
+        let restarted = vec![
+            "/run/host-services/ssh-auth.sock\t/ssh-agent\t".to_owned(),
+            "/run/host-services/docker.sock\t/var/run/docker.sock\t".to_owned(),
+        ];
+        let legacy = vec![
+            "/mnt/mac/Users/alice/.gnupg/S.gpg-agent.ssh\t/ssh-agent\tro".to_owned(),
+            "/run/host-services/docker.sock\t/var/run/docker.sock\t".to_owned(),
+        ];
+        let sock = |s: &str| (s == "/Users/alice/.kiri/run/docker.sock").then(|| "/run/host-services/docker.sock".to_owned());
+        assert_eq!(super::fresh_bind_sources_with(&restarted, &gpg_info, sock, true), restarted);
+        assert_eq!(
+            super::fresh_bind_sources_with(&legacy, &gpg_info, sock, true),
+            [
+                "/run/host-services/ssh-auth.sock\t/ssh-agent\tro",
+                "/run/host-services/docker.sock\t/var/run/docker.sock\t",
+            ]
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let _guard = super::super::ports::PREFERRED_SSH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            super::super::ports::clear_preferred_ssh_auth_sock();
+
+            let (root, engine) = engine_in("mac-gpg-ssh-mounts", false);
+            let image = test_image("ssh:1");
+            let own_sock = super::super::socket_path().unwrap().to_string_lossy().into_owned();
+            let body = json!({
+                "HostConfig": {
+                    "Binds": [
+                        "/Users/alice/.gnupg/S.gpg-agent.ssh:/ssh-agent",
+                        format!("{live_gpg_str}:/live-gpg.sock:ro"),
+                        format!("{own_sock}:/not-ssh"),
+                    ],
+                    "Mounts": [
+                        {"Type": "bind", "Source": "/Users/alice/.1password/agent.sock", "Target": "/op.sock", "ReadOnly": true},
+                    ],
+                }
+            });
+            // Container caller must never mutate the daemon's preferred SSH agent socket.
+            let m_container = super::mounts_for(&body, &engine, &image, &super::super::caller::Caller::Container).unwrap();
+            assert!(super::super::ports::current_preferred_ssh_auth_sock().is_none(), "Caller::Container must not set preferred SSH socket");
+            assert_eq!(
+                m_container.guest,
+                [
+                    "/run/host-services/ssh-auth.sock\t/ssh-agent\t",
+                    "/run/host-services/ssh-auth.sock\t/live-gpg.sock\tro",
+                    "/run/host-services/docker.sock\t/not-ssh\t",
+                    "/run/host-services/ssh-auth.sock\t/op.sock\tro",
+                ]
+            );
+            assert_eq!(m_container.info[0]["Source"], "/Users/alice/.gnupg/S.gpg-agent.ssh");
+            assert_eq!(m_container.info[1]["Source"], live_gpg_str);
+            assert_eq!(m_container.info[2]["Source"], own_sock);
+            assert_eq!(m_container.info[3]["Source"], "/Users/alice/.1password/agent.sock");
+
+            // Host caller records the live GPG socket as preferred while keeping inspect intact.
+            let m_host = super::mounts_for(&body, &engine, &image, &super::super::caller::Caller::Host).unwrap();
+            assert_eq!(m_host.guest, m_container.guest);
+            assert_eq!(
+                super::super::ports::current_preferred_ssh_auth_sock(),
+                Some(std::fs::canonicalize(&live_gpg).unwrap())
+            );
+
+            super::super::ports::clear_preferred_ssh_auth_sock();
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `--pid`: empty and `host` as given, `container:<name>` kept with the
@@ -3869,6 +5445,120 @@ mod tests {
         assert!(asked.borrow().iter().all(|k| !k.starts_with("container:")), "a container: key was looked up as a network");
     }
 
+    /// `POST /containers/create` network selection across `HostConfig.NetworkMode`
+    /// and `NetworkingConfig.EndpointsConfig` (#407, #727).
+    #[test]
+    fn create_network_mode_with_endpoints_config() {
+        let (root, engine) = engine_in("create-net-endpoints", false);
+        let image = test_image("net-ep:1");
+        engine.store.put_image(image.clone()).unwrap();
+        let k3d = engine.lock_net().create("k3d-net", Default::default()).unwrap();
+        engine.lock_net().create("custom-a", Default::default()).unwrap();
+        engine.lock_net().create("custom-b", Default::default()).unwrap();
+        engine.lock_net().create("back-net", super::super::network::Settings { internal: true, ..Default::default() }).unwrap();
+
+        let make = |name: &str, body: Value| -> Result<(String, Value), Error> {
+            let req = Request::internal("POST", "/containers/create", &[("name", name)], serde_json::to_vec(&body).unwrap());
+            let created = create(&req, &engine)?;
+            let id = created["Id"].as_str().unwrap().to_owned();
+            let inspected = container_inspect(&engine, &id)?;
+            Ok((id, inspected))
+        };
+        let net_names = |inspected: &Value| -> Vec<String> {
+            let mut names: Vec<String> = inspected["NetworkSettings"]["Networks"].as_object().unwrap().keys().cloned().collect();
+            names.sort();
+            names
+        };
+
+        // 1. NetworkMode "bridge" + non-empty EndpointsConfig without bridge -> joins ONLY k3d-net.
+        let (id1, ins1) = make("bridge-k3d", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "bridge"},
+            "NetworkingConfig": {"EndpointsConfig": {"k3d-net": {"Aliases": ["node-0"]}}},
+        })).unwrap();
+        assert_eq!(net_names(&ins1), ["k3d-net"]);
+        assert_eq!(ins1["NetworkSettings"]["Networks"]["k3d-net"]["Aliases"], json!(["node-0"]));
+        engine.with(&id1, |c| {
+            assert_eq!(c.spec.network_mode, "k3d-net");
+            assert!(c.spec.extra_networks.is_empty());
+        }).unwrap();
+
+        // Same when EndpointsConfig names the network by ID, and with internal + outside networks.
+        let (_, ins1_id) = make("bridge-k3d-id", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "bridge"},
+            "NetworkingConfig": {"EndpointsConfig": {k3d.id.as_str(): {}, "back-net": {}}},
+        })).unwrap();
+        assert_eq!(net_names(&ins1_id), ["back-net", "k3d-net"]);
+        assert_eq!(ins1_id["HostConfig"]["NetworkMode"], "k3d-net", "outside network beats internal");
+
+        // 2. NetworkMode "bridge" + EndpointsConfig including both bridge and k3d-net -> joins BOTH.
+        let (id2, ins2) = make("bridge-and-k3d", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "bridge"},
+            "NetworkingConfig": {"EndpointsConfig": {"bridge": {}, "k3d-net": {"Aliases": ["both"]}}},
+        })).unwrap();
+        assert_eq!(net_names(&ins2), ["bridge", "k3d-net"]);
+        assert_eq!(ins2["NetworkSettings"]["Networks"]["k3d-net"]["Aliases"], json!(["both"]));
+        engine.with(&id2, |c| {
+            assert_eq!(c.spec.network_mode, "bridge");
+            assert_eq!(c.spec.extra_networks.len(), 1);
+            assert_eq!(c.spec.extra_networks[0].name, "k3d-net");
+        }).unwrap();
+
+        // 3. NetworkMode "bridge" + empty or absent EndpointsConfig -> joins bridge as usual.
+        for (name, body) in [
+            ("bridge-empty-eps", json!({"Image": "net-ep:1", "Cmd": ["true"], "HostConfig": {"NetworkMode": "bridge"}, "NetworkingConfig": {"EndpointsConfig": {}}})),
+            ("bridge-no-eps", json!({"Image": "net-ep:1", "Cmd": ["true"], "HostConfig": {"NetworkMode": "bridge"}})),
+        ] {
+            let (id, ins) = make(name, body).unwrap();
+            assert_eq!(net_names(&ins), ["bridge"], "{name}");
+            engine.with(&id, |c| {
+                assert_eq!(c.spec.network_mode, "bridge", "{name}");
+                assert!(c.spec.extra_networks.is_empty(), "{name}");
+            }).unwrap();
+        }
+
+        // 4. Named user network in NetworkMode + another in EndpointsConfig -> keeps NetworkMode primary + extra.
+        let (id4, ins4) = make("custom-a-and-b", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "custom-a"},
+            "NetworkingConfig": {"EndpointsConfig": {"custom-b": {"Aliases": ["b-alias"]}}},
+        })).unwrap();
+        assert_eq!(net_names(&ins4), ["custom-a", "custom-b"]);
+        assert_eq!(ins4["NetworkSettings"]["Networks"]["custom-b"]["Aliases"], json!(["b-alias"]));
+        engine.with(&id4, |c| {
+            assert_eq!(c.spec.network_mode, "custom-a");
+            assert_eq!(c.spec.extra_networks.len(), 1);
+            assert_eq!(c.spec.extra_networks[0].name, "custom-b");
+        }).unwrap();
+
+        // 5. Special NetworkModes ("host", "none", "container:<id>") with EndpointsConfig stay unaffected / rejected.
+        let (id_host, _) = make("host-with-ep", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "host"},
+            "NetworkingConfig": {"EndpointsConfig": {"k3d-net": {}}},
+        })).unwrap();
+        engine.with(&id_host, |c| assert_eq!(c.spec.network_mode, "host")).unwrap();
+
+        let (id_none, _) = make("none-with-ep", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": "none"},
+            "NetworkingConfig": {"EndpointsConfig": {"k3d-net": {}}},
+        })).unwrap();
+        engine.with(&id_none, |c| assert_eq!(c.spec.network_mode, "none")).unwrap();
+
+        let err_ctr = make("ctr-with-ep", json!({
+            "Image": "net-ep:1", "Cmd": ["true"],
+            "HostConfig": {"NetworkMode": format!("container:{id1}")},
+            "NetworkingConfig": {"EndpointsConfig": {"k3d-net": {}}},
+        }));
+        assert!(matches!(err_ctr, Err(Error::BadRequest(ref m)) if m.contains("sharing network namespace")), "{err_ctr:?}");
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn archive_uploads_are_sniffed() {
         assert_eq!(upload_compression(&[0x1f, 0x8b, 8, 0, 0, 0]), Upload::Gzip);
@@ -3943,7 +5633,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || serve(server, engine)
+                move || serve(server, engine, Caller::Host)
             });
             client.write_all(requests.as_bytes()).unwrap();
             client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -3972,8 +5662,258 @@ mod tests {
         // A close asked for on the second request ends it after that one.
         let (got, ended) = exchange("GET /_ping HTTP/1.1\r\nHost: d\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n");
         assert!(ended && got.matches("HTTP/1.1 200 ").count() == 2 && got.matches("Connection: close\r\n").count() == 1, "{got}");
+        // Absolute-form targets route as origin-form (#757), while malformed
+        // targets or request lines answer 400 Bad Request and close cleanly.
+        let (got, ended) = exchange("GET http://127.0.0.1:2376/_ping HTTP/1.1\r\nHost: 127.0.0.1:2376\r\nConnection: close\r\n\r\n");
+        assert!(ended && got.starts_with("HTTP/1.1 200 OK\r\n") && got.ends_with("OK"), "{got}");
+        for bad in [
+            "GET http:///containers/json HTTP/1.1\r\nHost: 127.0.0.1:2376\r\n\r\n",
+            "GET ftp://127.0.0.1:2376/_ping HTTP/1.1\r\nHost: 127.0.0.1:2376\r\n\r\n",
+            "GET  http://127.0.0.1:2376/_ping HTTP/1.1\r\nHost: 127.0.0.1:2376\r\n\r\n",
+            "GET\t/_ping HTTP/1.1\r\nHost: d\r\n\r\n",
+        ] {
+            let (got, ended) = exchange(bad);
+            assert!(
+                ended && got.starts_with("HTTP/1.1 400 Bad Request\r\n") && got.contains("Connection: close\r\n") && got.contains("\"message\":\"bad request "),
+                "{bad:?}: {got}"
+            );
+        }
+        let (got, ended) = exchange("GET /_ping HTTP/1.1\r\nHost: d\r\n\r\nGET http:///bad HTTP/1.1\r\nHost: d\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n");
+        assert!(
+            ended && got.matches("HTTP/1.1 200 OK\r\n").count() == 1 && got.matches("HTTP/1.1 400 Bad Request\r\n").count() == 1 && got.matches("Connection: close\r\n").count() == 1,
+            "{got}"
+        );
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The `(method, path)` routes a `route` function's body matches, read
+    /// from its source: single or `|`-separated methods, a literal
+    /// `/kiri…` path or a `p.strip_prefix("/kiri/…")` guard (with an
+    /// optional `strip_suffix`). Any other line naming a `/kiri` path (an
+    /// arm split over lines, a method in a variable) fails the test rather
+    /// than going unseen; a handler repeating its arm's `strip_prefix` is
+    /// fine.
+    fn kiri_routes(body: &str) -> Vec<(String, String)> {
+        let mut routes: Vec<(String, String)> = Vec::new();
+        let mut prefixes: Vec<String> = Vec::new();
+        for line in body.lines().map(str::trim).filter(|l| !l.starts_with("//")) {
+            let names_kiri = line.contains("\"/kiri");
+            let arm = line.strip_prefix('(').filter(|r| r.starts_with('"')).and_then(|r| {
+                let (methods, rest) = r.split_once(", ")?;
+                let methods: Option<Vec<&str>> = methods.split('|').map(|m| m.trim().strip_prefix('"')?.strip_suffix('"')).collect();
+                Some((methods?, rest))
+            });
+            let path = arm.as_ref().and_then(|(_, rest)| {
+                if let Some(lit) = rest.strip_prefix("\"/kiri") {
+                    Some(format!("/kiri{}", lit.split('"').next()?))
+                } else if let Some(i) = rest.find("strip_prefix(\"/kiri/") {
+                    let prefix = rest[i + "strip_prefix(\"".len()..].split('"').next()?;
+                    let suffix = rest.split("strip_suffix(\"").nth(1).map_or("", |s| s.split('"').next().unwrap_or_default());
+                    Some(format!("{prefix}1{suffix}"))
+                } else {
+                    None
+                }
+            });
+            match (arm, path) {
+                (Some((methods, _)), Some(path)) => {
+                    if let Some(i) = line.find("strip_prefix(\"/kiri/") {
+                        prefixes.push(line[i..].split('"').nth(1).unwrap_or_default().to_owned());
+                    }
+                    routes.extend(methods.iter().map(|m| ((*m).to_owned(), path.clone())));
+                }
+                _ if names_kiri => {
+                    let repeats = line.find("strip_prefix(\"/kiri/").is_some_and(|i| prefixes.iter().any(|p| line[i..].split('"').nth(1) == Some(p.as_str())));
+                    assert!(repeats, "a /kiri path the route reader cannot read: {line}");
+                }
+                _ => {}
+            }
+        }
+        routes
+    }
+
+    /// Every one of Kiri's own endpoints that changes something is refused
+    /// on a container's connection, unless listed in `CONTAINER_MAY`; GETs
+    /// and HEADs stay open. The routes are read from `route` itself and
+    /// from `ops::route` (which it asks first), so one added later is
+    /// covered too.
+    #[test]
+    fn a_container_changes_nothing_through_kiris_own_endpoints() {
+        let body_of = |src: &'static str, start: &str| {
+            let body = &src[src.find(start).unwrap()..];
+            &body[..body.find("\n}\n").unwrap()]
+        };
+        let mut routes = kiri_routes(body_of(include_str!("api.rs"), "\nfn route("));
+        routes.extend(kiri_routes(body_of(include_str!("ops.rs"), "\npub fn route(")));
+        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("PUT", "/kiri/roots/host"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("POST", "/kiri/containers/1/upper"), ("DELETE", "/kiri/k8s/forward/1"), ("GET", "/kiri/watch-roots"), ("POST", "/kiri/fs-events")] {
+            assert!(routes.iter().any(|(m, p)| (m.as_str(), p.as_str()) == known), "{known:?} not found in route(): {routes:?}");
+        }
+        for (m, p) in &routes {
+            let open = matches!(m.as_str(), "GET" | "HEAD") || CONTAINER_MAY.contains(&(m.as_str(), p.as_str()));
+            assert_eq!(container_may(m, p), open, "{m} {p}");
+        }
+        assert!(!container_may("PATCH", "/kiri/anything/new"));
+        assert!(!container_may("POST", "/kiri"));
+        assert!(container_may("POST", "/containers/create") && container_may("GET", "/kiri/registries") && container_may("HEAD", "/kiri/registries"));
+        // The reader itself: arms of several methods are read as each, and
+        // a /kiri path it cannot read stops the test.
+        let read = kiri_routes("        (\"POST\" | \"DELETE\", \"/kiri/x\") => {}\n        (\"GET\" | \"HEAD\", p) if p.strip_prefix(\"/kiri/y/\").is_some() => {\n            go(p.strip_prefix(\"/kiri/y/\"));\n        }");
+        assert_eq!(read, [("POST".to_owned(), "/kiri/x".to_owned()), ("DELETE".into(), "/kiri/x".into()), ("GET".into(), "/kiri/y/1".into()), ("HEAD".into(), "/kiri/y/1".into())]);
+        for unreadable in ["        (m, \"/kiri/z\") => {}", "        (\"POST\",\n            \"/kiri/z\") => {}"] {
+            assert!(std::panic::catch_unwind(|| kiri_routes(unreadable)).is_err(), "{unreadable}");
+        }
+    }
+
+    #[test]
+    fn fs_events_parsing_validates_paths_and_rejects_traversal() {
+        let json_body = br#"{"events":["M\t/mnt/c/Users/me/app.js","D\t/etc/passwd","C\t/mnt/c/../etc/shadow","X\t/mnt/c/a","C\t/mnt/d/new.ts"]}"#;
+        assert_eq!(parse_fs_events(json_body, "/mnt/").unwrap(), vec!["M\t/mnt/c/Users/me/app.js", "C\t/mnt/d/new.ts"]);
+        let text_body = b"M\t/mnt/c/test/app.js\nD\t/mnt/mac/Users/a\nP\t/mnt/c/test\nU\t/etc\n";
+        assert_eq!(parse_fs_events(text_body, "/mnt/").unwrap(), vec!["M\t/mnt/c/test/app.js", "P\t/mnt/c/test"]);
+        assert!(parse_fs_events(b"{not json", "/mnt/").is_err());
+        let too_many = vec!["M\t/mnt/c/a"; 4097].join("\n");
+        assert!(parse_fs_events(too_many.as_bytes(), "/mnt/").is_err());
+    }
+
+    #[test]
+    fn watch_roots_and_fs_events_endpoints_work_without_waking_vm() {
+        use std::io::{Read, Write};
+        let (root, engine) = engine_in("watch-roots", false);
+        // GET /kiri/watch-roots
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Host)
+        });
+        client.write_all(b"GET /kiri/watch-roots HTTP/1.1\r\nHost: d\r\nX-Kiri-Background: 1\r\nConnection: close\r\n\r\n").unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        served.join().unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
+        assert!(got.contains("\"automount_root\":\"/mnt/\""), "{got}");
+        assert!(got.contains("\"roots\":[]"), "{got}");
+
+        // POST /kiri/fs-events from Host returns 204 and does not wake VM
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Host)
+        });
+        let body = r#"{"events":["M\t/mnt/c/test/app.js"]}"#;
+        client.write_all(format!("POST /kiri/fs-events HTTP/1.1\r\nHost: d\r\nX-Kiri-Background: 1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        served.join().unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 204 "), "{got}");
+        assert!(!engine.is_awake());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Through the API itself: a container's Stop and settings are refused,
+    /// and the engine stays as it was.
+    #[test]
+    fn a_containers_stop_and_settings_are_refused() {
+        use std::io::{Read, Write};
+        let (root, engine) = engine_in("container-gate", false);
+        for req in ["POST /v1.47/kiri/stop", "POST /kiri/sleep", "POST /kiri/registries", "POST /kiri/proxy", "PUT /kiri/roots/host", "POST /kiri/resources", "POST /kiri/domains", "DELETE /kiri/domains", "POST /kiri/fs-events"] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Container)
+            });
+            client.write_all(format!("{req} HTTP/1.1\r\nHost: d\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes()).unwrap();
+            let mut got = String::new();
+            client.read_to_string(&mut got).unwrap();
+            served.join().unwrap().unwrap();
+            assert!(got.starts_with("HTTP/1.1 403 "), "{req}: {got}");
+        }
+        // Refused, the connection ends after the answer even when the
+        // client asked to keep it: the body is not read as a request.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Container)
+        });
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.write_all(b"POST /kiri/registries HTTP/1.1\r\nHost: d\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        served.join().unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 403 "), "{got}");
+        // What a container may do still answers: the registry lists are
+        // readable from one.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Container)
+        });
+        client.write_all(b"GET /kiri/registries HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n").unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        served.join().unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `PUT /kiri/roots/host` accepts only `Caller::Host` (kiri-win): neither a
+    /// container nor an integrated WSL distro may inject root CAs (#303).
+    #[test]
+    fn host_roots_endpoint_requires_host_caller() {
+        let req = Request::internal("PUT", "/kiri/roots/host", &[], br#"{"certs":["3001"],"distrusted":[]}"#.to_vec());
+        assert!(matches!(set_host_roots(&req, &Caller::Container), Err(Error::Forbidden(_))));
+        assert!(matches!(set_host_roots(&req, &Caller::Wsl("Ubuntu".into())), Err(Error::Forbidden(_))));
+        if !crate::daemon::hostroots::in_wsl() {
+            assert!(matches!(set_host_roots(&req, &Caller::Host), Err(Error::BadRequest(_))));
+        }
+
+        // Over the live HTTP handler: a WSL distro receives 403 on Linux.
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::{Read, Write};
+            let (root, engine) = engine_in("wsl-host-roots-gate", false);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Wsl("Ubuntu".into()))
+            });
+            let body = r#"{"certs":["3001"],"distrusted":[]}"#;
+            client
+                .write_all(format!("PUT /kiri/roots/host HTTP/1.1\r\nHost: d\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+                .unwrap();
+            let mut got = String::new();
+            client.read_to_string(&mut got).unwrap();
+            served.join().unwrap().unwrap();
+            assert!(got.starts_with("HTTP/1.1 403 "), "{got}");
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    /// `POST /kiri/registries` refreshes synchronously on the request thread
+    /// only when the save changed settings, never from a detached thread after
+    /// answering.
+    #[test]
+    fn set_registries_refreshes_synchronously_without_a_detached_thread() {
+        let req = Request::internal("POST", "/kiri/registries", &[], b"{}".to_vec());
+        let caller = std::thread::current().id();
+        let ran = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let ran2 = ran.clone();
+        set_registries_with(&req, |_| Ok((json!({}), true)), move || {
+            *ran2.lock().unwrap() = Some(std::thread::current().id());
+        })
+        .unwrap();
+        assert_eq!(*ran.lock().unwrap(), Some(caller), "refresh must finish on the caller thread before answering");
+
+        let ran = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let ran2 = ran.clone();
+        set_registries_with(&req, |_| Ok((json!({}), false)), move || {
+            *ran2.lock().unwrap() = true;
+        })
+        .unwrap();
+        assert!(!*ran.lock().unwrap(), "unchanged save must not refresh");
     }
 
     /// A pull sent with a body, as docker-modem (so Testcontainers for Node)
@@ -3989,7 +5929,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || serve(server, engine)
+                move || serve(server, engine, Caller::Host)
             });
             client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             // Written from a thread: a body larger than the socket buffer
@@ -4053,7 +5993,7 @@ mod tests {
             let t = std::time::Instant::now();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || (serve(server, engine), t.elapsed())
+                move || (serve(server, engine, Caller::Host), t.elapsed())
             });
             client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let sent = std::thread::spawn({
@@ -4109,6 +6049,141 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// End-to-end check through `serve`: TE+CL smuggling returns 400 and closes
+    /// without running a smuggled request; chunked trailers leave keep-alive
+    /// intact; `Expect: 100-continue` gets `100 Continue` before body upload.
+    #[test]
+    fn serve_handles_chunked_trailers_expect_continue_and_rejects_smuggling() {
+        use std::io::{Read, Write};
+        let (root, engine) = engine_in("http-framing", false);
+
+        // 1. Conflicting framing, malformed header lines (obs-fold, space before ':'),
+        //    and bare-LF chunk size lines -> 400 Bad Request, Connection: close, no second reply.
+        for smuggle in [
+            &b"POST /auth HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n"[..],
+            &b"POST /auth HTTP/1.1\r\nHost: d\r\n Transfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n"[..],
+            &b"POST /auth HTTP/1.1\r\nHost: d\r\nTransfer-Encoding : chunked\r\n\r\n0\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n"[..],
+            &b"POST /auth HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n2\n{}\r\n0\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\n\r\n"[..],
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client.write_all(smuggle).unwrap();
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).unwrap();
+            drop(client);
+            served.join().unwrap().unwrap();
+            let got = String::from_utf8_lossy(&got);
+            assert!(got.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{got}");
+            assert!(got.contains("Connection: close\r\n"), "{got}");
+            assert_eq!(got.matches("HTTP/1.1 ").count(), 1, "{got}");
+        }
+
+        // 2. Chunked request with trailers followed by GET /_ping on the same connection.
+        {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client
+                .write_all(
+                    b"POST /auth HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\nX-Checksum: 1\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).unwrap();
+            drop(client);
+            served.join().unwrap().unwrap();
+            let got = String::from_utf8_lossy(&got);
+            assert!(got.contains("HTTP/1.1 200 OK\r\n") && got.ends_with("OK"), "{got}");
+            assert_eq!(got.matches("HTTP/1.1 ").count(), 2, "{got}");
+        }
+
+        // 3. Buffered Expect: 100-continue sends 100 Continue before reading body, then answers normally.
+        {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client
+                .write_all(b"POST /auth HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut interim = [0u8; 25];
+            client.read_exact(&mut interim).unwrap();
+            assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+            client.write_all(b"{}").unwrap();
+            let mut rest = Vec::new();
+            client.read_to_end(&mut rest).unwrap();
+            drop(client);
+            served.join().unwrap().unwrap();
+            let rest = String::from_utf8_lossy(&rest);
+            assert!(rest.starts_with("HTTP/1.1 400 ") || rest.starts_with("HTTP/1.1 200 "), "{rest}");
+        }
+
+        // 4. Streamed 404 (PUT /archive on missing container) and early 400 (bad import repo)
+        //    with Expect: 100-continue must NOT emit 100 Continue and must close cleanly.
+        for (req_head, want_status) in [
+            ("PUT /containers/no-such-container/archive?path=/tmp HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nContent-Length: 1073741824\r\n\r\n", "HTTP/1.1 404 Not Found\r\n"),
+            ("POST /images/create?fromSrc=-&repo=INVALID_UPPERCASE HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nContent-Length: 1073741824\r\n\r\n", "HTTP/1.1 400 Bad Request\r\n"),
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client.write_all(req_head.as_bytes()).unwrap();
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).unwrap();
+            drop(client);
+            served.join().unwrap().unwrap();
+            let got = String::from_utf8_lossy(&got);
+            assert!(got.starts_with(want_status), "expected {want_status:?} for {req_head:?}, got: {got}");
+            assert!(got.contains("Connection: close\r\n"), "{got}");
+            assert!(!got.contains("100 Continue"), "{got}");
+            assert_eq!(got.matches("HTTP/1.1 ").count(), 1, "{got}");
+        }
+
+        // 5. Valid streamed upload (POST /images/create?fromSrc=-) with Expect: 100-continue
+        //    DOES emit 100 Continue before reading the body, then completes with 200 OK.
+        {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            client
+                .write_all(b"POST /images/create?fromSrc=- HTTP/1.1\r\nHost: d\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            let mut interim = [0u8; 25];
+            client.read_exact(&mut interim).unwrap();
+            assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+            // Two 512-byte zero blocks form a valid empty tar archive.
+            let empty_tar = [0u8; 1024];
+            write!(client, "{:x}\r\n", empty_tar.len()).unwrap();
+            client.write_all(&empty_tar).unwrap();
+            client.write_all(b"\r\n0\r\nX-Digest: ok\r\n\r\n").unwrap();
+            let mut rest = Vec::new();
+            client.read_to_end(&mut rest).unwrap();
+            drop(client);
+            served.join().unwrap().unwrap();
+            let rest = String::from_utf8_lossy(&rest);
+            assert!(rest.starts_with("HTTP/1.1 200 OK\r\n"), "{rest}");
+            assert!(rest.contains("sha256:"), "{rest}");
+        }
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// `docker save | gzip | docker load` loads, as on Docker (issue 528):
     /// the body goes through the same detection as `docker cp` uploads.
     /// Each archive is sent to `POST /images/load` as the CLI sends it.
@@ -4139,7 +6214,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || serve(server, engine)
+                move || serve(server, engine, Caller::Host)
             });
             write!(client, "POST /images/load?quiet=0 HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-tar\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
             client.write_all(body).unwrap();
@@ -4164,6 +6239,112 @@ mod tests {
         let (answer, found) = load("load-bzip2", &bzip2);
         assert!(answer.starts_with("HTTP/1.1 400") && answer.contains("bzip2-compressed archive isn't supported yet"), "{answer}");
         assert_eq!(found, None);
+    }
+
+    /// `POST /images/load` accepts OCI image-layout archives (plain, gzipped,
+    /// untagged, and with `?platform=...` as plain string or Docker API v1.48 JSON).
+    #[test]
+    fn image_load_takes_oci_archives_and_platform_queries() {
+        use std::io::{Read, Write};
+        let (src, src_engine) = engine_in("load-oci-src", false);
+        let put = |bytes: &[u8]| {
+            let mut w = src_engine.store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let make_manifest = |arch: &str| {
+            let cfg_bytes = serde_json::to_vec(&json!({"os": "linux", "architecture": arch, "created": "2026-01-01T00:00:00Z", "config": {"Cmd": [arch]}})).unwrap();
+            let (cfg, cfg_sz) = put(&cfg_bytes);
+            let (layer, layer_sz) = put(format!("layer-{arch}").as_bytes());
+            let man_bytes = serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg, "size": cfg_sz},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": layer, "size": layer_sz}],
+            }))
+            .unwrap();
+            let (man, man_sz) = put(&man_bytes);
+            (cfg, cfg_bytes, layer, format!("layer-{arch}").into_bytes(), man, man_bytes, man_sz)
+        };
+        let amd = make_manifest("amd64");
+        let arm = make_manifest("arm64");
+        let nested_bytes = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "manifests": [
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": amd.4, "size": amd.6, "platform": {"os": "linux", "architecture": "amd64"}},
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": arm.4, "size": arm.6, "platform": {"os": "linux", "architecture": "arm64"}},
+            ]
+        }))
+        .unwrap();
+        let (nested, nested_sz) = put(&nested_bytes);
+        drop(src_engine);
+        let _ = std::fs::remove_dir_all(src);
+
+        let build_oci = |tag: Option<&str>| {
+            let mut b = tar::Builder::new(Vec::new());
+            let mut add = |name: &str, data: &[u8]| {
+                let mut h = tar::Header::new_ustar();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_entry_type(tar::EntryType::Regular);
+                b.append_data(&mut h, name, data).unwrap();
+            };
+            for (cfg, cfg_b, layer, layer_b, man, man_b, _) in [&amd, &arm] {
+                add(&format!("blobs/sha256/{}", cfg.strip_prefix("sha256:").unwrap()), cfg_b);
+                add(&format!("blobs/sha256/{}", layer.strip_prefix("sha256:").unwrap()), layer_b);
+                add(&format!("blobs/sha256/{}", man.strip_prefix("sha256:").unwrap()), man_b);
+            }
+            add(&format!("blobs/sha256/{}", nested.strip_prefix("sha256:").unwrap()), &nested_bytes);
+            add("oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#);
+            let mut desc = json!({"mediaType": "application/vnd.oci.image.index.v1+json", "digest": nested, "size": nested_sz});
+            if let Some(t) = tag {
+                desc["annotations"] = json!({"io.containerd.image.name": format!("docker.io/{t}"), "org.opencontainers.image.ref.name": "1"});
+            }
+            add("index.json", &serde_json::to_vec(&json!({"schemaVersion": 2, "manifests": [desc]})).unwrap());
+            b.into_inner().unwrap()
+        };
+
+        let tagged_tar = build_oci(Some("demo/oci:1"));
+        let untagged_tar = build_oci(None);
+        let mut gz_tar = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz_tar.write_all(&tagged_tar).unwrap();
+        let gz_tar = gz_tar.finish().unwrap();
+
+        let post = |name: &str, query: &str, body: &[u8]| {
+            let (root, engine) = engine_in(name, false);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Host)
+            });
+            write!(client, "POST /v1.48/images/load{query} HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-tar\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+            client.write_all(body).unwrap();
+            let mut answer = String::new();
+            client.read_to_string(&mut answer).unwrap();
+            served.join().unwrap().unwrap();
+            let images = engine.store.images().unwrap();
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+            (answer, images)
+        };
+
+        let (ans, imgs) = post("oci-gz-amd", "?platform=linux%2Famd64", &gz_tar);
+        assert!(ans.starts_with("HTTP/1.1 200") && ans.contains("Loaded image: demo/oci:1"), "{ans}");
+        assert_eq!(imgs[0].platform, "linux/amd64");
+
+        // Docker API v1.48 sends platform as JSON-encoded ocispec.Platform.
+        let (ans, imgs) = post("oci-json-arm", "?platform=%7B%22architecture%22%3A%22arm64%22%2C%22os%22%3A%22linux%22%7D", &tagged_tar);
+        assert!(ans.starts_with("HTTP/1.1 200") && ans.contains("Loaded image: demo/oci:1"), "{ans}");
+        assert_eq!(imgs[0].platform, "linux/arm64");
+
+        // Untagged OCI archive loads by ID.
+        let (ans, imgs) = post("oci-untagged", "", &untagged_tar);
+        assert!(ans.starts_with("HTTP/1.1 200") && ans.contains("Loaded image ID: sha256:"), "{ans}");
+        assert!(imgs[0].name.starts_with("sha256:"));
+
+        // Invalid platform returns 400 after draining body.
+        let (ans, imgs) = post("oci-bad-plat", "?platform=%2F", &tagged_tar);
+        assert!(ans.starts_with("HTTP/1.1 400") && ans.contains("invalid platform"), "{ans}");
+        assert!(imgs.is_empty());
     }
 
     /// Every damaged gzip is a 400, including the ones Docker 29 accepts
@@ -4225,6 +6406,16 @@ mod tests {
     }
 
     #[test]
+    fn copy_error_maps_readonly_refusals_to_forbidden_403() {
+        for msg in ["mounted volume is marked read-only", "container rootfs is marked read-only"] {
+            let err = copy_error(&format!("forbidden: {msg}"));
+            assert_eq!(status_of(err), (403, msg.to_owned()));
+        }
+        assert_eq!(status_of(copy_error("notfound: Could not find the file /x in container c1")), (404, "Could not find the file /x in container c1".to_owned()));
+        assert_eq!(status_of(copy_error("notdir: extraction point is not a directory: /x")), (400, "extraction point is not a directory: /x".to_owned()));
+    }
+
+    #[test]
     fn intel_macs_refuse_images_without_amd64() {
         let p = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(amd64_only_refusal("alpine", &p(&["linux/amd64"])), None);
@@ -4274,6 +6465,29 @@ mod tests {
         assert_eq!(mac_source(dir.join("link").to_str().unwrap()).as_deref(), real.to_str());
         assert_eq!(mac_source("/tmp/kiri-no-such-path").as_deref(), Some("/tmp/kiri-no-such-path"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// On a Linux host a bind of the engine's socket made before Kiri gave
+    /// containers a socket of their own gets it at the next start; other
+    /// binds are mounted as they were made.
+    #[test]
+    fn a_socket_bind_made_earlier_is_given_the_container_socket_at_start() {
+        let guest = vec!["/run/kiri/docker.sock\t/var/run/docker.sock\t".to_owned(), "/srv/app\t/x\tro".to_owned(), "tmpfs\t/t\ttmpfs".to_owned()];
+        let info = vec![json!({"Type": "bind", "Source": "/var/run/docker.sock"}), json!({"Type": "bind", "Source": "/srv/app"}), json!({"Type": "tmpfs", "Source": ""})];
+        let sock = |s: &str| matches!(s, "/var/run/docker.sock" | "/run/kiri/docker.sock").then(|| "/run/kiri/docker.container.sock".to_owned());
+        let given = ["/run/kiri/docker.container.sock\t/var/run/docker.sock\t", "/srv/app\t/x\tro", "tmpfs\t/t\ttmpfs"];
+        assert_eq!(fresh_bind_sources_with(&guest, &info, sock, false), given);
+        // The path the person gave no longer leads to the socket (a link
+        // removed or re-pointed): the path mounted when it was made does.
+        let moved = vec![json!({"Type": "bind", "Source": "/home/me/sock-link"}), info[1].clone(), info[2].clone()];
+        assert_eq!(fresh_bind_sources_with(&guest, &moved, sock, false), given);
+        // Records that don't pair one to one with the mount lines: each
+        // line is still looked at by the path it mounts.
+        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, false), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &[], sock, false), given);
+        // A Mac follows binds from the records only, so it leaves unpaired
+        // lines as they are.
+        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, true), guest);
     }
 
     /// A linked bind source is followed again at each start: re-pointing the
@@ -4541,6 +6755,99 @@ mod tests {
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn network_create_ignores_ipv6_ipam_when_ipv6_disabled() {
+        let root = std::env::temp_dir().join(format!("kiri-net-ipv6-off-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let post = |body: Value| network_create(&Request::internal("POST", "/networks/create", &[], serde_json::to_vec(&body).unwrap()), &engine);
+
+        // 1a. Explicit EnableIPv6: false + IPv4 & IPv6 subnets (mailcow-dockerized).
+        post(json!({
+            "Name": "mailcow",
+            "EnableIPv6": false,
+            "IPAM": {
+                "Driver": "default",
+                "Config": [
+                    {"Subnet": "172.22.1.0/24"},
+                    {"Subnet": "fd4d:6169:6c63:6f77::/64"}
+                ]
+            }
+        }))
+        .unwrap();
+        let ins = network_inspect(&engine, "mailcow").unwrap();
+        assert_eq!(ins["EnableIPv4"], json!(true));
+        assert_eq!(ins["EnableIPv6"], json!(false));
+        assert_eq!(ins["IPAM"]["Config"], json!([{"Subnet": "172.22.1.0/24", "Gateway": "172.22.1.1"}]));
+
+        // 1b. EnableIPv6 omitted + IPv4 & IPv6 subnets.
+        post(json!({
+            "Name": "mailcow-omitted",
+            "IPAM": {
+                "Config": [
+                    {"Subnet": "172.22.2.0/24"},
+                    {"Subnet": "fd4d:6169:6c63:6f77::/64"}
+                ]
+            }
+        }))
+        .unwrap();
+        let ins = network_inspect(&engine, "mailcow-omitted").unwrap();
+        assert_eq!(ins["EnableIPv6"], json!(false));
+        assert_eq!(ins["IPAM"]["Config"], json!([{"Subnet": "172.22.2.0/24", "Gateway": "172.22.2.1"}]));
+
+        // 2. EnableIPv6: false + ONLY an IPv6 subnet: auto-allocates IPv4 subnet.
+        post(json!({
+            "Name": "v6-only-cfg",
+            "EnableIPv6": false,
+            "IPAM": {"Config": [{"Subnet": "fd4d:6169:6c63:6f77::/64"}]}
+        }))
+        .unwrap();
+        let ins = network_inspect(&engine, "v6-only-cfg").unwrap();
+        assert_eq!(ins["EnableIPv4"], json!(true));
+        assert_eq!(ins["EnableIPv6"], json!(false));
+        let cfg = ins["IPAM"]["Config"].as_array().unwrap();
+        assert_eq!(cfg.len(), 1);
+        let sub = cfg[0]["Subnet"].as_str().unwrap();
+        assert!(sub.contains('.') && !sub.contains(':'), "expected auto IPv4 subnet, got {sub}");
+
+        // 3. Malformed subnet strings with EnableIPv6: false are still 400 BadRequest.
+        for bad in [
+            json!([{"Subnet": "fd4d::not-a-cidr"}]),
+            json!([{"Subnet": "172.22.3.0/24"}, {"Subnet": "fd4d::not-a-cidr"}]),
+            json!([{"Subnet": "not-an-ip/64"}]),
+            json!([{"Subnet": "172.22.3.0/24"}, {"Subnet": "not-an-ip/64"}]),
+        ] {
+            let res = post(json!({"Name": "bad-cidr", "EnableIPv6": false, "IPAM": {"Config": bad}}));
+            assert!(matches!(res, Err(Error::BadRequest(ref m)) if m.contains("invalid CIDR block notation")), "{bad} -> {res:?}");
+        }
+
+        // 4. EnableIPv6: true + valid IPv6 subnet still works identically.
+        post(json!({
+            "Name": "mailcow-on",
+            "EnableIPv6": true,
+            "IPAM": {
+                "Config": [
+                    {"Subnet": "172.22.4.0/24"},
+                    {"Subnet": "fd4d:6169:6c63:6f77::/64"}
+                ]
+            }
+        }))
+        .unwrap();
+        let ins = network_inspect(&engine, "mailcow-on").unwrap();
+        assert_eq!(ins["EnableIPv6"], json!(true));
+        assert_eq!(
+            ins["IPAM"]["Config"],
+            json!([
+                {"Subnet": "172.22.4.0/24", "Gateway": "172.22.4.1"},
+                {"Subnet": "fd4d:6169:6c63:6f77::/64", "Gateway": "fd4d:6169:6c63:6f77::1"}
+            ])
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]
@@ -4571,8 +6878,27 @@ mod network_option_tests {
         for (shares, weight) in [(2, 1), (512, 59), (1024, 100), (4096, 303), (262_144, 10_000), (1, 1), (999_999, 10_000)] {
             assert_eq!(super::cpu_weight(shares), weight, "{shares}");
         }
-        let l = super::limits_from(&json!({"CpuShares": 1024}), Default::default());
+        let l = super::limits_from(&json!({"CpuShares": 1024}), Default::default()).unwrap();
         assert_eq!((l.cpu_shares, l.cpu_weight), (1024, 100));
+        // Limits above `u32::MAX` were silently truncated (`as u32`); they are
+        // a 400 now, while legal values and `0`/`-1` sentinels stay intact.
+        let big = (u32::MAX as u64) + 1;
+        assert!(matches!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": big}), Default::default()), Err(Error::BadRequest(_))));
+        assert!(matches!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": u64::MAX}), Default::default()), Err(Error::BadRequest(_))));
+        assert_eq!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": 50_000}), Default::default()).unwrap().cpu_period, 50_000);
+        assert_eq!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": 0}), Default::default()).unwrap().cpu_period, 100_000);
+        assert_eq!(limits_from(&json!({"CpuQuota": 100_000, "CpuPeriod": -1}), Default::default()).unwrap().cpu_period, 100_000);
+        assert!(matches!(limits_from(&json!({"PidsLimit": big}), Default::default()), Err(Error::BadRequest(_))));
+        assert!(matches!(limits_from(&json!({"PidsLimit": u64::MAX}), Default::default()), Err(Error::BadRequest(_))));
+        let pids_set = limits_from(&json!({"PidsLimit": 256}), Default::default()).unwrap();
+        assert_eq!(pids_set.pids_max, 256);
+        assert_eq!(limits_from(&json!({"PidsLimit": 0}), Default::default()).unwrap().pids_max, 0);
+        assert_eq!(limits_from(&json!({"PidsLimit": -1}), Default::default()).unwrap().pids_max, 0);
+        assert_eq!(limits_from(&json!({"PidsLimit": 0}), pids_set).unwrap().pids_max, 256);
+        assert_eq!(limits_from(&json!({"PidsLimit": -1}), pids_set).unwrap().pids_max, 256);
+        assert!(matches!(restart_policy(&json!({"Name": "on-failure", "MaximumRetryCount": big}), true), Err(Error::BadRequest(_))));
+        assert!(matches!(restart_policy(&json!({"Name": "on-failure", "MaximumRetryCount": u64::MAX}), false), Err(Error::BadRequest(_))));
+        assert_eq!(restart_policy(&json!({"Name": "on-failure", "MaximumRetryCount": 5}), true).unwrap().max_retries, 5);
         // Rises with the shares, never backwards.
         let mut last = 0;
         for s in 2..5000 {
@@ -4580,6 +6906,136 @@ mod network_option_tests {
             assert!(w >= last, "{s}");
             last = w;
         }
+    }
+
+    #[test]
+    fn inspect_keeps_exposed_protocols_from_the_image_and_create() {
+        let dir = std::env::temp_dir().join(format!("kiri-exposed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({
+            "architecture": "arm64", "os": "linux",
+            "config": {"Cmd": ["true"], "ExposedPorts": {"53/udp": {}, "132/SCTP": {}, "0/tcp": {}, "bad/udp": {}}}
+        });
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:dns".into(), &digest, &cfg, Vec::new())).unwrap();
+
+        let udp = json!({"53/udp": [{"HostIp": "127.0.0.1", "HostPort": "5353"}]});
+        for bindings in [json!({}), udp.clone()] {
+            let body = json!({
+                "Image": "demo:dns",
+                "ExposedPorts": {
+                    "53": {}, "53/TCP": {}, "5353/UDP": {},
+                    "0": {}, "0/udp": {}, "70000/tcp": {}, "+53/tcp": {}, "53/": {}, "53/udp/extra": {}, "53/u dp": {}
+                },
+                "HostConfig": {"PortBindings": bindings}
+            });
+            let created = create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine).unwrap();
+            let id = created["Id"].as_str().unwrap();
+            let inspected = container_inspect(&engine, id).unwrap();
+            assert_eq!(inspected["Config"]["ExposedPorts"], json!({"132/sctp": {}, "53/tcp": {}, "53/udp": {}, "5353/udp": {}}));
+            assert_eq!(inspected["HostConfig"]["PortBindings"], bindings);
+            engine
+                .with(id, |c| {
+                    // Deterministic normalized order in stored Spec.exposed.
+                    assert_eq!(c.spec.exposed, ["132/sctp", "53/tcp", "53/udp", "5353/udp"]);
+                    let bound: Vec<_> = c.spec.ports.iter().map(|b| (b.clone(), b.host_ip.clone(), b.host_port)).collect();
+                    assert_eq!(
+                        ports_map_of(&bound, Some((&c.spec.ports, &c.spec.exposed))),
+                        json!({"132/sctp": null, "53/tcp": null, "53/udp": bindings["53/udp"], "5353/udp": null})
+                    );
+                })
+                .unwrap();
+        }
+
+        // PublishAllPorts (-P) publishes exposed TCP and UDP ports (normalizing case),
+        // skips non-TCP/UDP protocols like SCTP without failing, and keeps explicit bindings.
+        let body = json!({
+            "Image": "demo:dns",
+            "ExposedPorts": {"53": {}, "5353/UDP": {}},
+            "HostConfig": {"PublishAllPorts": true, "PortBindings": udp}
+        });
+        let created = create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine).unwrap();
+        let id = created["Id"].as_str().unwrap();
+        engine
+            .with(id, |c| {
+                let mut got: Vec<_> = c.spec.ports.iter().map(|b| (b.container_port, b.proto.as_str(), b.host_port)).collect();
+                got.sort_unstable();
+                assert_eq!(got, [(53, "tcp", 0), (53, "udp", 5353), (5353, "udp", 0)]);
+            })
+            .unwrap();
+
+        // Domain routing picks only TCP exposed ports, ignoring UDP and SCTP.
+        let dom_body = json!({"Image": "demo:dns", "ExposedPorts": {"53": {}, "5353/UDP": {}}});
+        let created = create(&Request::internal("POST", "/containers/create", &[("name", "dnsdom")], serde_json::to_vec(&dom_body).unwrap()), &engine).unwrap();
+        let dom_id = created["Id"].as_str().unwrap();
+        engine.mark_running_for_test(dom_id, [10, 88, 0, 2]);
+        let target = engine.route("dnsdom.kiri.localhost").expect("running container domain target");
+        assert_eq!(target.exposed, [53]);
+
+        // With NetworkMode: "host" and PortBindings (#764), HostConfig.PortBindings
+        // and Config.ExposedPorts are preserved in inspect, while NetworkSettings.Ports
+        // is {} and ps Ports is [] when no host-side port forwarder is bound.
+        let host_bindings = json!({"18081/tcp": [{"HostIp": "", "HostPort": "18081"}]});
+        let host_body = json!({
+            "Image": "demo:dns",
+            "HostConfig": {
+                "NetworkMode": "host",
+                "PortBindings": host_bindings
+            }
+        });
+        let created = create(&Request::internal("POST", "/containers/create", &[("name", "hostweb")], serde_json::to_vec(&host_body).unwrap()), &engine).unwrap();
+        let host_id = created["Id"].as_str().unwrap();
+        let inspected_created = container_inspect(&engine, host_id).unwrap();
+        assert_eq!(inspected_created["HostConfig"]["NetworkMode"], "host");
+        assert_eq!(inspected_created["HostConfig"]["PortBindings"], host_bindings);
+        assert_eq!(inspected_created["NetworkSettings"]["Ports"], json!({}));
+
+        engine.mark_running_for_test(host_id, [0; 4]);
+        let inspected_running = container_inspect(&engine, host_id).unwrap();
+        assert_eq!(inspected_running["HostConfig"]["NetworkMode"], "host");
+        assert_eq!(inspected_running["HostConfig"]["PortBindings"], host_bindings);
+        assert_eq!(inspected_running["Config"]["ExposedPorts"]["18081/tcp"], json!({}));
+        assert_eq!(inspected_running["NetworkSettings"]["Ports"], json!({}));
+        let listed = list(&Request::internal("GET", "/containers/json", &[], Vec::new()), &engine).unwrap();
+        let row = listed.as_array().unwrap().iter().find(|r| r["Id"] == host_id).expect("hostweb listed");
+        assert_eq!(row["Ports"], json!([]));
+        let host_route = engine.route("hostweb.kiri.localhost").expect("host network domain target");
+        assert_eq!(host_route.ip, [127, 0, 0, 1]);
+        assert_eq!(host_route.published, [18081]);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn exposed_ports_in_old_and_new_specs_round_trip() {
+        let mut record = json!({
+            "image": "demo:dns", "image_id": "sha256:0123", "entrypoint": [], "cmd": ["true"], "env": [],
+            "cwd": "/", "user": "", "auto_remove": false, "network_mode": "bridge", "labels": {}, "exposed": [53, 8080]
+        });
+        let old: Spec = serde_json::from_value(record.clone()).unwrap();
+        assert_eq!(inspect_exposed(&old.ports, &old.exposed), json!({"53/tcp": {}, "8080/tcp": {}}));
+        assert_eq!(ports_map_of(&[], Some((&old.ports, &old.exposed))), json!({"53/tcp": null, "8080/tcp": null}));
+        assert_eq!(serde_json::to_value(&old).unwrap()["exposed"], json!(["53/tcp", "8080/tcp"]));
+
+        record["exposed"] = json!(["132/sctp", "53/tcp", "53/udp"]);
+        let new: Spec = serde_json::from_value(record.clone()).unwrap();
+        let saved = serde_json::to_vec(&new).unwrap();
+        let loaded: Spec = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(serde_json::to_value(&loaded).unwrap()["exposed"], record["exposed"]);
+        assert_eq!(inspect_exposed(&loaded.ports, &loaded.exposed), json!({"132/sctp": {}, "53/tcp": {}, "53/udp": {}}));
+
+        // Mixed legacy/new/uppercase/duplicate/invalid entries normalize cleanly, and null is empty.
+        record["exposed"] = json!([53, "53", "53/TCP", "53/UDP", 0, "0/udp", "bad"]);
+        let mixed: Spec = serde_json::from_value(record.clone()).unwrap();
+        assert_eq!(mixed.exposed, ["53/tcp", "53/udp"]);
+
+        record["exposed"] = Value::Null;
+        let null_spec: Spec = serde_json::from_value(record).unwrap();
+        assert!(null_spec.exposed.is_empty());
     }
 
     #[test]
@@ -4591,13 +7047,13 @@ mod network_option_tests {
         assert_eq!(inspect_bindings(&ports), json!({"80/tcp": [{"HostIp": "", "HostPort": "8080"}, {"HostIp": "127.0.0.1", "HostPort": ""}], "53/udp": [{"HostIp": "", "HostPort": "5353"}]}));
         assert_eq!(inspect_bindings(&[]), json!({}));
         assert_eq!(inspect_exposed(&[], &[]), Value::Null);
-        assert_eq!(inspect_exposed(&ports, &[80, 9000]), json!({"80/tcp": {}, "53/udp": {}, "9000/tcp": {}}));
+        assert_eq!(inspect_exposed(&ports, &["80/tcp".into(), "9000/tcp".into()]), json!({"80/tcp": {}, "53/udp": {}, "9000/tcp": {}}));
         // NetworkSettings.Ports: published ports with their addresses, exposed
         // ones without as null keys (#492); none at all while not running.
         let bound = [(b(80, "tcp", "", 8080), "0.0.0.0".to_string(), 8080)];
-        assert_eq!(ports_map_of(&[], Some((&[], &[80]))), json!({"80/tcp": null}));
+        assert_eq!(ports_map_of(&[], Some((&[], &["80/tcp".into()]))), json!({"80/tcp": null}));
         assert_eq!(
-            ports_map_of(&bound, Some((&ports, &[80, 9000]))),
+            ports_map_of(&bound, Some((&ports, &["80/tcp".into(), "9000/tcp".into()]))),
             json!({"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}], "53/udp": null, "9000/tcp": null})
         );
         assert_eq!(ports_map_of(&[], None), json!({}));
@@ -4704,6 +7160,340 @@ mod network_option_tests {
         assert!(message.starts_with("No such image: demo:nosuch"));
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cgroupns_mode_is_kept_in_inspect_and_bad_modes_are_refused() {
+        let dir = std::env::temp_dir().join(format!("kiri-cgroupns-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-23T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+
+        let make = |host: Value| {
+            let body = json!({"Image": "demo:local", "HostConfig": host});
+            super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine)
+        };
+        let default_id = make(json!({})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &default_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let null_id = make(json!({"CgroupnsMode": Value::Null})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &null_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let empty_id = make(json!({"CgroupnsMode": ""})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &empty_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let priv_id = make(json!({"CgroupnsMode": "private"})).unwrap()["Id"].as_str().unwrap().to_owned();
+        assert_eq!(super::container_inspect(&engine, &priv_id).unwrap()["HostConfig"]["CgroupnsMode"], "private");
+        let host_id = make(json!({"CgroupnsMode": "host"})).unwrap()["Id"].as_str().unwrap().to_owned();
+        let host_inspected = super::container_inspect(&engine, &host_id).unwrap();
+        assert_eq!(host_inspected["HostConfig"]["CgroupnsMode"], "host");
+        // Recreating from inspect keeps CgroupnsMode persisted.
+        let mut recreate = host_inspected["Config"].clone();
+        recreate["HostConfig"] = host_inspected["HostConfig"].clone();
+        let host_id2 = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&recreate).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(super::container_inspect(&engine, &host_id2).unwrap()["HostConfig"]["CgroupnsMode"], "host");
+        for bad in [json!("bogus"), json!("container:abc"), json!(123)] {
+            let want = match &bad {
+                Value::String(s) => format!("invalid cgroup namespace mode: {s}"),
+                other => format!("invalid cgroup namespace mode: {other}"),
+            };
+            assert_eq!(super::status_of(make(json!({"CgroupnsMode": bad})).unwrap_err()), (400, want));
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--security-opt seccomp=unconfined` (and `seccomp:unconfined`) warns in
+    /// `POST /containers/create`'s `Warnings` that Kiri's host boundary stays
+    /// in place; default containers, `--privileged` alone, and options where a
+    /// later `seccomp=` entry overrides `unconfined` produce no warning (#516).
+    #[test]
+    fn seccomp_unconfined_warns_that_the_host_boundary_stays() {
+        let dir = std::env::temp_dir().join(format!("kiri-seccomp-warn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-23T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+        let warnings_for = |host: Value| {
+            let body = json!({"Image": "demo:local", "HostConfig": host});
+            let res = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine).unwrap();
+            res["Warnings"].clone()
+        };
+        let expected = json!([super::SECCOMP_UNCONFINED_WARNING]);
+        assert_eq!(warnings_for(json!({})), json!([]));
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp=builtin"]})), json!([]));
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp=unconfined"]})), expected);
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp:unconfined"]})), expected);
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp=builtin", "seccomp=unconfined"]})), expected);
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp=unconfined", "seccomp=builtin"]})), json!([]));
+        assert_eq!(warnings_for(json!({"SecurityOpt": ["seccomp=unconfined", r#"seccomp={"defaultAction":"SCMP_ACT_ALLOW"}"#]})), json!([]));
+        assert_eq!(warnings_for(json!({"Privileged": true})), json!([]));
+        assert_eq!(warnings_for(json!({"Privileged": true, "SecurityOpt": ["seccomp=unconfined"]})), expected);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Creates a container from `body` (on an image with a VOLUME line) and
+    /// returns its inspect, as `docker inspect` shows it.
+    fn inspect_after_create(name: &str, body: Value) -> Value {
+        let dir = std::env::temp_dir().join(format!("kiri-inspect-mounts-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-20T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"], "Volumes": {"/var/lib/img": {}}}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+        let mut body = body;
+        body["Image"] = json!("demo:local");
+        let id = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let v = container_inspect(&engine, &id).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+        v
+    }
+
+    /// `-v` and Compose's short syntax arrive as Binds, `--mount` and the
+    /// long syntax as Mounts, `--tmpfs` as Tmpfs. Docker gives each back as
+    /// it came, and tools that recreate a container (Watchtower, Portainer,
+    /// Arcane) copy HostConfig: without them the new container has no volumes (#610).
+    #[test]
+    fn inspect_gives_back_binds_mounts_and_tmpfs_as_created() {
+        let src = std::env::temp_dir().join(format!("kiri-inspect-src-{}", std::process::id()));
+        std::fs::create_dir_all(&src).unwrap();
+        let src = src.to_str().unwrap().to_owned();
+        let binds = json!([
+            format!("{src}:/b:ro"),
+            "k610vol:/data:rw",
+            "/var/run/docker.sock:/var/run/docker.sock",
+            "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock",
+        ]);
+        let mounts = json!([
+            {"Type": "bind", "Source": src, "Target": "/b2", "ReadOnly": true},
+            {"Type": "bind", "Source": "/run/host-services/ssh-auth.sock", "Target": "/ssh2.sock", "ReadOnly": true},
+            {"Type": "volume", "Source": "k610other", "Target": "/data2", "ReadOnly": true, "VolumeOptions": {"NoCopy": true}},
+            {"Type": "volume", "Target": "/anon2", "VolumeOptions": {}},
+            {"Type": "tmpfs", "Target": "/t", "TmpfsOptions": {"SizeBytes": 1048576}},
+        ]);
+        let tmpfs = json!({"/t2": "size=2m"});
+        let v = inspect_after_create("given", json!({"HostConfig": {"Binds": binds, "Mounts": mounts, "Tmpfs": tmpfs}}));
+        assert_eq!(v["HostConfig"]["Binds"], binds);
+        assert_eq!(v["HostConfig"]["Mounts"], mounts);
+        assert_eq!(v["HostConfig"]["Tmpfs"], tmpfs);
+        assert_eq!(v["Config"]["Volumes"], json!({"/var/lib/img": {}}));
+        // HostConfig must never leak internal volume or relay socket paths.
+        let hc_text = v["HostConfig"].to_string();
+        assert!(!hc_text.contains("/var/lib/kiri/volumes/"), "HostConfig leaked volume path: {hc_text}");
+        assert!(!hc_text.contains("/run/kiri/host-services/ssh-auth.sock"), "HostConfig leaked host ssh relay path: {hc_text}");
+        assert!(!hc_text.contains("/run/host-services/docker.sock"), "HostConfig leaked vm docker relay path: {hc_text}");
+        assert!(!hc_text.contains("docker.container.sock"), "HostConfig leaked container socket path: {hc_text}");
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// With no mounts asked for, Docker shows none.
+    #[test]
+    fn inspect_without_mounts_shows_none() {
+        let v = inspect_after_create("none", json!({"HostConfig": {}}));
+        assert_eq!(v["HostConfig"]["Binds"], Value::Null);
+        assert_eq!(v["HostConfig"]["Mounts"], Value::Null);
+        assert_eq!(v["HostConfig"]["Tmpfs"], Value::Null);
+        assert_eq!(v["Config"]["Volumes"], json!({"/var/lib/img": {}}));
+    }
+
+    /// `-v /path` arrives in Config.Volumes; Docker's inspect lists it there
+    /// with the image's VOLUME lines, never in HostConfig.Binds under its
+    /// generated 64-hex volume ID, so a recreate makes fresh anonymous volumes.
+    #[test]
+    fn inspect_lists_anonymous_volumes_in_config_volumes() {
+        let v = inspect_after_create("anon", json!({"Volumes": {"/anon": {}}, "HostConfig": {}}));
+        assert_eq!(v["Config"]["Volumes"], json!({"/anon": {}, "/var/lib/img": {}}));
+        assert_eq!(v["HostConfig"]["Binds"], Value::Null);
+        assert_eq!(v["HostConfig"]["Mounts"], Value::Null);
+        assert_eq!(v["HostConfig"]["Tmpfs"], Value::Null);
+    }
+
+    /// Recreating a container directly from its inspect `Config` + `HostConfig`
+    /// verbatim (as Watchtower, Portainer and Arcane do) succeeds with no
+    /// duplicate mount points and keeps named volumes, `:ro`, `ReadOnly: true`,
+    /// tmpfs, and socket paths while giving anonymous volumes fresh IDs (#610).
+    #[test]
+    fn inspect_recreate_round_trip_keeps_mounts_without_duplicates() {
+        let dir = std::env::temp_dir().join(format!("kiri-inspect-recreate-{}", std::process::id()));
+        let src = std::env::temp_dir().join(format!("kiri-inspect-recreate-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let src_s = src.to_str().unwrap().to_owned();
+        let engine = super::super::engine::boot_without_vm(&dir);
+        let cfg = json!({"created": "2026-11-20T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"], "Volumes": {"/var/lib/img": {}, "/img-overridden": {}}}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        engine.store.put_image(kiri_image::archive::from_config("demo:local".into(), &digest, &cfg, Vec::new())).unwrap();
+
+        let body = json!({
+            "Image": "demo:local",
+            "Volumes": {"/anon": {}},
+            "HostConfig": {
+                "Binds": [
+                    format!("{src_s}:/b:ro"),
+                    "k610vol:/data",
+                    "k610img:/img-overridden",
+                    "/var/run/docker.sock:/var/run/docker.sock",
+                    "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock",
+                ],
+                "Mounts": [
+                    {"Type": "bind", "Source": src_s, "Target": "/b2", "ReadOnly": true},
+                    {"Type": "volume", "Source": "k610rovol", "Target": "/rovol", "ReadOnly": true},
+                    {"Type": "tmpfs", "Target": "/t", "TmpfsOptions": {"SizeBytes": 1048576}},
+                ],
+                "Tmpfs": {"/t2": "size=2m"},
+            }
+        });
+        let id1 = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&body).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let v1 = container_inspect(&engine, &id1).unwrap();
+
+        let mut recreate = v1["Config"].clone();
+        recreate["HostConfig"] = v1["HostConfig"].clone();
+        let id2 = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&recreate).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let v2 = container_inspect(&engine, &id2).unwrap();
+
+        assert_eq!(v2["HostConfig"]["Binds"], v1["HostConfig"]["Binds"]);
+        assert_eq!(v2["HostConfig"]["Mounts"], v1["HostConfig"]["Mounts"]);
+        assert_eq!(v2["HostConfig"]["Tmpfs"], v1["HostConfig"]["Tmpfs"]);
+        assert_eq!(v2["Config"]["Volumes"], json!({"/anon": {}, "/var/lib/img": {}, "/img-overridden": {}}));
+
+        // Top-level Mounts has every expected destination exactly once.
+        let mounts2 = v2["Mounts"].as_array().unwrap();
+        let dsts: Vec<&str> = mounts2.iter().map(|m| m["Destination"].as_str().unwrap()).collect();
+        let unique: std::collections::HashSet<&str> = dsts.iter().copied().collect();
+        assert_eq!(dsts.len(), unique.len(), "duplicate mount targets after recreate: {dsts:?}");
+        let find = |dst: &str| mounts2.iter().find(|m| m["Destination"] == dst).unwrap_or_else(|| panic!("missing {dst}"));
+        assert_eq!(find("/b")["RW"], false);
+        assert_eq!(find("/b2")["RW"], false);
+        assert_eq!(find("/data")["Name"], "k610vol");
+        assert_eq!(find("/img-overridden")["Name"], "k610img");
+        assert_eq!(find("/rovol")["Name"], "k610rovol");
+        assert_eq!(find("/rovol")["RW"], false);
+        assert_eq!(find("/var/run/docker.sock")["Source"], "/var/run/docker.sock");
+        assert_eq!(find("/run/host-services/ssh-auth.sock")["Source"], "/run/host-services/ssh-auth.sock");
+        assert_eq!(find("/t")["Type"], "tmpfs");
+        assert_eq!(find("/t2")["Type"], "tmpfs");
+        // Anonymous volumes get fresh IDs on recreate instead of being pinned in Binds.
+        let anon1 = v1["Mounts"].as_array().unwrap().iter().find(|m| m["Destination"] == "/anon").unwrap()["Name"].as_str().unwrap();
+        let anon2 = find("/anon")["Name"].as_str().unwrap();
+        assert_ne!(anon1, anon2, "recreated container must get a fresh anonymous volume");
+        assert!(!v1["HostConfig"]["Binds"].to_string().contains(anon1));
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// A container saved before `mount_request` was kept has only Docker's
+    /// `Mounts` entries: its Binds, Mounts, Tmpfs and anonymous volumes are
+    /// made from those without leaking `/var/lib/kiri/volumes/...`, internal
+    /// socket paths, or anonymous 64-hex IDs, and recreating from inspect works.
+    #[test]
+    fn inspect_of_an_older_container_derives_its_mounts() {
+        let root = std::env::temp_dir().join(format!("kiri-inspect-older-{}", std::process::id()));
+        let src = std::env::temp_dir().join(format!("kiri-inspect-older-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let src_s = src.to_str().unwrap().to_owned();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let cfg = json!({"created": "2026-11-20T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["true"]}});
+        let mut w = engine.store.ingest().unwrap();
+        io::Write::write_all(&mut w, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        let image = kiri_image::archive::from_config("older:1".into(), &digest, &cfg, Vec::new());
+        engine.store.put_image(image.clone()).unwrap();
+        // An anonymous volume borrowed via --volumes-from lives in volumes.json
+        // as anonymous even when not listed on this container's anon_volumes.
+        let borrowed_anon = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        engine.volume_ensure(borrowed_anon, json!({}), true).unwrap();
+        let spec: super::super::engine::Spec = serde_json::from_value(json!({
+            "image": image.name, "image_id": image.config_digest, "entrypoint": [], "cmd": ["true"],
+            "env": [], "cwd": "/", "user": "", "auto_remove": false, "network_mode": "none", "labels": {},
+            "restart": {"name": "no", "max_retries": 0}, "volumes": ["named", "namedro", borrowed_anon], "anon_volumes": ["0123abcd", "deadbeef"],
+            "mount_info": [
+                {"Type": "bind", "Source": src_s, "Destination": "/src", "Mode": "", "RW": false, "Propagation": "rprivate"},
+                {"Type": "bind", "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock", "Mode": "", "RW": true, "Propagation": "rprivate"},
+                {"Type": "bind", "Source": "/run/host-services/ssh-auth.sock", "Destination": "/run/host-services/ssh-auth.sock", "Mode": "", "RW": true, "Propagation": "rprivate"},
+                {"Type": "volume", "Name": "named", "Source": "/var/lib/kiri/volumes/named/_data", "Destination": "/data", "Driver": "local", "Mode": "z", "RW": true, "Propagation": ""},
+                {"Type": "volume", "Name": "namedro", "Source": "/var/lib/kiri/volumes/namedro/_data", "Destination": "/dataro", "Driver": "local", "Mode": "z", "RW": false, "Propagation": ""},
+                {"Type": "volume", "Name": "0123abcd", "Source": "/var/lib/kiri/volumes/0123abcd/_data", "Destination": "/anon", "Driver": "local", "Mode": "z", "RW": true, "Propagation": ""},
+                {"Type": "volume", "Name": "deadbeef", "Source": "/var/lib/kiri/volumes/deadbeef/_data", "Destination": "/anonro", "Driver": "local", "Mode": "z", "RW": false, "Propagation": ""},
+                {"Type": "volume", "Name": borrowed_anon, "Source": format!("/var/lib/kiri/volumes/{borrowed_anon}/_data"), "Destination": "/borrowed", "Driver": "local", "Mode": "z", "RW": true, "Propagation": ""},
+                {"Type": "tmpfs", "Source": "", "Destination": "/t", "Mode": "", "RW": true, "Propagation": ""},
+                {"Type": "tmpfs", "Source": "", "Destination": "/tro", "Mode": "", "RW": false, "Propagation": ""},
+            ],
+        })).unwrap();
+        let id = engine.create(Some("older".into()), spec, &image).unwrap();
+        let v = container_inspect(&engine, &id).unwrap();
+        assert_eq!(
+            v["HostConfig"]["Binds"],
+            json!([
+                format!("{src_s}:/src:ro"),
+                "/var/run/docker.sock:/var/run/docker.sock",
+                "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock",
+                "named:/data",
+                "namedro:/dataro:ro",
+            ])
+        );
+        assert_eq!(
+            v["HostConfig"]["Mounts"],
+            json!([
+                {"Type": "volume", "Target": "/anonro", "ReadOnly": true},
+                {"Type": "tmpfs", "Target": "/tro", "ReadOnly": true},
+            ])
+        );
+        assert_eq!(v["HostConfig"]["Tmpfs"], json!({"/t": ""}));
+        assert_eq!(v["Config"]["Volumes"], json!({"/anon": {}, "/borrowed": {}}));
+        let hc_text = v["HostConfig"].to_string();
+        assert!(!hc_text.contains("/var/lib/kiri/volumes/"));
+        assert!(!hc_text.contains("0123abcd"));
+        assert!(!hc_text.contains("deadbeef"));
+        assert!(!hc_text.contains(borrowed_anon));
+
+        // Recreating from the legacy container's inspect succeeds with no duplicates.
+        let mut recreate = v["Config"].clone();
+        recreate["HostConfig"] = v["HostConfig"].clone();
+        let id2 = super::create(&Request::internal("POST", "/containers/create", &[], serde_json::to_vec(&recreate).unwrap()), &engine).unwrap()["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let v2 = container_inspect(&engine, &id2).unwrap();
+        let dsts: Vec<&str> = v2["Mounts"].as_array().unwrap().iter().map(|m| m["Destination"].as_str().unwrap()).collect();
+        let unique: std::collections::HashSet<&str> = dsts.iter().copied().collect();
+        assert_eq!(dsts.len(), unique.len(), "duplicate mount targets after legacy recreate: {dsts:?}");
+        assert_eq!(dsts.len(), 10);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&src);
     }
 
     #[test]
@@ -4880,6 +7670,38 @@ mod network_option_tests {
         assert!(super::check_volume_device(&opts(&[])).is_ok());
     }
 
+    #[test]
+    fn ssh_agent_bind_uses_the_agent_host_path_on_linux() {
+        // The guest is told where the agent listens: the VM's path, or
+        // Kiri's own /run/kiri on a Linux host (#420).
+        assert_eq!(super::ssh_agent_source_for(false), "/run/host-services/ssh-auth.sock");
+        assert_eq!(super::ssh_agent_source_for(true), "/run/kiri/host-services/ssh-auth.sock");
+        assert_eq!(
+            super::ssh_agent_source(),
+            if cfg!(target_os = "linux") { "/run/kiri/host-services/ssh-auth.sock" } else { "/run/host-services/ssh-auth.sock" }
+        );
+        assert!(super::is_ssh_agent_sock("/run/host-services/ssh-auth.sock"));
+        assert!(super::is_ssh_agent_sock("/run/host-services//ssh-auth.sock"));
+        assert!(super::is_ssh_agent_sock("/run/./host-services/ssh-auth.sock"));
+        assert!(!super::is_ssh_agent_sock("run/host-services/ssh-auth.sock"));
+        // A container made before #420 with /run/host-services/ssh-auth.sock
+        // in its saved guest mount line gets /run/kiri/host-services/ssh-auth.sock
+        // when started on Linux, while inspect keeps the path asked for.
+        let guest = vec!["/run/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro".to_owned()];
+        let info = vec![serde_json::json!({"Type": "bind", "Source": "/run/host-services/ssh-auth.sock"})];
+        assert_eq!(
+            super::fresh_bind_sources_with(&guest, &info, |_| None, false),
+            ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]
+        );
+        assert_eq!(super::fresh_bind_sources_with(&guest, &[], |_| None, false), ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]);
+        let slash_guest = vec!["/run/host-services//ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro".to_owned()];
+        assert_eq!(
+            super::fresh_bind_sources_with(&slash_guest, &[], |_| None, false),
+            ["/run/kiri/host-services/ssh-auth.sock\t/run/host-services/ssh-auth.sock\tro"]
+        );
+        assert_eq!(super::fresh_bind_sources_with(&guest, &info, |_| None, true), guest);
+    }
+
     /// `--add-host name:ip` and `--hostname` are written into the container's
     /// /etc/hosts by the guest, so neither may add a line of its own.
     #[test]
@@ -4900,6 +7722,101 @@ mod network_option_tests {
             assert!(!super::valid_hosts_name(bad), "{bad:?}");
         }
     }
+
+    /// `--memory-swap` as Docker Engine takes it (#523): memory plus swap,
+    /// twice the memory when not given, -1 for unlimited swap.
+    #[test]
+    fn memory_swap_is_memory_plus_swap_as_in_docker() {
+        let create = |h: Value| limits_from(&h, super::super::engine::Limits::default());
+        let swap = |l: super::super::engine::Limits| l.wire().swap_max;
+        const G: u64 = 1 << 30;
+
+        let l = create(json!({"Memory": 4 * G})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (8 * G as i64, 4 * G));
+        let l = create(json!({"Memory": 4 * G, "MemorySwap": 6 * G})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (6 * G as i64, 2 * G));
+        let l = create(json!({"Memory": 4 * G, "MemorySwap": 4 * G})).unwrap();
+        assert_eq!(swap(l), 0, "--memory-swap equal to --memory: no swap");
+        let l = create(json!({"Memory": 4 * G, "MemorySwap": -1})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (-1, kiri_proto::NO_LIMIT));
+        let l = create(json!({"MemorySwap": -1})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (-1, kiri_proto::NO_LIMIT));
+        let l = create(json!({})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (0, kiri_proto::NO_LIMIT), "no memory limit, no swap limit");
+        assert_eq!(l.wire(), kiri_proto::Limits::default(), "unlimited container matches wire default");
+
+        // Overflow near i64::MAX: 2 * Memory saturates at i64::MAX without wrapping or panicking.
+        let five_eb: u64 = 5 << 60;
+        let l = create(json!({"Memory": five_eb})).unwrap();
+        assert_eq!(l.memory_swap, i64::MAX);
+        assert_eq!(swap(l), (i64::MAX as u64) - five_eb);
+        let l = create(json!({"Memory": i64::MAX as u64})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (i64::MAX, 0));
+        let l = create(json!({"Memory": u64::MAX})).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (i64::MAX, 0));
+
+        let bad = |h: Value| match create(h) {
+            Err(Error::BadRequest(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        assert!(bad(json!({"MemorySwap": G})).starts_with("You should always set the Memory limit"));
+        assert!(bad(json!({"Memory": 2 * G, "MemorySwap": G})).starts_with("Minimum memoryswap limit"));
+
+        // docker update keeps what it isn't given, and refuses a memory
+        // limit above the memory plus swap already set.
+        let base = create(json!({"Memory": 4 * G, "MemorySwap": 6 * G})).unwrap();
+        let l = limits_from(&json!({"Memory": 0, "MemorySwap": 0, "NanoCpus": 2_000_000_000u64}), base).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (4 * G, 6 * G as i64, 2 * G), "updating --cpus keeps custom MemorySwap");
+        let l = limits_from(&json!({"Memory": 5 * G}), base).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (5 * G, 6 * G as i64, G));
+        let l = limits_from(&json!({"Memory": 4 * G, "MemorySwap": 8 * G}), base).unwrap();
+        assert_eq!(swap(l), 4 * G);
+        let l = limits_from(&json!({"MemorySwap": -1}), base).unwrap();
+        assert_eq!((l.memory_swap, swap(l)), (-1, kiri_proto::NO_LIMIT));
+        match limits_from(&json!({"Memory": 7 * G}), base) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("Memory limit should be smaller than already set memoryswap limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        match limits_from(&json!({"MemorySwap": 2 * G}), base) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("Minimum memoryswap limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        match limits_from(&json!({"Memory": 8 * G, "MemorySwap": 6 * G}), base) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("Minimum memoryswap limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        let no_mem = create(json!({})).unwrap();
+        match limits_from(&json!({"MemorySwap": G}), no_mem) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("You should always set the Memory limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+
+        // Updating --memory or --cpus when base.memory_swap == -1 keeps -1 (unlimited swap).
+        let unlim = create(json!({"Memory": 4 * G, "MemorySwap": -1})).unwrap();
+        let l = limits_from(&json!({"Memory": 512 << 20}), unlim).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (512 << 20, -1, kiri_proto::NO_LIMIT));
+        let l = limits_from(&json!({"Memory": 8 * G}), unlim).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (8 * G, -1, kiri_proto::NO_LIMIT));
+        let l = limits_from(&json!({"NanoCpus": 2_000_000_000u64}), unlim).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (4 * G, -1, kiri_proto::NO_LIMIT));
+
+        // Updating Memory above i64::MAX against an i64::MAX MemorySwap is refused.
+        let huge = create(json!({"Memory": five_eb})).unwrap();
+        match limits_from(&json!({"Memory": u64::MAX}), huge) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("Memory limit should be smaller than already set memoryswap limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+
+        // Saved before `memory_swap`: Docker's default, not no swap, and updates honour it.
+        let old: super::super::engine::Limits = serde_json::from_value(json!({"memory_max": G, "cpu_quota": 0, "cpu_period": 0, "cpu_weight": 0, "pids_max": 0})).unwrap();
+        assert_eq!((old.memory_swap(), swap(old)), (2 * G as i64, G));
+        let l = limits_from(&json!({"Memory": 3 * G / 2}), old).unwrap();
+        assert_eq!((l.memory_max, l.memory_swap, swap(l)), (3 * G / 2, 2 * G as i64, G / 2));
+        match limits_from(&json!({"Memory": 3 * G}), old) {
+            Err(Error::BadRequest(m)) => assert!(m.starts_with("Memory limit should be smaller than already set memoryswap limit"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4917,7 +7834,7 @@ mod leave_first_network_tests {
         std::fs::create_dir_all(&root).unwrap();
         let engine = super::super::engine::boot_without_vm(&root);
         engine.lock_net().create("probe-net", Default::default()).unwrap();
-        let image = kiri_image::Image {
+        let image = kiri_image::Image { mirror: None,
             name: "test:1".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };
@@ -4933,10 +7850,348 @@ mod leave_first_network_tests {
         let networks: Vec<super::super::network::Network> = engine.lock_net().all().to_vec();
         assert_eq!(names(&container_inspect(&engine, &id).unwrap()["NetworkSettings"]["Networks"]), ["probe-net"]);
         assert_eq!(names(&engine.with(&id, |c| network_settings(c, &networks)).unwrap()["Networks"]), ["probe-net"]);
+        let filter_has = |net: &str| {
+            let filters = format!(r#"{{"network":["{net}"]}}"#);
+            let req = Request::internal("GET", "/containers/json", &[("all", "1"), ("filters", &filters)], Vec::new());
+            list(&req, &engine).unwrap().as_array().unwrap().iter().any(|r| r["Id"] == id)
+        };
+        assert!(filter_has("probe-net"));
+        assert!(!filter_has("bridge"));
         engine.disconnect("probe-net", &id).unwrap();
         assert!(names(&container_inspect(&engine, &id).unwrap()["NetworkSettings"]["Networks"]).is_empty());
         assert!(names(&engine.with(&id, |c| network_settings(c, &networks)).unwrap()["Networks"]).is_empty());
+        assert!(!filter_has("probe-net"));
+        assert!(!filter_has("none"));
+        assert!(engine.network_members("none").is_empty());
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod resources_disk_tests {
+    use super::*;
+
+    #[test]
+    fn resources_payload_round_trip_and_disk_bounds() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiri-res-disk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let path = dir.join("vm.json");
+
+        // Save CPUs, memory and disk_gb; verify vm.json contents.
+        let body = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 128}).to_string();
+        save_resources(body.as_bytes(), &path, 12, 32768, Some(64), None, None).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 128}));
+
+        // Omitting disk_gb preserves the existing disk_gb in vm.json, and omitting
+        // shared_nat preserves an existing shared_nat flag in vm.json.
+        let body2 = json!({"cpus": 6, "memory_mib": 4096}).to_string();
+        save_resources(body2.as_bytes(), &path, 12, 32768, Some(64), saved["disk_gb"].as_u64(), Some(false)).unwrap();
+        let saved2: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved2, json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128, "shared_nat": false}));
+
+        // Explicitly updating shared_nat works and non-boolean values are rejected with 400.
+        let body3 = json!({"cpus": 6, "memory_mib": 4096, "shared_nat": true}).to_string();
+        save_resources(body3.as_bytes(), &path, 12, 32768, Some(64), Some(128), Some(false)).unwrap();
+        let saved3: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved3, json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128, "shared_nat": true}));
+
+        // Existing balloon / memory_min_mib fields in vm.json survive save_resources updates.
+        std::fs::write(
+            &path,
+            json!({"cpus": 6, "memory_mib": 4096, "disk_gb": 128, "shared_nat": true, "balloon": false, "memory_min_mib": 2048}).to_string(),
+        )
+        .unwrap();
+        let body4 = json!({"cpus": 8, "memory_mib": 8192}).to_string();
+        save_resources(body4.as_bytes(), &path, 12, 32768, Some(64), Some(128), Some(true)).unwrap();
+        let saved4: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved4,
+            json!({"cpus": 8, "memory_mib": 8192, "disk_gb": 128, "shared_nat": true, "balloon": false, "memory_min_mib": 2048})
+        );
+
+        let bad_nat = json!({"cpus": 4, "memory_mib": 8192, "shared_nat": "off"}).to_string();
+        match save_resources(bad_nat.as_bytes(), &path, 12, 32768, Some(64), None, None) {
+            Err(Error::BadRequest(msg)) => assert!(msg.contains("shared_nat must be a boolean"), "{msg}"),
+            other => panic!("expected BadRequest for non-bool shared_nat, got {other:?}"),
+        }
+
+        // Shrinking below current data.img size (128 GiB) is rejected with 400.
+        let shrink = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": 96}).to_string();
+        match save_resources(shrink.as_bytes(), &path, 12, 32768, Some(128), Some(128), None) {
+            Err(Error::BadRequest(msg)) => assert!(msg.contains("disk_gb must be 128 to 1024"), "{msg}"),
+            other => panic!("expected BadRequest for shrink, got {other:?}"),
+        }
+
+        // Below 64 GiB template floor, zero, negative, and oversized values are rejected.
+        for bad in [json!(0), json!(32), json!(-1), json!(2048), json!("128")] {
+            let raw = json!({"cpus": 4, "memory_mib": 8192, "disk_gb": bad}).to_string();
+            match save_resources(raw.as_bytes(), &path, 12, 32768, Some(64), None, None) {
+                Err(Error::BadRequest(msg)) => assert!(msg.contains("disk_gb must be"), "{msg}"),
+                other => panic!("expected BadRequest for {bad}, got {other:?}"),
+            }
+        }
+
+        // Payload includes disk fields on macOS and omits them when None (Linux).
+        let mac = resources_payload(4, 8192, 4, 8192, true, 12, 32768, false, Some((128, 256, 128)));
+        assert_eq!(mac["disk_gb"], 256);
+        assert_eq!(mac["running_disk_gb"], 128);
+        assert_eq!(mac["min_disk_gb"], 128);
+        assert_eq!(mac["max_disk_gb"], 1024);
+
+        let linux = resources_payload(4, 8192, 4, 8192, true, 12, 32768, false, None);
+        assert!(linux.get("disk_gb").is_none());
+        assert!(linux.get("min_disk_gb").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn host_gateway_extra_host_stores_placeholder_not_wsl_addr() {
+        let raw = vec!["myhost:host-gateway".to_owned(), "db:10.0.0.2".to_owned()];
+        assert_eq!(
+            extra_hosts_from(&raw).unwrap(),
+            vec![format!("{}\tmyhost", super::super::ports::HOST_ADDR), "10.0.0.2\tdb".to_owned()]
+        );
+        assert!(extra_hosts_from(&["bad:not-an-ip".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn wsl_distro_is_recorded_from_caller_and_inferred_from_legacy_mounts() {
+        let empty = json!({});
+        assert_eq!(created_wsl_distro(&Caller::Wsl("Debian".into()), Some("kiri"), &empty), Some("Debian".into()));
+        assert_eq!(created_wsl_distro(&Caller::Host, Some("Ubuntu"), &empty), Some("Ubuntu".into()));
+        assert_eq!(
+            created_wsl_distro(
+                &Caller::Host,
+                Some("kiri"),
+                &json!({"com.docker.compose.project.config_files": r"\\wsl.localhost\Ubuntu-24.04\home\simone\services\docker-compose.yml"})
+            ),
+            Some("Ubuntu-24.04".into())
+        );
+        assert_eq!(
+            created_wsl_distro(
+                &Caller::Host,
+                Some("kiri"),
+                &json!({"com.docker.compose.project.working_dir": r"C:\Users\me\shop"})
+            ),
+            None
+        );
+        assert_eq!(created_wsl_distro(&Caller::Host, None, &empty), None);
+        assert_eq!(created_wsl_distro(&Caller::Container, Some("Ubuntu"), &empty), None);
+        assert_eq!(created_wsl_distro(&Caller::Wsl("../evil".into()), Some("kiri"), &empty), None);
+
+        let base_spec = || -> super::super::engine::Spec {
+            serde_json::from_value(json!({
+                "image": "alpine:1", "image_id": "sha256:0123", "entrypoint": [], "cmd": ["true"], "env": [],
+                "cwd": "/", "user": "", "auto_remove": false, "labels": {}, "network_mode": "bridge",
+                "restart": {"name": "no", "max_retries": 0},
+            }))
+            .unwrap()
+        };
+        assert!(serde_json::to_value(base_spec()).unwrap().get("wsl_distro").is_none(), "omitted when None");
+
+        let mut recorded = base_spec();
+        recorded.wsl_distro = Some("Debian".into());
+        assert_eq!(spec_wsl_distro(&recorded), Some("Debian".into()));
+        assert_eq!(serde_json::to_value(&recorded).unwrap()["wsl_distro"], "Debian");
+
+        let mut legacy = base_spec();
+        legacy.mount_info = vec![json!({"Type": "bind", "Source": "/mnt/wsl/kiri/roots/Ubuntu-24.04/home/simone/services/data", "Destination": "/data"})];
+        assert_eq!(spec_wsl_distro(&legacy), Some("Ubuntu-24.04".into()));
+        assert_eq!(spec_wsl_distro(&base_spec()), None);
+
+        // End-to-end through Engine and GET /containers/json?all=1.
+        let root = std::env::temp_dir().join(format!("kiri-wsl-distro-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = super::super::engine::boot_without_vm(&root);
+        let image = kiri_image::Image {
+            mirror: None,
+            name: "alpine:1".into(),
+            digest: "sha256:0123".into(),
+            index_digest: None,
+            config_digest: "sha256:0123".into(),
+            layers: Vec::new(),
+            size: 0,
+            platform: "linux/amd64".into(),
+            created: String::new(),
+            pulled_at: 0,
+            config: Default::default(),
+        };
+        engine.store.put_image(image.clone()).unwrap();
+        let create_req = Request::internal(
+            "POST",
+            "/containers/create",
+            &[("name", "from-debian")],
+            serde_json::to_vec(&json!({"Image": "alpine:1", "Cmd": ["true"]})).unwrap(),
+        );
+        create_by(&create_req, &engine, &Caller::Wsl("Debian".into())).unwrap();
+        engine.create(Some("legacy-ubuntu".into()), legacy, &image).unwrap();
+        engine.create(Some("plain-host".into()), base_spec(), &image).unwrap();
+
+        let rows = list(&Request::internal("GET", "/containers/json", &[("all", "1")], Vec::new()), &engine).unwrap();
+        let by_name = |name: &str| {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["Names"][0] == format!("/{name}"))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(by_name("from-debian")["KiriWslDistro"], "Debian");
+        assert_eq!(by_name("legacy-ubuntu")["KiriWslDistro"], "Ubuntu-24.04");
+        assert!(by_name("plain-host").get("KiriWslDistro").is_none());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_copy_out_paces_chunks_and_rejects_oversized_frames() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (mut host_copy, mut guest_copy) = UnixStream::pair().unwrap();
+        let (mut api_client, mut api_server) = UnixStream::pair().unwrap();
+        let payload: Vec<u8> = (0..(150 * 1024)).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+
+        let guest = std::thread::spawn(move || {
+            for chunk in payload.chunks(COPY_OUT_CHUNK) {
+                let mut ack = [0u8; 1];
+                guest_copy.read_exact(&mut ack).unwrap();
+                assert_eq!(ack[0], 1);
+                guest_copy.write_all(&(chunk.len() as u32).to_le_bytes()).unwrap();
+                guest_copy.write_all(chunk).unwrap();
+            }
+            let mut ack = [0u8; 1];
+            guest_copy.read_exact(&mut ack).unwrap();
+            guest_copy.write_all(&0u32.to_le_bytes()).unwrap();
+        });
+
+        let server = std::thread::spawn(move || {
+            super::stream_copy_out(&mut host_copy, &mut api_server, true).unwrap();
+            http::end(&mut api_server).unwrap();
+        });
+
+        let mut raw = Vec::new();
+        api_client.read_to_end(&mut raw).unwrap();
+        guest.join().unwrap();
+        server.join().unwrap();
+
+        // Decode HTTP chunked response body and verify exact payload.
+        let mut decoded = Vec::new();
+        let mut pos = 0;
+        loop {
+            let line_end = raw[pos..].windows(2).position(|w| w == b"\r\n").unwrap() + pos;
+            let len_str = std::str::from_utf8(&raw[pos..line_end]).unwrap();
+            let len = usize::from_str_radix(len_str, 16).unwrap();
+            pos = line_end + 2;
+            if len == 0 {
+                assert_eq!(&raw[pos..], b"\r\n");
+                break;
+            }
+            assert!(len <= COPY_OUT_CHUNK);
+            decoded.extend_from_slice(&raw[pos..pos + len]);
+            pos += len;
+            assert_eq!(&raw[pos..pos + 2], b"\r\n");
+            pos += 2;
+        }
+        assert_eq!(decoded, expected);
+
+        // Oversized paced chunk header (or BE Msg::Error frame) is rejected cleanly.
+        let (mut host_bad, mut guest_bad) = UnixStream::pair().unwrap();
+        let mut sink = Vec::new();
+        let bad_guest = std::thread::spawn(move || {
+            let mut ack = [0u8; 1];
+            guest_bad.read_exact(&mut ack).unwrap();
+            guest_bad.write_all(&((COPY_OUT_CHUNK as u32) + 1).to_le_bytes()).unwrap();
+        });
+        let err = super::stream_copy_out(&mut host_bad, &mut sink, true).unwrap_err();
+        bad_guest.join().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bind_mount_preparation_never_creates_localtime_or_timezone_directory() {
+        let root = std::env::temp_dir().join(format!("kiri-api-localtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+
+        // `--mount type=bind` (`create_missing = false`) refuses missing /etc/localtime without creating a directory.
+        let err = super::prepare_bind_source_at(&root, "/etc/localtime", "/etc/localtime", false, true, None).unwrap_err();
+        assert!(matches!(err, super::Error::BadRequest(ref m) if m.contains("bind source path does not exist")), "{err:?}");
+        assert!(std::fs::symlink_metadata(root.join("etc/localtime")).is_err());
+
+        // `-v /etc/localtime:/etc/localtime:ro` (`create_missing = true`) creates a valid TZif2 file, never a directory.
+        super::prepare_bind_source_at(&root, "/etc/localtime", "/etc//localtime", true, true, None).unwrap();
+        let lt = root.join("etc/localtime");
+        assert!(std::fs::symlink_metadata(&lt).unwrap().file_type().is_file());
+        let bytes = std::fs::read(&lt).unwrap();
+        assert!(bytes.starts_with(b"TZif2") && bytes.ends_with(b"\nUTC0\n"));
+
+        // Existing empty directory at /etc/localtime is repaired into a file for both `-v` and `--mount`.
+        std::fs::remove_file(&lt).unwrap();
+        std::fs::create_dir(&lt).unwrap();
+        super::prepare_bind_source_at(&root, "/etc/localtime", "/etc/./localtime", false, true, None).unwrap();
+        assert!(std::fs::symlink_metadata(&lt).unwrap().file_type().is_file());
+
+        // Non-empty directory at /etc/localtime is refused without deleting its contents.
+        std::fs::remove_file(&lt).unwrap();
+        std::fs::create_dir(&lt).unwrap();
+        std::fs::write(lt.join("keep"), b"keep").unwrap();
+        assert!(super::prepare_bind_source_at(&root, "/etc/localtime", "/etc/localtime", true, true, None).is_err());
+        assert_eq!(std::fs::read(lt.join("keep")).unwrap(), b"keep");
+        std::fs::remove_dir_all(&lt).unwrap();
+
+        // `-v /etc/timezone:/etc/timezone:ro` creates/repairs a regular file, never a directory.
+        let tz = root.join("etc/timezone");
+        let _ = std::fs::remove_file(&tz);
+        super::prepare_bind_source_at(&root, "/etc/timezone", "/etc/timezone", true, true, Some("Asia/Shanghai")).unwrap();
+        assert!(std::fs::symlink_metadata(&tz).unwrap().file_type().is_file());
+        assert_eq!(std::fs::read_to_string(&tz).unwrap(), "Asia/Shanghai\n");
+
+        // Regular missing bind paths still become directories under `-v`.
+        super::prepare_bind_source_at(&root, "/srv/app", "/srv/app", true, true, None).unwrap();
+        assert!(root.join("srv/app").is_dir());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Settings → Resources keeps the VM's swap (#326): 0 to 16 GiB, kept
+    /// when a save leaves it out.
+    #[test]
+    fn swap_is_saved_checked_and_kept() {
+        let dir = std::env::temp_dir().join(format!("kiri-res-swap-{}", std::process::id()));
+        let path = dir.join("vm.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let save = |body: Value| save_resources(body.to_string().as_bytes(), &path, 12, 32768, Some(64), None, None);
+        let saved = || serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap();
+
+        save(json!({"cpus": 4, "memory_mib": 8192, "swap_mib": 2048})).unwrap();
+        assert_eq!(saved()["swap_mib"], 2048);
+        save(json!({"cpus": 4, "memory_mib": 4096})).unwrap();
+        assert_eq!(saved()["swap_mib"], 2048, "left out, the swap stays");
+        save(json!({"cpus": 4, "memory_mib": 4096, "swap_mib": 0})).unwrap();
+        assert_eq!(saved()["swap_mib"], 0, "0 is no swap");
+        for bad in [json!(-1), json!(16 * 1024 + 1), json!("1024"), json!(1.5)] {
+            match save(json!({"cpus": 4, "memory_mib": 4096, "swap_mib": bad})) {
+                Err(Error::BadRequest(msg)) => assert!(msg.contains("swap_mib must be 0 to 16384"), "{msg}"),
+                other => panic!("expected BadRequest for {bad}, got {other:?}"),
+            }
+        }
+        assert_eq!(saved()["swap_mib"], 0, "a refused save changes nothing");
+
+        let mut v = json!({});
+        swap_payload(&mut v, 2048, 1024);
+        assert_eq!(v, json!({"swap_mib": 2048, "running_swap_mib": 1024, "max_swap_mib": 16384}));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
